@@ -10,6 +10,14 @@ DetectorMessenger::DetectorMessenger(DetectorConstruction* Det)
   fTestDir = new G4UIdirectory("/testhadr/");
   fTestDir->SetGuidance("Hadr01 detector control.");
 
+  fDefMatCmd = new G4UIcmdWithAString("/testhadr/defineMaterial",this);
+  fDefMatCmd->SetGuidance("Define a material from its stoichiometry.");
+  fDefMatCmd->SetGuidance("Usage: <name> <density_g_cm3> <El1> <n1> [<El2> <n2> ...]");
+  fDefMatCmd->SetGuidance("n_i are relative atom counts (non-integer allowed);");
+  fDefMatCmd->SetGuidance("they are converted internally to mass fractions.");
+  fDefMatCmd->SetParameterName("spec",false);
+  fDefMatCmd->AvailableForStates(G4State_PreInit);
+
   fMatCmd = new G4UIcmdWithAString("/testhadr/TargetMat",this);
   fMatCmd->SetGuidance("Select Material of the Target.");
   fMatCmd->SetParameterName("material",false);
@@ -30,6 +38,7 @@ DetectorMessenger::DetectorMessenger(DetectorConstruction* Det)
 
 DetectorMessenger::~DetectorMessenger()
 {
+  delete fDefMatCmd;
   delete fMatCmd;
   delete fRCmd;
   delete fLCmd;
@@ -38,7 +47,9 @@ DetectorMessenger::~DetectorMessenger()
 
 void DetectorMessenger::SetNewValue(G4UIcommand* command, G4String newValue)
 {
-  if( command == fMatCmd ) {
+  if( command == fDefMatCmd ) {
+    fDetector->DefineMaterial(newValue);
+  } else if( command == fMatCmd ) {
     fDetector->SetTargetMaterial(newValue);
   } else if( command == fRCmd ) {
     fDetector->SetTargetRadius(fRCmd->GetNewDoubleValue(newValue));
