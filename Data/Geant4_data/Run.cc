@@ -65,7 +65,7 @@ void ExportStoppingPowerTable(const G4String& mineralName, int Z, int A, const G
 int main(int argc, char** argv) {
     if (argc < 2) {
         G4cout << "Usage for simulation: " << argv[0] << " <macro_file>" << G4endl;
-        G4cout << "Usage for dedx export: " << argv[0] << " --export-dedx <mineral> <Z> <A> <outDir>" << G4endl;
+        G4cout << "Usage for dedx export: " << argv[0] << " --export-dedx <mineral> <Z> <A> <outDir> [materials.mac]" << G4endl;
         return 1;
     }
 
@@ -95,6 +95,17 @@ int main(int argc, char** argv) {
         UI->ApplyCommand("/control/verbose 0");
         UI->ApplyCommand("/run/verbose 0");
         
+        // Optional 6th argument: macro with /testhadr/defineMaterial commands
+        if (argc >= 7) {
+            G4int status = UI->ApplyCommand(G4String("/control/execute ") + argv[6]);
+            if (status != 0) {
+                G4cout << "Error: could not execute materials macro " << argv[6]
+                       << " (status " << status << ")" << G4endl;
+                delete runManager;
+                return 1;
+            }
+        }
+
         UI->ApplyCommand("/testhadr/TargetMat " + mineral);
         UI->ApplyCommand("/run/setCut 0.005 mm");
         UI->ApplyCommand("/process/eLoss/CSDARange true");

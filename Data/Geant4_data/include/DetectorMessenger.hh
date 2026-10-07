@@ -22,6 +22,7 @@ private:
   G4UIcmdWithAString* fMatCmd;
   G4UIcmdWithADoubleAndUnit* fRCmd;
   G4UIcmdWithADoubleAndUnit* fLCmd;
+  G4UIcmdWithAString* fDefMatCmd;
 };
 
 #endif

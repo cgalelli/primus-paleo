@@ -21,11 +21,13 @@ public:
   void SetTargetMaterial (const G4String&);
   void SetTargetRadius   (G4double);
   void SetTargetLength   (G4double);
+  void DefineMaterial(const G4String& spec);
 
   // Getters
   G4Material* GetTargetMaterial()  const {return fTargetMaterial;};
   G4double    GetTargetLength()    const {return fTargetLength;};
   G4double    GetTargetRadius()    const {return fTargetRadius;};
+
 
 private:
   void DefineMaterials();
