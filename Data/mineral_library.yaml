@@ -121,3 +121,24 @@ Calcite:
   uranium_concentration_g_g: 1.0e-06
   density_g_cm3: 2.7
   an_coeff_n_nalpha: 1
+Obsidian:
+  name: Obsidian
+  nuclei:
+  - O
+  - Si
+  - Al
+  - K
+  - Na
+  - Fe
+  - Ca
+  stoich:
+  - 100
+  - 41
+  - 8
+  - 3.7
+  - 3.3
+  - 0.5
+  - 0.5
+  uranium_concentration_g_g: 1.0e-06
+  density_g_cm3: 2.4
+  an_coeff_n_nalpha: 0.1

@@ -1,24 +1,40 @@
 """
 OptimusPrimus: two-stage track detection in optical-microscopy images.
 
-A segmentation network (MAnet + EfficientNet-B7) proposes candidate tracks with high recall on each focal plane of a
-z-stack; a classifier (EfficientNet-B0 on 64x64 patches aligned to the track axis) removes false positives. Tracks are
-measured by ellipse fitting.
+A segmentation network (MAnet + EfficientNet-B7) proposes candidate tracks; a classifier (EfficientNet-B0 on 64x64
+patches aligned to the track axis) removes false positives. Tracks are measured by ellipse fitting. Every z-stack is
+analysed on its sharpest focal plane, as the annotated tiles are.
 
-Contents
-    Configuration
-    Data preparation          slice_tif_to_png_tiles, convert_xml_to_masks
-    Building blocks           naming, preprocessing, model builders, prediction, instances and matching
-    Detection model           recall, length response and false positives for folding theoretical spectra
-    OptimusPrimus             inference on z-stacks of image tiles
-    OptimusPrimusTraining     training and evaluation of the two networks
+Workflow
+    0. Data preparation       slice_tif_to_png_tiles, convert_xml_to_masks
+    1. Segmentation           train_segmentation          -> Data/models/<SEG_NAME>/<SEG_NAME>.pth (+ .json, descriptor)
+    2. Classifier patches     automatic: train_classifier(seg, patches='auto')
+                              manual:    export_candidate_patches -> sort unsorted/ into track/ and bkg/
+                                         -> train_classifier(seg, patches=<folder>)
+    3. Classifier             train_classifier            -> Data/models/<SEG_NAME>/<SEG_NAME>__<CLS_TAG>.pth (+ .json, descriptor)
+       (1-3 in one call: train_all, segmentation + automatic patches + classifier)
+    4. Inference              run_inference(images, seg_model, cls_model=None)   (cls_model None: segmentation only)
+    5. Detection model        load_detection_logs -> detection_descriptor -> detection_model -> fold_detection
+                              -> poisson_chi2
+
+Model folder Data/models/<SEG_NAME>/
+    <SEG_NAME>.pth / .json / _training_metrics.csv           segmentation weights, training record (files, split,
+                                                            hyperparameters), per-epoch metrics
+    <SEG_NAME>_st<t>_detection_logs.json / _descriptor.csv  segmentation-only descriptor at threshold t
+    <SEG_NAME>__<CLS_TAG>.pth / .json / _training_metrics.csv
+    <SEG_NAME>__<CLS_TAG>_st<t>_ct<c>_detection_logs.json / _descriptor.csv
+    patches_auto_pt<t>/                                     automatic classifier patches (cache, rewritten)
+    patches_manual_<images>/                                default target of export_candidate_patches
 """
 import os
 import re
 import glob
 import json
 import shutil
+import hashlib
+import datetime
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor
 
 import cv2
@@ -31,7 +47,7 @@ from skimage.measure import label, regionprops
 from skimage.transform import rotate
 from sklearn.model_selection import train_test_split
 from scipy.stats import norm as _norm, chi2 as _chi2_dist
-from scipy.optimize import nnls as _nnls, linear_sum_assignment
+from scipy.optimize import linear_sum_assignment
 
 import torch
 import torch.nn as nn
@@ -42,11 +58,6 @@ import timm
 import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from skimage.transform import rotate
-from skimage.measure import label, regionprops
-from sklearn.model_selection import train_test_split
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import json
 
 # ==========================================
 # CONFIGURATION
@@ -56,22 +67,19 @@ IMAGE_CONFIG = {
     'img_height': 1024,
     'img_width': 1024,
     'pixel_resolution_um_per_px': 0.345,
-    'image_folder_path': "Data/images/",
 }
 
 SEG_MODEL_CONFIG = {
     'model_arc': 'MAnet',
     'encoder': 'efficientnet-b7',
     'encoder_weights': 'imagenet',
-    'threshold': 0.1,                       # operating point: inference, evaluation, classifier-patch extraction
-    'model_folder_path': "Data/models/segmentation/",
+    'threshold': 0.1,                       # operating point: patches, inference, descriptor (stored with the model)
 }
 
 CLASS_MODEL_CONFIG = {
     'encoder': 'efficientnet_b0',
-    'pretrained': True,                     # ImageNet initialisation when training a new classifier
-    'threshold': 0.55,                      # operating point: inference and evaluation
-    'model_folder_path': "Data/models/classification/",
+    'pretrained': True,                     # ImageNet initialisation
+    'threshold': 0.55,                      # operating point: inference, descriptor (stored with the model)
 }
 
 TRAINING_PARAMETERS = {
@@ -93,12 +101,11 @@ TRAINING_PARAMETERS = {
 
 TRAIN_IMAGE = {
     'mask_subdir': 'training_masks',
-    'data_split_subdir': 'data_split',
     'image_extensions': '*.png',
     'mask_extension': '_mask.png',
     'test_split_ratio': 0.1,
     'val_split_ratio': 0.15,
-    'split_filename': 'split_set.json',
+    'split_seed': 42,
 }
 
 AUGMENTATION_PARAMETERS = {
@@ -107,74 +114,42 @@ AUGMENTATION_PARAMETERS = {
     'BRIGHTNESS_CONTRAST_PROB': 0.4,
 }
 
+MODELS_ROOT = "Data/models/"
+INFERENCE_ROOT = "Data/inference_results/"
+TILES_SUBDIR = "tiles"
+
+MANUAL_PATCH_VAL_RATIO = 0.15               # validation share of hand-sorted patches without train/ and val/ subfolders
+MIN_TRACK_AREA_PX = 10                      # smaller components are never reported (ellipse fit), nor used as patches
+IOU_THRESHOLD = 0.5                         # matching of predictions to annotations (patch labels and descriptor)
+
+DEFAULT_BIN_EDGES_NM = np.linspace(0., 16000., 17)   # grid of the descriptor table written at training time
+DESCRIPTOR_MIN_COUNT = 5                    # bins with fewer annotated tracks borrow the recall of the nearest bin
+DESCRIPTOR_MIN_PAIRS = 5                    # bins with fewer matched pairs borrow the length response of the nearest bin
+
 # keep_patches_in_memory=True holds every 64x64x3 uint8 patch (~12 KB) in RAM: warn above this number
 MAX_IN_MEMORY_PATCHES_WARNING = 50000
 
-TILES_SUBDIR = "tiles"
+# z-stack tiles: Frame<n>_<acquisition>_<i>_<j>.png, grouped by (n, i, j)
+_FRAME_RE = re.compile(r'^Frame(\d+)_.+_(\d+)_(\d+)\.png$')
+
+_IMAGENET_MEAN, _IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
 
 # ==========================================
-# UTILITY FUNCTIONS
+# DATA PREPARATION
 # ==========================================
 
-def _asymmetric_gaussian_kernel(size, sigma_left, sigma_right=None):
-    """Generates a normalized 1D asymmetric Gaussian kernel array.
-
-    Args:
-        size (int): The total size of the kernel (must be an odd integer).
-        sigma_left (float): Standard deviation applied to the left side of the kernel center.
-        sigma_right (float, optional): Standard deviation applied to the right side of the kernel center. 
-            Defaults to None, which maps to match sigma_left.
-
-    Returns:
-        np.ndarray: A 1D normalized numpy float array representing the asymmetric Gaussian distribution.
-        
-    Raises:
-        ValueError: If size is an even integer.
-    """
-    if size % 2 == 0:
-        raise ValueError("Kernel size must be odd.")
-
-    center = size // 2
-    x = np.arange(size)
-
-    if sigma_right is None:
-        sigma_right = sigma_left
-    
-    kernel = np.zeros(size)
-    kernel[:center] = np.exp(-(x[:center] - center)**2 / (2 * sigma_left**2))
-    kernel[center] = 1.0
-    kernel[center+1:] = np.exp(-(x[center+1:] - center)**2 / (2 * sigma_right**2))
-    
-    return kernel / np.sum(kernel)
-
-
-def smear_spectrum(counts, size, sigma_left, sigma_right=None):
-    """Convolves a given spectrum signal with an asymmetric Gaussian kernel.
-
-    Args:
-        counts (np.ndarray): The 1D input array/signal to smear.
-        size (int): Spatial pixel size of the Gaussian kernel window.
-        sigma_left (float): Left side standard deviation profile.
-        sigma_right (float, optional): Right side standard deviation profile. Defaults to None.
-
-    Returns:
-        np.ndarray: The smeared spectrum convolved array signal matching input counts shape.
-    """
-    smeared_counts = np.convolve(counts, _asymmetric_gaussian_kernel(size, sigma_left, sigma_right), mode='same')
-    return smeared_counts
-
-    
 def slice_tif_to_png_tiles(images_per_group, input_dir, output_spec=TILES_SUBDIR, tile_size=IMAGE_CONFIG['img_height']):
-    """Slices large TIF/TIFF files into smaller uniform square PNG tiles.
+    """Slices TIFF acquisitions into square PNG tiles named Frame<group>_<file stem>_<i>_<j>.png.
+
+    Consecutive files (sorted by name) form one z-stack group of `images_per_group` focal planes; only full-size tiles
+    are written.
 
     Args:
-        images_per_group (int): Number of consecutive images belonging to a single logical group stack.
-        input_dir (str): Base filesystem path containing the source high-res TIFF images.
-        output_spec (str, optional): Target subfolder name for the extracted PNG tiles. Defaults to TILES_SUBDIR.
-        tile_size (int, optional): Spatial edge dimension for square image tiling crops. Defaults to 1024.
-
-    Returns:
-        None
+        images_per_group (int): Number of focal planes per z-stack.
+        input_dir (str): Folder with the TIFF files; the tiles go to input_dir/output_spec.
+        output_spec (str, optional): Tiles subfolder. Defaults to TILES_SUBDIR.
+        tile_size (int, optional): Tile side in pixels. Defaults to IMAGE_CONFIG['img_height'].
 
     Raises:
         ValueError: If the number of TIFF files is not a multiple of images_per_group.
@@ -231,29 +206,147 @@ def convert_xml_to_masks(xml_path, output_dir):
 
 
 # ==========================================
-# BUILDING BLOCKS
+# NAMING AND MODEL RECORDS
 # ==========================================
 
-def make_seg_model_spec(encoder, image_spec):
-    """Name (without extension) of a segmentation checkpoint trained on `image_spec`."""
-    return f"seg_model_{encoder}_{image_spec}"
+def _slug(text):
+    """Text reduced to letters, digits and . + - (other runs become '-')."""
+    return re.sub(r'[^A-Za-z0-9.+-]+', '-', str(text)).strip('-')
 
 
-def make_class_model_spec(model_type, image_spec):
-    """Name (without extension) of a classification checkpoint trained on `image_spec`."""
-    return f"class_model_{model_type}_{image_spec}"
+def _short_hash(items):
+    """6-character hash of a set of strings (order independent)."""
+    return hashlib.md5('\n'.join(sorted(items)).encode()).hexdigest()[:6]
 
 
-def efficiency_csv_paths(seg_spec, cls_spec, seg_folder, cls_folder):
-    """Binned-efficiency csv of each mode: 'seg' next to the segmentation model, 'seg_class' next to the classifier."""
-    return {'seg': os.path.join(seg_folder, f"binned_efficiency_{seg_spec}.csv"),
-            'seg_class': os.path.join(cls_folder, f"binned_efficiency_{seg_spec}_{cls_spec}.csv")}
+def seg_model_name(image_spec, n_tiles, file_hash, seg_cfg, params):
+    """Folder and file name of a segmentation model: annotated set, architecture and training hyperparameters.
+
+    Example: seg_ARCI-URAS26F2_n150-3fa2c1_MAnet-efficientnet-b7_ep200-bs2-lr3e-04-Dice-F1
+    """
+    return (f"seg_{_slug(image_spec)}_n{n_tiles}-{file_hash}_{seg_cfg['model_arc']}-{_slug(seg_cfg['encoder'])}"
+            f"_ep{params['seg_epochs']}-bs{params['seg_batch_size']}-lr{params['seg_learning_rate']:.0e}"
+            f"-{_slug(params['seg_metric_to_monitor'])}")
 
 
-def detection_logs_file(efficiency_csv):
-    """Validation logs of the detection model, saved next to the binned-efficiency csv."""
-    return os.path.splitext(efficiency_csv)[0] + "_detection_logs.json"
+def cls_model_tag(source_tag, patch_th, cls_cfg, params):
+    """Classifier part of a classifier file name: patch source and threshold, network and hyperparameters.
 
+    Example: cls-auto_pt0.1_efficientnet-b0_ep80-bs64-lr3e-05-pw0.7
+    """
+    init = '' if cls_cfg['pretrained'] else '-scratch'
+    return (f"cls-{source_tag}_pt{patch_th:g}_{_slug(cls_cfg['encoder'])}{init}"
+            f"_ep{params['class_epochs']}-bs{params['class_batch_size']}-lr{params['class_learning_rate']:.0e}"
+            f"-pw{params['class_boost_precision_weight']:g}")
+
+
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"{type(o)} is not JSON serialisable")
+
+
+def _save_json(path, obj):
+    with open(path, 'w') as f:
+        json.dump(obj, f, indent=2, default=_json_default)
+
+
+def _now():
+    return datetime.datetime.now().isoformat(timespec='seconds')
+
+
+def _record_path(pth):
+    """Training record (json) of a checkpoint."""
+    return os.path.splitext(pth)[0] + '.json'
+
+
+def _load_record(pth, kind):
+    record_path = _record_path(pth)
+    if not os.path.exists(record_path):
+        raise FileNotFoundError(f"Model record not found at '{record_path}' (models trained with this module have one).")
+    with open(record_path) as f:
+        record = json.load(f)
+    if record.get('kind') != kind:
+        raise ValueError(f"'{pth}' is a {record.get('kind')} model, not a {kind} model.")
+    return record
+
+
+def resolve_seg_model(seg_model):
+    """Segmentation checkpoint and its training record.
+
+    Args:
+        seg_model (str): The model folder Data/models/<SEG_NAME> or the .pth file.
+
+    Returns:
+        tuple: (path of the .pth, record dict).
+    """
+    path = seg_model
+    if os.path.isdir(path):
+        path = os.path.join(path, os.path.basename(os.path.normpath(path)) + '.pth')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Segmentation model not found at '{path}'")
+    return path, _load_record(path, 'segmentation')
+
+
+def resolve_cls_model(cls_model, seg_record=None):
+    """Classifier checkpoint and its training record; warns if it was trained on another segmentation model.
+
+    Returns:
+        tuple: (path of the .pth, record dict).
+    """
+    if not os.path.exists(cls_model):
+        raise FileNotFoundError(f"Classification model not found at '{cls_model}'")
+    record = _load_record(cls_model, 'classification')
+    if seg_record is not None and record['seg_model'] != seg_record['name']:
+        print(f"Warning: the classifier was trained on candidates of '{record['seg_model']}', "
+              f"not of '{seg_record['name']}'.")
+    return cls_model, record
+
+
+def descriptor_paths(seg_pth, seg_th, cls_pth=None, cls_th=None):
+    """Detection logs (json) and descriptor table (csv) of a model at given thresholds, in the model folder.
+
+    Returns:
+        tuple: (logs path, table path, base name).
+    """
+    model_dir = os.path.dirname(seg_pth)
+    if cls_pth is None:
+        base = f"{os.path.splitext(os.path.basename(seg_pth))[0]}_st{seg_th:g}"
+    else:
+        base = f"{os.path.splitext(os.path.basename(cls_pth))[0]}_st{seg_th:g}_ct{cls_th:g}"
+    return (os.path.join(model_dir, base + '_detection_logs.json'), os.path.join(model_dir, base + '_descriptor.csv'), base)
+
+
+def list_models(models_root=MODELS_ROOT):
+    """Segmentation models under `models_root` and the classifiers trained on each.
+
+    Returns:
+        pandas.DataFrame: One row per model with kind, name, training summary and path.
+    """
+    rows = []
+    for seg_dir in sorted(glob.glob(os.path.join(models_root, 'seg_*'))):
+        for record_path in sorted(glob.glob(os.path.join(seg_dir, '*.json'))):
+            if record_path.endswith(('_detection_logs.json', 'export_info.json')):
+                continue
+            with open(record_path) as f:
+                rec = json.load(f)
+            if rec.get('kind') not in ('segmentation', 'classification'):
+                continue
+            res = rec.get('training_result', {})
+            rows.append({'seg_model': os.path.basename(seg_dir), 'kind': rec['kind'],
+                         'classifier': '' if rec['kind'] == 'segmentation' else rec['tag'],
+                         'threshold': rec['threshold'], 'best_epoch': res.get('best_epoch'),
+                         'created': rec.get('created'), 'path': os.path.splitext(record_path)[0] + '.pth'})
+    return pd.DataFrame(rows)
+
+
+# ==========================================
+# BUILDING BLOCKS
+# ==========================================
 
 def resolve_num_workers(parallel=True):
     """Number of CPU workers: a small pool for data loading when a GPU is available, otherwise all cores
@@ -262,6 +355,10 @@ def resolve_num_workers(parallel=True):
     if torch.cuda.is_available():
         return min(4, cpu_count // 2) if cpu_count > 1 else 0
     return cpu_count if parallel else 0
+
+
+def _device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def compute_sharpness_score(fpath):
@@ -278,6 +375,66 @@ def compute_sharpness_score(fpath):
         return fpath, score, None
     except Exception as e:
         return fpath, 0.0, f"{os.path.basename(fpath)}: unexpected error: {e}"
+
+
+def _images_tag(images):
+    """Short name of an image source (the parent folder when the folder is the tiles subfolder)."""
+    if isinstance(images, (list, tuple)):
+        return f"list{len(images)}-{_short_hash([os.path.basename(p) for p in images])}"
+    path = os.path.normpath(images)
+    name = os.path.basename(path)
+    if name == TILES_SUBDIR:
+        name = os.path.basename(os.path.dirname(path))
+    return _slug(os.path.splitext(name)[0] if os.path.isfile(path) else name)
+
+
+def collect_images(images, parallel=True):
+    """Images to analyse, one per z-stack: the sharpest focal plane of each group Frame<n>_*_<i>_<j>.png; files
+    that do not follow the z-stack naming are taken one by one.
+
+    Args:
+        images (str or list): Folder of PNG tiles (or a folder containing the TILES_SUBDIR subfolder), one file,
+            or a list of files.
+        parallel (bool, optional): Spread the sharpness analysis over all CPU cores when there is no GPU.
+
+    Returns:
+        list: Image paths.
+    """
+    if isinstance(images, (list, tuple)):
+        paths = sorted(images)
+    elif os.path.isdir(images):
+        paths = sorted(glob.glob(os.path.join(images, '*.png')))
+        if not paths and os.path.isdir(os.path.join(images, TILES_SUBDIR)):
+            paths = sorted(glob.glob(os.path.join(images, TILES_SUBDIR, '*.png')))
+    elif os.path.isfile(images):
+        paths = [images]
+    else:
+        raise FileNotFoundError(f"No images at '{images}'")
+    if not paths:
+        raise FileNotFoundError(f"No PNG images found in '{images}'")
+
+    groups = {}
+    for p in paths:
+        m = _FRAME_RE.match(os.path.basename(p))
+        groups.setdefault(f"Frame{m.group(1)}_{m.group(2)}_{m.group(3)}" if m else p, []).append(p)
+    stacked = [p for files in groups.values() if len(files) > 1 for p in files]
+    if not stacked:
+        return [files[0] for files in groups.values()]
+
+    workers = resolve_num_workers(parallel)
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results = list(tqdm(executor.map(compute_sharpness_score, stacked, chunksize=8), total=len(stacked),
+                                desc="Sharpest focal plane"))
+    else:
+        results = [compute_sharpness_score(p) for p in tqdm(stacked, desc="Sharpest focal plane")]
+    scores = {}
+    for path, score, error in results:
+        if error:
+            print(error)
+        scores[path] = score
+    print(f"{len(paths)} images in {len(groups)} z-stacks: the sharpest plane of each is used.")
+    return [max(files, key=lambda p: scores.get(p, 0.)) if len(files) > 1 else files[0] for files in groups.values()]
 
 
 def get_seg_preprocessing(encoder, encoder_weights, height=None, width=None):
@@ -335,6 +492,18 @@ def build_class_model(model_type, weights_path=None, pretrained=True, device='cp
     return model.to(device)
 
 
+def _load_seg(seg_pth, seg_record, device):
+    """Trained segmentation network (eval mode) and its preprocessing, from the training record."""
+    m, img = seg_record['model'], seg_record['image_config']
+    model = build_seg_model(m['model_arc'], m['encoder'], weights_path=seg_pth, device=device).eval()
+    return model, get_seg_preprocessing(m['encoder'], m['encoder_weights'], img['img_height'], img['img_width'])
+
+
+def _load_cls(cls_pth, cls_record, device):
+    """Trained classifier (eval mode), from the training record."""
+    return build_class_model(cls_record['model']['encoder'], weights_path=cls_pth, device=device).eval()
+
+
 def _parallelize(model):
     """Wraps the model in DataParallel when more than one GPU is available."""
     if torch.cuda.device_count() > 1:
@@ -361,19 +530,9 @@ def predict_seg_mask(image_path, model, preprocessing, device, threshold):
     return image, mask
 
 
-def predict_stack_mask(file_list, model, preprocessing, device, threshold):
-    """Union (pixel-wise OR) of the segmentation masks of the focal planes of one z-stack.
-
-    Returns:
-        tuple: (RGB image of the first file, aggregated uint8 mask).
-    """
-    first_image, masks = None, []
-    for path in file_list:
-        image, mask = predict_seg_mask(path, model, preprocessing, device, threshold)
-        if first_image is None:
-            first_image = image
-        masks.append(mask)
-    return first_image, np.max(np.stack(masks), axis=0).astype(np.uint8)
+def candidate_regions(mask):
+    """Connected components of a mask large enough to be reported as tracks (area >= MIN_TRACK_AREA_PX)."""
+    return [r for r in regionprops(label(mask > 0)) if r.area >= MIN_TRACK_AREA_PX]
 
 
 def get_64x64_centered_patch(img, mask, region):
@@ -427,6 +586,27 @@ def get_64x64_centered_patch(img, mask, region):
     return canvas
 
 
+def context_crop(img, region, half_size=64, scale=2):
+    """Unrotated RGB crop around a candidate with its outline drawn, for sorting patches by eye.
+
+    Returns:
+        np.ndarray: RGB crop of side 2 * half_size * scale (larger for long candidates).
+    """
+    minr, minc, maxr, maxc = region.bbox
+    half = max(half_size, int(0.75 * max(maxr - minr, maxc - minc)) + 8)
+    cy, cx = (int(round(c)) for c in region.centroid)
+    padded = np.pad(img, ((half, half), (half, half), (0, 0)), mode='constant')
+    crop = padded[cy:cy + 2 * half, cx:cx + 2 * half].copy()
+    comp = np.zeros(crop.shape[:2], np.uint8)
+    rr, cc = region.coords[:, 0] - cy + half, region.coords[:, 1] - cx + half
+    comp[rr, cc] = 1
+    comp = cv2.dilate(comp, np.ones((7, 7), np.uint8))          # outline 3 px outside the candidate, which stays visible
+    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    crop = cv2.resize(crop, (2 * half * scale, 2 * half * scale), interpolation=cv2.INTER_NEAREST)
+    cv2.drawContours(crop, [c * scale for c in contours], -1, (0, 255, 0), 1)
+    return crop
+
+
 def classify_regions(image, mask, regions, model, transform, device, batch_size=256):
     """Track probability (sigmoid of the classifier logit) of each region of `mask`, in batches.
 
@@ -450,78 +630,46 @@ def create_class_mask(image, mask, model, transform, device, threshold=0.5, batc
     Returns:
         np.ndarray: Mask (same dtype as `mask`) with 1 on the accepted components.
     """
-    final_confirmed_mask = np.zeros_like(mask)
-    labeled_mask = label(mask)
-    regions = regionprops(labeled_mask)
+    labeled = label(mask)
+    regions = regionprops(labeled)
+    confirmed = np.zeros_like(mask)
+    probs = classify_regions(image, mask, regions, model, transform, device, batch_size)
+    confirmed[np.isin(labeled, [r.label for r, p in zip(regions, probs) if p > threshold])] = 1
+    return confirmed
 
-    for region in regions:
-        patch = get_64x64_centered_patch(image, mask, region)
-        is_valid = evaluate_patch(patch, model, transform, device, threshold=threshold)
-            
-        if is_valid:
-            final_confirmed_mask[labeled_mask == region.label] = 1
-    return final_confirmed_mask
 
-# ==========================================
-# CORE PIPELINE CLASSES
-# ==========================================
+def label_candidates(gt_mask, pred_mask, iou_threshold=IOU_THRESHOLD):
+    """Labels the segmentation candidates of one annotated image for the classifier.
 
-class OptimusPrimus:
-    """Production runtime inference management engine for the track identification architecture."""
-    
-    def __init__(self, image_spec, seg_model_spec, cls_model_spec, image_config=None, tiles_subdir=TILES_SUBDIR, seg_model_config=None, class_model_config=None, parallel=True):
-        """Initializes structural paths, parameters, and system environments for production deployment.
+    Every candidate (component of the predicted mask, see `candidate_regions`) is matched to the annotated tracks
+    with the maximum-total-IoU assignment (Hungarian algorithm): target 1 if matched with IoU >= `iou_threshold`,
+    0 otherwise. The patches are therefore those the classifier sees at inference, and the labels follow the
+    matching of the descriptor. Annotated tracks missed by the segmentation give no sample.
 
-        Args:
-            image_spec (str): Key identifier describing the processing image group stack dataset.
-            seg_model_spec (str): Name string of the saved segmentation weights file checkpoint.
-            cls_model_spec (str): Name string of the saved classification weights file checkpoint.
-            image_config (dict, optional): Custom execution configurations overrides for images. Defaults to None.
-            tiles_subdir (str, optional): Sub-path folder containing PNG tiled arrays. Defaults to TILES_SUBDIR.
-            seg_model_config (dict, optional): Custom configurations overrides for the segmentation module. Defaults to None.
-            class_model_config (dict, optional): Custom configurations overrides for the classification module. Defaults to None.
-            parallel (bool, optional): Standard compute policy toggle. A CUDA GPU is always used when
-                available; when no GPU is available, CPU-bound work (e.g. image quality analysis) is
-                spread across all available CPU cores unless `parallel` is set to False, in which case
-                it runs on a single core. Defaults to True.
-
-    Raises:
-        ValueError: If `negatives` is not one of NEGATIVES_MODES.
+    Returns:
+        list: (region, target) pairs.
     """
-    if negatives not in NEGATIVES_MODES:
-        raise ValueError(f"negatives must be one of {NEGATIVES_MODES}, got '{negatives}'")
     gt, pred = gt_mask > 0, pred_mask > 0
-    near_gt = cv2.dilate(gt.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     gt_labels, pred_labels = label(gt), label(pred)
-
-    def touches(region):
-        return bool(near_gt[region.coords[:, 0], region.coords[:, 1]].any())
-
-    if negatives == 'unmatched':
-        gt_regions, pred_regions = regionprops(gt_labels), regionprops(pred_labels)
-        matched = np.zeros(len(pred_regions), bool)
-        if gt_regions and pred_regions:
-            width = len(pred_regions) + 1
-            both = gt & pred
-            inter = np.bincount(gt_labels[both] * width + pred_labels[both], minlength=(len(gt_regions) + 1) * width)
-            inter = inter.reshape(len(gt_regions) + 1, width)[1:, 1:]
-            area_gt = np.array([r.area for r in gt_regions])[:, None]
-            area_pred = np.array([r.area for r in pred_regions])[None, :]
-            iou = inter / (area_gt + area_pred - inter)
-            for i, j in zip(*linear_sum_assignment(-iou)):
-                matched[j] = iou[i, j] >= iou_threshold
-        return [(pred_mask, r, int(m), touches(r)) for r, m in zip(pred_regions, matched)]
-
-    candidates = [(gt_mask, r, 1, True) for r in regionprops(gt_labels)]
-    for r in regionprops(label(pred & ~gt) if negatives == 'rims' else pred_labels):
-        near = touches(r)
-        if negatives == 'rims' or not near:
-            candidates.append((pred_mask, r, 0, near))
-    return candidates
+    gt_regions = regionprops(gt_labels)
+    pred_regions = [r for r in regionprops(pred_labels) if r.area >= MIN_TRACK_AREA_PX]
+    matched = np.zeros(len(pred_regions), bool)
+    if gt_regions and pred_regions:
+        width = pred_labels.max() + 1
+        both = gt & pred
+        inter = np.bincount(gt_labels[both] * width + pred_labels[both], minlength=(len(gt_regions) + 1) * width)
+        inter = inter.reshape(len(gt_regions) + 1, width)[1:]
+        inter = inter[:, [r.label for r in pred_regions]]
+        area_gt = np.array([r.area for r in gt_regions])[:, None]
+        area_pred = np.array([r.area for r in pred_regions])[None, :]
+        iou = inter / (area_gt + area_pred - inter)
+        for i, j in zip(*linear_sum_assignment(-iou)):
+            matched[j] = iou[i, j] >= iou_threshold
+    return [(r, int(m)) for r, m in zip(pred_regions, matched)]
 
 
 def fit_ellipses(mask):
-    """Ellipse fit of each outer contour of `mask` with area >= 10 px and at least 5 points.
+    """Ellipse fit of each outer contour of `mask` with area >= MIN_TRACK_AREA_PX and at least 5 points.
 
     Returns:
         list: Dicts with 'contour', 'center' (x, y), 'major_px', 'minor_px', 'angle_deg'.
@@ -529,12 +677,26 @@ def fit_ellipses(mask):
     contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ellipses = []
     for contour in contours:
-        if cv2.contourArea(contour) < 10 or len(contour) < 5:
+        if cv2.contourArea(contour) < MIN_TRACK_AREA_PX or len(contour) < 5:
             continue
         (cx, cy), (axis_a, axis_b), angle = cv2.fitEllipse(contour)
         ellipses.append({'contour': contour, 'center': (cx, cy), 'major_px': max(axis_a, axis_b),
                          'minor_px': min(axis_a, axis_b), 'angle_deg': angle})
     return ellipses
+
+
+def _ellipse_records(mask, image_filename, um_per_px):
+    """One record per fitted track of `mask`."""
+    records = []
+    for track_id, e in enumerate(fit_ellipses(mask), start=1):
+        record = {"image_filename": image_filename, "track_id": track_id,
+                  "centroid_x_px_ellipse": round(e['center'][0], 1), "centroid_y_px_ellipse": round(e['center'][1], 1),
+                  "major_axis_px": round(e['major_px'], 2), "minor_axis_px": round(e['minor_px'], 2),
+                  "orientation_deg": round(e['angle_deg'], 2)}
+        if um_per_px is not None:
+            record['len_um'] = round(e['major_px'] * um_per_px, 2)
+        records.append(record)
+    return records
 
 
 def extract_instances(binary_mask, um_per_px=None):
@@ -564,7 +726,7 @@ def _instance_iou(a, b):
     return inter / (a['area'] + b['area'] - inter) if inter else 0.0
 
 
-def match_instances_by_iou(gt_mask, pred_mask, iou_threshold=0.5, um_per_px=None):
+def match_instances_by_iou(gt_mask, pred_mask, iou_threshold=IOU_THRESHOLD, um_per_px=None):
     """Matches annotated and predicted instances with the assignment that maximises the total IoU (Hungarian
     algorithm), so that the result does not depend on the order of the instances; assigned pairs below
     `iou_threshold` are not matched.
@@ -584,30 +746,6 @@ def match_instances_by_iou(gt_mask, pred_mask, iou_threshold=0.5, um_per_px=None
     gt_log = [{'len_um': g['size'], 'is_true_positive': bool(hit)} for g, hit in zip(gt, gt_hit)]
     pred_log = [{'len_um': p['size'], 'is_true_positive': bool(hit)} for p, hit in zip(pred, pred_hit)]
     return gt_log, pred_log, pairs
-
-
-def binned_efficiency_table(gt_log, pred_log, num_bins=10, unit='um'):
-    """Recall (per annotated length) and precision (per reported length) in equal-population bins of the annotated
-    lengths.
-
-    Returns:
-        tuple: (table, df_gt, df_pred, bin edges).
-
-    Raises:
-        ValueError: If there are no annotated or no reported instances.
-    """
-    df_gt, df_pred = pd.DataFrame(gt_log), pd.DataFrame(pred_log)
-    if df_gt.empty or df_pred.empty:
-        raise ValueError("No annotated or no reported instances: the efficiency cannot be computed.")
-    df_gt['size_bin'], bins = pd.qcut(df_gt['len_um'], q=num_bins, retbins=True, duplicates='drop')
-    df_pred['size_bin'] = pd.cut(df_pred['len_um'], bins=bins, include_lowest=True)
-    table = pd.concat([
-        df_gt.groupby('size_bin', observed=False)['is_true_positive'].agg(Recall='mean', GT_Count='count'),
-        df_pred.groupby('size_bin', observed=False)['is_true_positive'].agg(Precision='mean', Pred_Count='count'),
-    ], axis=1)
-    table.index.name = f'Size Bin ({unit})'
-    table['Bin_mid'] = (bins[:-1] + bins[1:]) / 2
-    return table.fillna(0), df_gt, df_pred, bins
 
 
 def show_images(panels, title=None):
@@ -669,47 +807,564 @@ def _segmentation_scores(tp, fp, fn, beta):
             "Dice/F1": ratio(2 * tp, 2 * tp + fp + fn), "Recall": ratio(tp, tp + fn), "Precision": ratio(tp, tp + fp)}
 
 
-# ======================================================================================
-# DETECTION MODEL: recall, length response and false positives of the recognition pipeline
-#
-# Turns a sliced theoretical spectrum N_i (expected tracks per bin of etched size, nm) into the
-# histogram that OptimusPrimus is expected to report, with uncertainties:
-#     recall R_i (true/annotated length) -> length response M_ji -> false positives phi_j (per area)
-#     mu_j = sum_i M_ji R_i N_i + phi_j A                       (fp_mode='density', default)
-#     mu_j = (sum_i M_ji R_i N_i) / P_j                         (fp_mode='precision')
-# Uncertainties: Poisson variance mu_j plus a first-order calibration covariance C_cal.
-# The calibration uses the *_detection_logs.json written by OptimusPrimusTraining.evaluate_binned_efficiency
-# (see save_detection_logs / load_detection_logs).
-# All lengths are in nm; the logged lengths are in um and are converted with `len_scale`.
-# ======================================================================================
-def _records(log):
-    """Converts a validation log into a list of dictionaries.
+# ==========================================
+# TRAINING
+# ==========================================
+
+def _annotated_pairs(train_image_dir, train_cfg):
+    """(image, mask) pairs of the annotated tiles."""
+    mask_dir = os.path.join(train_image_dir, train_cfg['mask_subdir'])
+    for path, what in ((train_image_dir, "Image directory"), (mask_dir, "Mask directory")):
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"{what} not found at '{path}'")
+    pairs = []
+    for img_path in sorted(glob.glob(os.path.join(train_image_dir, train_cfg['image_extensions']))):
+        mask_path = os.path.join(mask_dir, os.path.splitext(os.path.basename(img_path))[0] + train_cfg['mask_extension'])
+        if os.path.exists(mask_path):
+            pairs.append([img_path, mask_path])
+    if not pairs:
+        raise FileNotFoundError(f"No image-mask pairs found in '{train_image_dir}' / '{mask_dir}'")
+    return pairs
+
+
+def _make_split(pairs, train_cfg):
+    """Train / val / test split of the annotated pairs (deterministic for a given file list and seed)."""
+    seed = train_cfg['split_seed']
+    test_size, val_size = int(len(pairs) * train_cfg['test_split_ratio']), int(len(pairs) * train_cfg['val_split_ratio'])
+    train_val, test = train_test_split(pairs, test_size=test_size, random_state=seed) if test_size > 0 else (pairs, [])
+    train, val = (train_test_split(train_val, test_size=val_size, random_state=seed)
+                  if 0 < val_size < len(train_val) else (train_val, []))
+    if not val:
+        raise ValueError(f"{len(pairs)} annotated tiles give an empty validation split: annotate more tiles.")
+    return {'train': train, 'val': val, 'test': test}
+
+
+def _held_out_paths(seg_record):
+    """Absolute paths of the validation and test tiles of a segmentation model (used by the descriptor). Paths, not
+    names: tile names such as Frame3_Acquisition_1_0_0.png repeat across samples."""
+    return {os.path.abspath(img) for split in ('val', 'test') for img, _ in seg_record['split'][split]}
+
+
+def train_segmentation(train_image_dir, image_spec, training_parameters=None, image_config=None, seg_model_config=None,
+                       train_image=None, models_root=MODELS_ROOT, parallel=True, overwrite=False, describe=True):
+    """Trains the segmentation network and stores it, with its training record and descriptor, in its own folder.
+
+    The folder and file name (`seg_model_name`) summarise the annotated set and the hyperparameters; the record
+    (<name>.json) holds the full configuration and the train/val/test split, which classifiers trained on this
+    model reuse. With `describe`, the segmentation-only descriptor at the operating threshold is computed on the
+    val + test tiles.
 
     Args:
-        log (list or pandas.DataFrame): Per-instance records.
+        train_image_dir (str): Folder with the annotated tiles; masks in its `mask_subdir`.
+        image_spec (str): Name of the annotated set (first part of the model name).
+        training_parameters, image_config, seg_model_config, train_image (dict, optional): Overrides of the module
+            defaults.
+        models_root (str, optional): Parent folder of the model folders. Defaults to MODELS_ROOT.
+        parallel (bool, optional): Without a GPU, load the data with all CPU cores.
+        overwrite (bool, optional): Retrain if a model with the same name exists. Defaults to False.
+        describe (bool, optional): Compute the descriptor after training. Defaults to True.
 
     Returns:
-        list: The records as dictionaries.
+        str: Path of the trained checkpoint.
+
+    Raises:
+        FileExistsError: If the model exists and `overwrite` is False.
     """
-    return log.to_dict('records') if hasattr(log, 'to_dict') else list(log)
+    train_cfg = {**TRAIN_IMAGE, **(train_image or {})}
+    img_cfg = {**IMAGE_CONFIG, **(image_config or {})}
+    seg_cfg = {**SEG_MODEL_CONFIG, **(seg_model_config or {})}
+    params = {**TRAINING_PARAMETERS, **(training_parameters or {})}
+
+    pairs = _annotated_pairs(train_image_dir, train_cfg)
+    split = _make_split(pairs, train_cfg)
+    name = seg_model_name(image_spec, len(pairs), _short_hash([os.path.basename(p[0]) for p in pairs]), seg_cfg, params)
+    model_dir = os.path.join(models_root, name)
+    seg_pth = os.path.join(model_dir, name + '.pth')
+    if os.path.exists(seg_pth):
+        if not overwrite:
+            raise FileExistsError(f"'{seg_pth}' exists: pass overwrite=True to retrain it.")
+        n_cls = len(glob.glob(os.path.join(model_dir, f"{name}__*.pth")))
+        if n_cls:
+            print(f"Warning: {n_cls} classifier(s) in '{model_dir}' were trained on the previous weights.")
+    os.makedirs(model_dir, exist_ok=True)
+
+    record = {'kind': 'segmentation', 'name': name, 'created': _now(), 'image_spec': image_spec,
+              'train_image_dir': train_image_dir, 'n_tiles': len(pairs),
+              'n_split': {k: len(v) for k, v in split.items()}, 'split': split, 'train_image': train_cfg,
+              'image_config': img_cfg,
+              'model': {k: seg_cfg[k] for k in ('model_arc', 'encoder', 'encoder_weights')},
+              'threshold': seg_cfg['threshold'],
+              'training_parameters': {k: v for k, v in params.items() if k.startswith('seg_')},
+              'augmentations': AUGMENTATION_PARAMETERS}
+    print(f"[SEGMENTATION] {name}\n  {len(pairs)} annotated tiles: {record['n_split']}")
+    record['training_result'] = _fit_segmentation(split['train'], split['val'], record, params, seg_pth, parallel)
+    _save_json(_record_path(seg_pth), record)
+    if describe:
+        describe_model(seg_pth)
+    print(f"[OUTPUT] segmentation model: {seg_pth}")
+    return seg_pth
 
 
-def load_detection_logs(path):
-    """Reads the validation logs written by `OptimusPrimusTraining.evaluate_binned_efficiency`.
+def _fit_segmentation(train_files, val_files, record, params, seg_pth, parallel):
+    """Training loop of the segmentation network (0.5 Dice + 0.5 BCE on logits, AdamW, ReduceLROnPlateau on the
+    monitored validation metric, early stopping after `seg_min_epochs`). Saves the best checkpoint at `seg_pth` and
+    the per-epoch metrics next to it.
+
+    Returns:
+        dict: best_epoch, best_metric, epochs_run, interrupted.
+    """
+    p, m, img = params, record['model'], record['image_config']
+    device = _device()
+    preprocessing = get_seg_preprocessing(m['encoder'], m['encoder_weights'])
+    resize = A.Resize(img['img_height'], img['img_width'], interpolation=cv2.INTER_LINEAR)
+    train_augs = A.Compose([resize, A.HorizontalFlip(p=AUGMENTATION_PARAMETERS['H_FLIP_PROB']),
+                            A.VerticalFlip(p=AUGMENTATION_PARAMETERS['V_FLIP_PROB']),
+                            A.RandomBrightnessContrast(p=AUGMENTATION_PARAMETERS['BRIGHTNESS_CONTRAST_PROB'])])
+    workers, pin = resolve_num_workers(parallel), torch.cuda.is_available()
+    train_loader = DataLoader(SegmentationDataset(train_files, train_augs, preprocessing), batch_size=p['seg_batch_size'],
+                              shuffle=True, num_workers=workers, pin_memory=pin, drop_last=True)
+    val_loader = DataLoader(SegmentationDataset(val_files, A.Compose([resize]), preprocessing), batch_size=p['seg_batch_size'],
+                            shuffle=False, num_workers=workers, pin_memory=pin)
+
+    model = _parallelize(build_seg_model(m['model_arc'], m['encoder'], m['encoder_weights'], device=device))
+    dice_loss, bce_loss = smp.losses.DiceLoss(mode="binary", from_logits=True), smp.losses.SoftBCEWithLogitsLoss()
+
+    def loss_fn(pred, target):
+        return 0.5 * dice_loss(pred, target) + 0.5 * bce_loss(pred, target)
+
+    optimizer = optim.AdamW(model.parameters(), lr=p['seg_learning_rate'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=8)
+    metrics_csv = os.path.splitext(seg_pth)[0] + "_training_metrics.csv"
+    best, best_epoch, counter, logs, interrupted = -1.0, 0, 0, [], False
+    try:
+        for epoch in range(p['seg_epochs']):
+            model.train()
+            train_loss = 0.0
+            for images, masks in tqdm(train_loader, desc=f"Seg train E{epoch + 1}", leave=False):
+                images, masks = images.to(device, dtype=torch.float32), masks.to(device, dtype=torch.float32)
+                optimizer.zero_grad()
+                loss = loss_fn(model(images), masks)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            model.eval()
+            val_loss, counts = 0.0, np.zeros(3)            # pixel tp, fp, fn over the whole validation set
+            with torch.no_grad():
+                for images, masks in val_loader:
+                    images, masks = images.to(device, dtype=torch.float32), masks.to(device, dtype=torch.float32)
+                    outputs = model(images)
+                    val_loss += loss_fn(outputs, masks).item()
+                    pred, truth = torch.sigmoid(outputs) > p['seg_threshold'], masks > 0.5
+                    counts += [(pred & truth).sum().item(), (pred & ~truth).sum().item(), (~pred & truth).sum().item()]
+            scores = _segmentation_scores(*counts, beta=p['seg_val_beta'])
+            logs.append({"epoch": epoch + 1, "train_loss": train_loss / max(len(train_loader), 1),
+                         "val_loss": val_loss / max(len(val_loader), 1), **{f"val_{k.lower()}": v for k, v in scores.items()}})
+            monitored = scores[p['seg_metric_to_monitor']]
+            print(f"Epoch {epoch + 1}: train loss {logs[-1]['train_loss']:.4f}, val loss {logs[-1]['val_loss']:.4f}, "
+                  f"{p['seg_metric_to_monitor']} {monitored:.4f}")
+
+            if monitored > best:
+                best, best_epoch, counter = monitored, epoch + 1, 0
+                torch.save(_state_dict(model), seg_pth)
+                print(f"Saved segmentation checkpoint: {seg_pth}")
+            else:
+                counter += 1
+                if counter >= p['seg_patience'] and epoch > p['seg_min_epochs']:
+                    print("Early stopping triggered")
+                    break
+            scheduler.step(monitored)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nTraining interrupted by user.")
+    finally:
+        pd.DataFrame(logs).to_csv(metrics_csv, index=False)
+        print(f"[INFO] Segmentation training finished. Metrics saved at: {metrics_csv}")
+    if best_epoch == 0:
+        raise RuntimeError("No segmentation checkpoint was saved.")
+    return {'best_epoch': best_epoch, 'best_metric': best, 'epochs_run': len(logs), 'interrupted': interrupted}
+
+
+def export_candidate_patches(seg_model, images, out_dir=None, seg_th=None, max_patches=None, context=True, seed=42,
+                             overwrite=False, parallel=True):
+    """Writes the classifier patches of the segmentation candidates of `images`, to be sorted by hand.
+
+    Each candidate gives <out_dir>/unsorted/<tile>__c<k>.png, exactly the 64x64 patch the classifier sees, and,
+    with `context`, <out_dir>/context/<tile>__c<k>.png, an unrotated view of the surroundings with the candidate
+    outlined. Move the files of unsorted/ into track/ or bkg/ (created empty), then train with
+    `train_classifier(seg_model, patches=out_dir)`. candidates.csv lists source tile, position and length of
+    every patch; export_info.json records model and threshold.
+
+    The validation and test tiles of the segmentation model are skipped: the descriptor is measured on them, and a
+    classifier trained on their candidates would bias it.
 
     Args:
-        path (str): Path of the *_detection_logs.json file.
+        seg_model (str): Segmentation model folder or .pth.
+        images (str or list): Images to take candidates from (see `collect_images`; one plane per z-stack).
+        out_dir (str, optional): Defaults to <model folder>/patches_manual_<images>.
+        seg_th (float, optional): Segmentation threshold. Defaults to the model's operating point.
+        max_patches (int, optional): Stop after this many patches, taking images in random order.
+        context (bool, optional): Also write the context views. Defaults to True.
+        seed (int, optional): Seed of the image order when `max_patches` is given.
+        overwrite (bool, optional): Delete patches already in out_dir (sorted ones included). Defaults to False.
 
     Returns:
-        dict: Keys 'gt_log', 'pred_log', 'pair_log', 'val_area_cm2' and 'length_unit'.
+        str: out_dir.
+
+    Raises:
+        FileExistsError: If out_dir already holds patches and `overwrite` is False.
     """
-    with open(path, 'r') as f:
-        logs = json.load(f)
-    logs['pair_log'] = [tuple(p) for p in logs['pair_log']]
-    return logs
+    seg_pth, seg_record = resolve_seg_model(seg_model)
+    seg_th = seg_record['threshold'] if seg_th is None else seg_th
+    out_dir = out_dir or os.path.join(os.path.dirname(seg_pth), f"patches_manual_{_images_tag(images)}")
+    subdirs = {k: os.path.join(out_dir, k) for k in ('unsorted', 'track', 'bkg', 'context')}
+    existing = [p for k in ('unsorted', 'track', 'bkg') for p in glob.glob(os.path.join(subdirs[k], '**', '*.png'), recursive=True)]
+    if existing and not overwrite:
+        raise FileExistsError(f"'{out_dir}' already holds {len(existing)} patches: pass overwrite=True to replace them "
+                              f"(sorted ones included) or choose another out_dir.")
+    for d in subdirs.values():
+        shutil.rmtree(d, ignore_errors=True)
+        if d != subdirs['context'] or context:
+            os.makedirs(d, exist_ok=True)
+
+    files = collect_images(images, parallel)
+    held_out = _held_out_paths(seg_record)
+    n_skipped = sum(os.path.abspath(f) in held_out for f in files)
+    files = [f for f in files if os.path.abspath(f) not in held_out]
+    if n_skipped:
+        print(f"{n_skipped} validation/test tiles of the segmentation model skipped.")
+    if not files:
+        raise ValueError("No images left after removing the validation/test tiles of the segmentation model.")
+    if max_patches is not None:
+        files = [files[k] for k in np.random.default_rng(seed).permutation(len(files))]
+
+    device = _device()
+    model, preprocessing = _load_seg(seg_pth, seg_record, device)
+    um = seg_record['image_config']['pixel_resolution_um_per_px']
+    rows, n_images = [], 0
+    for path in tqdm(files, desc="Exporting candidate patches"):
+        if max_patches is not None and len(rows) >= max_patches:
+            break
+        image, mask = predict_seg_mask(path, model, preprocessing, device, seg_th)
+        n_images += 1
+        stem = os.path.splitext(os.path.basename(path))[0]
+        for region in candidate_regions(mask):
+            if max_patches is not None and len(rows) >= max_patches:
+                break
+            fname = f"{stem}__c{region.label}.png"
+            patch = get_64x64_centered_patch(image, mask, region)
+            cv2.imwrite(os.path.join(subdirs['unsorted'], fname), cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
+            if context:
+                cv2.imwrite(os.path.join(subdirs['context'], fname), cv2.cvtColor(context_crop(image, region), cv2.COLOR_RGB2BGR))
+            cy, cx = region.centroid
+            rows.append({'patch': fname, 'source_image': path, 'centroid_x_px': round(cx, 1), 'centroid_y_px': round(cy, 1),
+                         'area_px': int(region.area),
+                         'len_um': round(region.axis_major_length * um, 2) if um else None})
+
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, 'candidates.csv'), index=False)
+    _save_json(os.path.join(out_dir, 'export_info.json'),
+               {'seg_model': seg_record['name'], 'seg_th': seg_th, 'images': images if isinstance(images, str) else list(images),
+                'n_images': n_images, 'n_patches': len(rows), 'created': _now()})
+    print(f"[OUTPUT] {len(rows)} patches from {n_images} images in {subdirs['unsorted']}\n"
+          f"  Next: move each file of unsorted/ into track/ or bkg/ (leave doubtful ones in unsorted/, they are not used),"
+          f"\n  then train_classifier('{seg_pth}', patches='{out_dir}').")
+    return out_dir
 
 
-def save_detection_logs(path, gt_log, pred_log, pair_log, val_area_cm2, length_unit='um'):
+def _png_samples(folder, target):
+    return [(p, target) for p in sorted(glob.glob(os.path.join(folder, '*.png')))]
+
+
+def _folder_patches(patch_dir, seg_record):
+    """Hand-sorted patches: <patch_dir>/track and /bkg (split train/val here), or <patch_dir>/train|val/track|bkg.
+
+    Returns:
+        tuple: (train samples, val samples, source dict for the record).
+    """
+    if not os.path.isdir(patch_dir):
+        raise FileNotFoundError(f"Patch folder not found at '{patch_dir}'")
+    info_path = os.path.join(patch_dir, 'export_info.json')
+    info = None
+    if os.path.exists(info_path):
+        with open(info_path) as f:
+            info = json.load(f)
+    if info and info['seg_model'] != seg_record['name']:
+        print(f"Warning: the patches were exported with '{info['seg_model']}', not with '{seg_record['name']}'.")
+    csv_path = os.path.join(patch_dir, 'candidates.csv')
+    source_of = dict(pd.read_csv(csv_path)[['patch', 'source_image']].itertuples(index=False)) if os.path.exists(csv_path) else {}
+    held_out = _held_out_paths(seg_record)
+
+    def check_leak(samples):
+        leaked = [p for p, _ in samples if os.path.abspath(str(source_of.get(os.path.basename(p), ''))) in held_out]
+        if leaked:
+            raise ValueError(f"{len(leaked)} patches come from validation/test tiles of the segmentation model "
+                             f"(e.g. {os.path.basename(leaked[0])}): remove them, the descriptor is measured on those tiles.")
+
+    if all(os.path.isdir(os.path.join(patch_dir, s)) for s in ('train', 'val')):
+        train = _png_samples(os.path.join(patch_dir, 'train', 'track'), 1) + _png_samples(os.path.join(patch_dir, 'train', 'bkg'), 0)
+        val = _png_samples(os.path.join(patch_dir, 'val', 'track'), 1) + _png_samples(os.path.join(patch_dir, 'val', 'bkg'), 0)
+        split_mode = 'given'
+    else:
+        samples = _png_samples(os.path.join(patch_dir, 'track'), 1) + _png_samples(os.path.join(patch_dir, 'bkg'), 0)
+        n_pos = sum(t for _, t in samples)
+        if min(n_pos, len(samples) - n_pos) < 2:
+            raise ValueError(f"'{patch_dir}' needs at least 2 patches in each of track/ and bkg/ ({n_pos} track, "
+                             f"{len(samples) - n_pos} bkg): sort the files of unsorted/ first.")
+        check_leak(samples)
+        n_val = max(2, int(round(MANUAL_PATCH_VAL_RATIO * len(samples))))
+        train, val = train_test_split(samples, test_size=n_val, random_state=TRAIN_IMAGE['split_seed'],
+                                      stratify=[t for _, t in samples])
+        split_mode = f'random {MANUAL_PATCH_VAL_RATIO:g}'
+    check_leak(train + val)
+
+    rel = [os.path.relpath(p, patch_dir) for p, _ in train + val]
+    n_track = sum(t for _, t in train + val)
+    source = {'type': 'manual', 'folder': patch_dir, 'split': split_mode, 'n_track': n_track,
+              'n_bkg': len(rel) - n_track, 'hash': _short_hash(rel), 'export_info': info,
+              'tag': f"manual-{_slug(os.path.basename(os.path.normpath(patch_dir)))}-n{len(rel)}-{_short_hash(rel)}"}
+    return train, val, source
+
+
+def _auto_patches(seg_pth, seg_record, seg_th, keep_patches_in_memory):
+    """Automatically labelled patches (see `label_candidates`) of the train and val tiles of the segmentation model.
+    Without `keep_patches_in_memory` they are written under <model folder>/patches_auto_pt<seg_th>/ (rewritten).
+
+    Returns:
+        tuple: (train samples, val samples, source dict for the record).
+    """
+    device = _device()
+    model, preprocessing = _load_seg(seg_pth, seg_record, device)
+    cache = os.path.join(os.path.dirname(seg_pth), f"patches_auto_pt{seg_th:g}")
+    if not keep_patches_in_memory:
+        shutil.rmtree(cache, ignore_errors=True)
+    out, counts = {}, {}
+    for split in ('train', 'val'):
+        samples = []
+        for img_path, mask_path in tqdm(seg_record['split'][split], desc=f"Patches ({split})", leave=False):
+            image, pred_mask = predict_seg_mask(img_path, model, preprocessing, device, seg_th)
+            gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            stem = os.path.splitext(os.path.basename(img_path))[0]
+            for region, target in label_candidates(gt_mask, pred_mask):
+                patch = get_64x64_centered_patch(image, pred_mask, region)
+                if keep_patches_in_memory:
+                    samples.append((patch, target))
+                    continue
+                folder = os.path.join(cache, split, 'track' if target else 'bkg')
+                os.makedirs(folder, exist_ok=True)
+                path = os.path.join(folder, f"{stem}__c{region.label}.png")
+                cv2.imwrite(path, cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
+                samples.append((path, target))
+        n_pos = sum(t for _, t in samples)
+        counts[split] = {'track': n_pos, 'bkg': len(samples) - n_pos}
+        print(f"[{split}] {n_pos} track / {len(samples) - n_pos} bkg candidates")
+        out[split] = samples
+    total = len(out['train']) + len(out['val'])
+    if keep_patches_in_memory and total > MAX_IN_MEMORY_PATCHES_WARNING:
+        print(f"Warning: {total} patches (~{total * 64 * 64 * 3 / 1024 ** 2:.0f} MB) are held in RAM; "
+              f"consider keep_patches_in_memory=False.")
+    source = {'type': 'auto', 'labelling': f'segmentation candidates, Hungarian IoU >= {IOU_THRESHOLD:g} with the annotations',
+              'counts': counts, 'folder': None if keep_patches_in_memory else cache, 'tag': 'auto'}
+    return out['train'], out['val'], source
+
+
+def train_classifier(seg_model, patches='auto', training_parameters=None, class_model_config=None, seg_th=None,
+                     keep_patches_in_memory=False, overwrite=False, describe=True):
+    """Trains the patch classifier on the candidates of a segmentation model; stores it, with its record and
+    descriptor, in the segmentation model folder as <SEG_NAME>__<CLS_TAG>.pth.
+
+    Args:
+        seg_model (str): Segmentation model folder or .pth.
+        patches (str, optional): 'auto' (default): candidates of the model's train/val tiles, labelled by matching
+            them to the annotations (`label_candidates`). Otherwise a folder of hand-sorted patches, with
+            track/ and bkg/ (or train/ and val/, each with track/ and bkg/), e.g. from `export_candidate_patches`.
+            The two sources are never mixed.
+        training_parameters, class_model_config (dict, optional): Overrides of the module defaults.
+        seg_th (float, optional): Segmentation threshold of the automatic candidates. Defaults to the model's
+            operating point; for a patch folder, the threshold of its export is used.
+        keep_patches_in_memory (bool, optional): Automatic patches in RAM instead of PNG files. Defaults to False.
+        overwrite (bool, optional): Retrain if a classifier with the same name exists. Defaults to False.
+        describe (bool, optional): Compute the segmentation + classification descriptor after training.
+
+    Returns:
+        str: Path of the trained checkpoint.
+    """
+    seg_pth, seg_record = resolve_seg_model(seg_model)
+    cls_cfg = {**CLASS_MODEL_CONFIG, **(class_model_config or {})}
+    params = {**TRAINING_PARAMETERS, **(training_parameters or {})}
+
+    if isinstance(patches, str) and patches == 'auto':
+        patch_th = seg_record['threshold'] if seg_th is None else seg_th
+        train_samples, val_samples, source = _auto_patches(seg_pth, seg_record, patch_th, keep_patches_in_memory)
+    else:
+        train_samples, val_samples, source = _folder_patches(patches, seg_record)
+        info = source['export_info']
+        patch_th = info['seg_th'] if info else (seg_record['threshold'] if seg_th is None else seg_th)
+    for split, samples in (('train', train_samples), ('val', val_samples)):
+        n_pos = sum(t for _, t in samples)
+        if n_pos == 0 or n_pos == len(samples):
+            raise ValueError(f"The {split} samples have no {'track' if n_pos == 0 else 'bkg'} patches "
+                             f"({len(samples)} samples): the classifier cannot be trained.")
+
+    tag = cls_model_tag(source['tag'], patch_th, cls_cfg, params)
+    cls_pth = os.path.join(os.path.dirname(seg_pth), f"{seg_record['name']}__{tag}.pth")
+    if os.path.exists(cls_pth) and not overwrite:
+        raise FileExistsError(f"'{cls_pth}' exists: pass overwrite=True to retrain it.")
+    record = {'kind': 'classification', 'name': os.path.splitext(os.path.basename(cls_pth))[0], 'tag': tag,
+              'created': _now(), 'seg_model': seg_record['name'], 'patch_threshold': patch_th,
+              'source': {k: v for k, v in source.items() if k != 'tag'},
+              'n_samples': {'train': len(train_samples), 'val': len(val_samples)},
+              'model': {k: cls_cfg[k] for k in ('encoder', 'pretrained')}, 'threshold': cls_cfg['threshold'],
+              'training_parameters': {k: v for k, v in params.items() if k.startswith('class_')}}
+    print(f"[CLASSIFICATION] {record['name']}")
+    record['training_result'] = _fit_classifier(train_samples, val_samples, cls_cfg, params, cls_pth)
+    _save_json(_record_path(cls_pth), record)
+    if describe:
+        describe_model(seg_pth, cls_pth)
+    print(f"[OUTPUT] classification model: {cls_pth}")
+    return cls_pth
+
+
+def _fit_classifier(train_samples, val_samples, cls_cfg, params, cls_pth):
+    """Training loop of the classifier (weighted BCE, AdamW, ReduceLROnPlateau on the validation loss; the
+    checkpoint with the best validation Dice is kept at `cls_pth`, the per-epoch metrics next to it).
+
+    Returns:
+        dict: best_epoch, best_val_dice, epochs_run.
+    """
+    p = params
+    device = _device()
+    train_loader = DataLoader(TrackDataset(train_samples, get_class_transform(train=True)), batch_size=p['class_batch_size'], shuffle=True)
+    val_loader = DataLoader(TrackDataset(val_samples, get_class_transform()), batch_size=p['class_batch_size'], shuffle=False)
+
+    model = _parallelize(build_class_model(cls_cfg['encoder'], pretrained=cls_cfg['pretrained'], device=device))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([p['class_boost_precision_weight']], device=device))
+    optimizer = optim.AdamW(model.parameters(), lr=p['class_learning_rate'], weight_decay=1e-3)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=p['class_patience'])
+
+    best_dice, best_epoch, logs, eps = -1.0, 0, [], 1e-8      # -1: the first epoch is always saved, even if its Dice is 0
+    for epoch in range(p['class_epochs']):
+        model.train()
+        train_loss = 0.0
+        for imgs, labels in tqdm(train_loader, desc=f"Class train E{epoch + 1}", leave=False):
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(imgs), labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss, tp, fp, fn, tn = 0.0, 0, 0, 0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                val_loss += loss_fn(outputs, labels).item()
+                pred, truth = torch.sigmoid(outputs) > p['class_threshold'], labels > 0.5
+                tp += (pred & truth).sum().item()
+                fp += (pred & ~truth).sum().item()
+                fn += (~pred & truth).sum().item()
+                tn += (~pred & ~truth).sum().item()
+        val_loss /= max(len(val_loader), 1)
+        logs.append({"epoch": epoch + 1, "train_loss": train_loss / max(len(train_loader), 1), "val_loss": val_loss,
+                     "val_accuracy": (tp + tn) / (tp + tn + fp + fn + eps), "val_precision": tp / (tp + fp + eps),
+                     "val_recall": tp / (tp + fn + eps), "val_iou": tp / (tp + fp + fn + eps),
+                     "val_dice": 2 * tp / (2 * tp + fp + fn + eps)})
+        scheduler.step(val_loss)
+        if logs[-1]['val_dice'] > best_dice:
+            best_dice, best_epoch = logs[-1]['val_dice'], epoch + 1
+            torch.save(_state_dict(model), cls_pth)
+            print(f"Epoch {epoch + 1}: val Dice {best_dice:.4f}, saved classification checkpoint: {cls_pth}")
+
+    metrics_csv = os.path.splitext(cls_pth)[0] + "_training_metrics.csv"
+    pd.DataFrame(logs).to_csv(metrics_csv, index=False)
+    print(f"[INFO] Classification training finished. Metrics saved at: {metrics_csv}")
+    return {'best_epoch': best_epoch, 'best_val_dice': best_dice, 'epochs_run': len(logs)}
+
+
+def train_all(train_image_dir, image_spec, training_parameters=None, image_config=None, seg_model_config=None,
+              class_model_config=None, train_image=None, models_root=MODELS_ROOT, parallel=True, overwrite=False,
+              keep_patches_in_memory=False):
+    """Segmentation training, automatic classifier patches and classifier training, each with its descriptor.
+
+    Returns:
+        tuple: (segmentation checkpoint, classification checkpoint).
+    """
+    seg_pth = train_segmentation(train_image_dir, image_spec, training_parameters, image_config, seg_model_config,
+                                 train_image, models_root, parallel, overwrite)
+    cls_pth = train_classifier(seg_pth, 'auto', training_parameters, class_model_config,
+                               keep_patches_in_memory=keep_patches_in_memory, overwrite=overwrite)
+    return seg_pth, cls_pth
+
+
+# ==========================================
+# DESCRIPTOR (measured on the annotated validation + test tiles)
+# ==========================================
+
+def describe_model(seg_model, cls_model=None, seg_th=None, cls_th=None, edges_nm=DEFAULT_BIN_EDGES_NM, visualize=False):
+    """Runs the chain on the validation + test tiles of the segmentation model, matches the result to the annotations
+    and writes, in the model folder, the per-instance detection logs (json) and the descriptor table on `edges_nm`
+    (csv). Called automatically at the end of training; call it again for other thresholds.
+
+    Args:
+        seg_model (str): Segmentation model folder or .pth.
+        cls_model (str, optional): Classifier .pth; None describes the segmentation-only chain.
+        seg_th, cls_th (float, optional): Thresholds. Default to the operating points stored with the models.
+        edges_nm (np.ndarray, optional): Bin edges of the csv table [nm].
+        visualize (bool, optional): Show image, annotation and prediction of each tile.
+
+    Returns:
+        pandas.DataFrame: The descriptor table (see `detection_descriptor`).
+    """
+    seg_pth, seg_record = resolve_seg_model(seg_model)
+    seg_th = seg_record['threshold'] if seg_th is None else seg_th
+    cls_pth, cls_record = resolve_cls_model(cls_model, seg_record) if cls_model is not None else (None, None)
+    if cls_record is not None:
+        cls_th = cls_record['threshold'] if cls_th is None else cls_th
+    mode = 'seg' if cls_pth is None else 'seg_class'
+
+    device = _device()
+    seg_net, preprocessing = _load_seg(seg_pth, seg_record, device)
+    cls_net = _load_cls(cls_pth, cls_record, device) if cls_pth else None
+    transform = get_class_transform()
+    um = seg_record['image_config']['pixel_resolution_um_per_px']
+
+    files = seg_record['split']['val'] + seg_record['split']['test']
+    gt_log, pred_log, pair_log, area_cm2 = [], [], [], 0.0
+    for img_path, mask_path in tqdm(files, desc=f"Descriptor ({mode})"):
+        gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        image, pred_mask = predict_seg_mask(img_path, seg_net, preprocessing, device, seg_th)
+        if cls_net is not None:
+            pred_mask = create_class_mask(image, pred_mask, cls_net, transform, device, cls_th)
+        g, r, pairs = match_instances_by_iou(gt_mask, pred_mask, IOU_THRESHOLD, um)
+        gt_log += g
+        pred_log += r
+        pair_log += pairs
+        if um is not None:
+            area_cm2 += gt_mask.shape[0] * gt_mask.shape[1] * (um * 1e-4) ** 2
+        if visualize:
+            show_images([(image, "Input"), (gt_mask, "Annotation"), (pred_mask, mode)], title=os.path.basename(img_path))
+
+    logs_path, table_path, base = descriptor_paths(seg_pth, seg_th, cls_pth, cls_th)
+    meta = {'mode': mode, 'seg_model': seg_record['name'], 'seg_th': seg_th,
+            'cls_model': cls_record['name'] if cls_record else None, 'cls_th': cls_th if cls_record else None,
+            'iou_threshold': IOU_THRESHOLD, 'n_tiles': len(files), 'created': _now()}
+    save_detection_logs(logs_path, gt_log, pred_log, pair_log, area_cm2 if um is not None else None,
+                        'um' if um is not None else 'px', meta)
+    n_tp = sum(r['is_true_positive'] for r in gt_log)
+    n_tpp = sum(r['is_true_positive'] for r in pred_log)
+    print(f"[{mode}] {len(files)} val+test tiles: recall {n_tp / max(len(gt_log), 1):.3f}, "
+          f"precision {n_tpp / max(len(pred_log), 1):.3f} | TP {n_tp}, FP {len(pred_log) - n_tpp}, FN {len(gt_log) - n_tp}")
+    if um is None:
+        print("No pixel calibration: the descriptor table needs lengths in um and the area; only the logs were written.")
+        return None
+    table = detection_descriptor(load_detection_logs(logs_path), edges_nm)
+    table.to_csv(table_path, index=False)
+    print(f"[OUTPUT] descriptor: {table_path}")
+    return table
+
+
+def save_detection_logs(path, gt_log, pred_log, pair_log, val_area_cm2, length_unit='um', meta=None):
     """Writes the per-instance validation logs read by `load_detection_logs`.
 
     Args:
@@ -718,27 +1373,44 @@ def save_detection_logs(path, gt_log, pred_log, pair_log, val_area_cm2, length_u
         pair_log (list): (annotated, reported) lengths of the matched pairs.
         val_area_cm2 (float or None): Total area of the validation images [cm^2] (None without pixel calibration).
         length_unit (str, optional): 'um' or 'px'. Defaults to 'um'.
+        meta (dict, optional): Models and thresholds the logs refer to.
     """
     payload = {
+        'meta': meta or {},
         'length_unit': length_unit,
         'val_area_cm2': None if val_area_cm2 is None else float(val_area_cm2),
         'gt_log': [{'len_um': float(r['len_um']), 'is_true_positive': bool(r['is_true_positive'])} for r in gt_log],
         'pred_log': [{'len_um': float(r['len_um']), 'is_true_positive': bool(r['is_true_positive'])} for r in pred_log],
         'pair_log': [[float(a), float(b)] for a, b in pair_log],
     }
-    with open(path, 'w') as f:
-        json.dump(payload, f)
+    _save_json(path, payload)
+
+
+def load_detection_logs(path):
+    """Reads the validation logs written by `describe_model`.
+
+    Returns:
+        dict: Keys 'meta', 'gt_log', 'pred_log', 'pair_log', 'val_area_cm2' and 'length_unit'.
+    """
+    if path is None or not os.path.exists(path):
+        raise FileNotFoundError(f"Detection logs not found ({path}): run describe_model for these models and thresholds.")
+    with open(path, 'r') as f:
+        logs = json.load(f)
+    logs['pair_log'] = [tuple(p) for p in logs['pair_log']]
+    return logs
 
 
 def _length_pair_inliers(gt_len, pred_len, n_mad=5., max_iter=5):
-    """Pairs kept for the length-response fit: residuals of a linear bias fit within `n_mad` robust standard
-    deviations (1.4826 MAD), iterated. Rejects gross ellipse-fit failures, e.g. on tracks cut by the tile border.
+    """Pairs kept for the length response: residuals of a linear bias fit within `n_mad` robust standard deviations
+    (1.4826 MAD), iterated. Rejects gross ellipse-fit failures, e.g. on tracks cut by the tile border.
 
     Returns:
         np.ndarray: Boolean mask of the kept pairs.
     """
-    resid = pred_len - gt_len
     keep = np.ones(len(gt_len), bool)
+    if len(gt_len) < 10:
+        return keep
+    resid = pred_len - gt_len
     for _ in range(max_iter):
         b1, b0 = np.polyfit(gt_len[keep], resid[keep], 1)
         r = resid - (b0 + b1 * gt_len)
@@ -750,1208 +1422,275 @@ def _length_pair_inliers(gt_len, pred_len, n_mad=5., max_iter=5):
     return keep
 
 
-def fit_length_response(gt_len, pred_len):
-    """Fits the length-measurement response from matched (annotated, reported) pairs.
+def _nearest_populated(ok):
+    """Index of each bin itself if `ok`, else of the nearest bin that is."""
+    good = np.where(ok)[0]
+    if len(good) == 0:
+        raise ValueError("No bin is populated enough: use coarser bins.")
+    return np.array([i if ok[i] else good[np.argmin(np.abs(good - i))] for i in range(len(ok))])
 
-    The bias is b(L) = b0 + b1 L and the variance sigma^2(L) = s0^2 + (s1 L)^2. Pass inlier pairs (see
-    `calibrate_detection_model`, which removes gross outliers first).
 
-    Args:
-        gt_len (np.ndarray): Annotated lengths.
-        pred_len (np.ndarray): Lengths reported for the same tracks.
+def detection_descriptor(logs, edges_nm=DEFAULT_BIN_EDGES_NM, min_count=DESCRIPTOR_MIN_COUNT, min_pairs=DESCRIPTOR_MIN_PAIRS):
+    """Binned description of the detection chain on the annotated validation + test tiles.
 
-    Returns:
-        tuple: ((b0, b1), (s0^2, s1^2)).
+    Per bin of annotated (true) length: G annotated tracks, TP detected, FN missed, recall = TP/G, fn_rate = FN/G,
+    and the length response of the matched pairs, bias = mean(reported - annotated) and sigma = std. Per bin of
+    reported length: Q reported tracks, FP false, precision, fp_per_cm2 = FP / validation area.
 
-        Raises:
-            FileNotFoundError: If the designated calibration file is not found on disk.
-        """
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"ERROR: CSV file not found at '{csv_path}'")
-        
-        if 'segmentation' in csv_path:
-            self.seg_efficiency_table = pd.read_csv(csv_path, index_col=0)
-            print("Loading efficiency table from CSV and storing it in self.seg_efficiency_table.")
-        elif 'seg_class' in csv_path:
-            self.seg_cls_efficiency_table = pd.read_csv(csv_path, index_col=0)
-            print("Loading efficiency table from CSV and storing it in self.seg_cls_efficiency_table.")
-        
-    def apply_detection_model_efficiency(self, x_bins, counts, meas_error=1000.):
-        """Applies empirical calibration correction parameters over raw counts using loaded efficiency data.
-
-        Args:
-            x_bins (np.ndarray): Geometric size bin boundaries matching calibration curves.
-            counts (np.ndarray): Collected raw instance frequency numbers per bin interval.
-            meas_error (float, optional): Experimental measurement system error parameter. Defaults to 1000.0.
-
-        Returns:
-            np.ndarray: Corrected and calibrated distribution spectrum array matching inputs shape.
-        """
-        if self.seg_cls_efficiency_table is not None:
-            efficiency_table = self.seg_cls_efficiency_table
-        elif self.seg_efficiency_table is not None:
-            efficiency_table = self.seg_efficiency_table
-        else:
-            print("Efficiency tables not initialized.")
-            return counts
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        recall = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Recall'])
-        precision = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Precision'])
-
-        counts_with_efficiency = counts * recall / precision
-        counts_with_measure = smear_spectrum(counts_with_efficiency, len(x_bins)//2*2-1, meas_error/np.diff(x_bins)[0], meas_error/np.diff(x_bins)[0])
-        return counts_with_measure
-
-    def _load_image_groups(self):
-        """Scans the image directory and groups multi-focus sequential structures via regex parsing.
-
-        Returns:
-            defaultdict: Map tracking frame acquisition coordinate blocks to raw tile paths.
-
-        Raises:
-            FileNotFoundError: If the base tile processing directory structure does not exist.
-        """
-        if not os.path.isdir(self.image_path):
-            raise FileNotFoundError(f"ERROR: Image folder not found at '{self.image_path}'")
-
-        image_files = sorted(glob.glob(os.path.join(self.image_path, '*.png')))
-        file_pattern = re.compile(r'Frame(\d+)_Acquisition_(\d+)_(\d+)_(\d+).png')
-        image_groups = defaultdict(list)
-
-        for fpath in image_files:
-            fname = os.path.basename(fpath)
-            match = file_pattern.match(fname)
-            if match:
-                n, image_id, top, left = match.groups()
-                group_key = f"Frame{n}_{top}_{left}"
-                image_groups[group_key].append(fpath)
-
-        img_area_cm2 = self.img_height * self.img_width * (self.pixel_resolution_um_per_px * 1e-4)**2
-        self.tot_area_cm2 = len(image_groups) * img_area_cm2
-        return image_groups
-    
-    def _image_quality_analysis(self, image_groups, max_workers=None, n_top_images=5):
-        """Filters spatial group cohorts down to top focus stacks using concurrent workers.
+    The *_fold columns are what `detection_model` uses: recall and length response of bins with fewer than
+    `min_count` annotated tracks / `min_pairs` matched pairs are taken from the nearest populated bin (marked in
+    'borrowed_recall' / 'borrowed_response'). Gross length outliers are excluded from the response first.
 
     Args:
-        model (dict): Output of `calibrate_detection_model`.
-        return_errors (bool, optional): If True, the standard deviations are also returned. Defaults to False.
+        logs (dict): Output of `load_detection_logs`.
+        edges_nm (np.ndarray, optional): Bin edges [nm], shared with the theoretical spectrum and the measurement.
 
     Returns:
-        tuple: (R, P) or (R, P, sigma_R, sigma_P).
+        pandas.DataFrame: One row per bin; attrs hold 'area_cm2', 'n_pairs', 'n_pairs_rejected' and 'meta'.
     """
-    R, varR = _beta_mean_var(model['Ra'], model['Rb'])
-    P, varP = _beta_mean_var(model['TPp'] + 0.5, model['FP'] + 0.5)
-    return (R, P, np.sqrt(varR), np.sqrt(varP)) if return_errors else (R, P)
-
-
-def detection_response_matrix(edges, bias, var, n_sub=5):
-    """Builds the length-migration matrix M[j, i] = P(reported in bin j | true length in bin i).
-
-    Columns sum to at most one: the remainder migrates outside the histogram range.
-
-    Args:
-        edges (np.ndarray): Bin edges [nm].
-        bias (tuple): (b0, b1) of the length bias.
-        var (tuple): (s0^2, s1^2) of the length variance.
-        n_sub (int, optional): Sub-points per true bin used to integrate over the bin. Defaults to 5.
-
-    Returns:
-        np.ndarray: Matrix of shape (n_bins, n_bins).
-    """
-    edges = np.asarray(edges, float)
+    if logs['length_unit'] != 'um' or logs['val_area_cm2'] is None:
+        raise ValueError("The descriptor needs logs with lengths in um and the validation area (pixel calibration).")
+    edges = np.asarray(edges_nm, float)
     nb = len(edges) - 1
-    b0, b1 = bias
-    s0sq, s1sq = var
+    g_len = np.array([r['len_um'] for r in logs['gt_log']], float) * 1e3
+    g_tp = np.array([r['is_true_positive'] for r in logs['gt_log']], bool)
+    p_len = np.array([r['len_um'] for r in logs['pred_log']], float) * 1e3
+    p_tp = np.array([r['is_true_positive'] for r in logs['pred_log']], bool)
+    pairs = np.asarray(logs['pair_log'], float).reshape(-1, 2) * 1e3
+    if len(pairs) == 0:
+        raise ValueError("No matched pairs in the logs.")
+
+    def binned(x, weights=None):
+        idx = np.digitize(x, edges) - 1
+        ok = (idx >= 0) & (idx < nb)
+        return np.bincount(idx[ok], weights=None if weights is None else weights[ok], minlength=nb)
+
+    G, TP = binned(g_len), binned(g_len[g_tp])
+    Q, TPp = binned(p_len), binned(p_len[p_tp])
+    FN, FP = G - TP, Q - TPp
+    area = float(logs['val_area_cm2'])
+
+    inliers = _length_pair_inliers(pairs[:, 0], pairs[:, 1])
+    true_len, resid = pairs[inliers, 0], pairs[inliers, 1] - pairs[inliers, 0]
+    n_pairs = binned(true_len)
+    s1, s2 = binned(true_len, resid), binned(true_len, resid ** 2)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        recall = np.where(G > 0, TP / G, np.nan)
+        precision = np.where(Q > 0, TPp / Q, np.nan)
+        bias = np.where(n_pairs > 0, s1 / n_pairs, np.nan)
+        sigma = np.where(n_pairs > 1, np.sqrt(np.maximum(s2 - n_pairs * bias ** 2, 0.) / (n_pairs - 1)), np.nan)
+
+    src_r = _nearest_populated(G >= min_count)
+    src_m = _nearest_populated(n_pairs >= max(min_pairs, 2))
+    table = pd.DataFrame({
+        'bin_lo_nm': edges[:-1], 'bin_hi_nm': edges[1:],
+        'G': G, 'TP': TP, 'FN': FN, 'recall': recall, 'fn_rate': 1. - recall,
+        'Q': Q, 'FP': FP, 'precision': precision, 'fp_per_cm2': FP / area,
+        'n_pairs': n_pairs, 'bias_nm': bias, 'sigma_nm': sigma,
+        'recall_fold': recall[src_r], 'bias_fold_nm': bias[src_m], 'sigma_fold_nm': sigma[src_m],
+        'borrowed_recall': src_r != np.arange(nb), 'borrowed_response': src_m != np.arange(nb)})
+    table.attrs = {'area_cm2': area, 'n_pairs': int(inliers.sum()), 'n_pairs_rejected': int((~inliers).sum()),
+                   'meta': logs.get('meta', {})}
+    return table
+
+
+# ==========================================
+# DETECTION MODEL: mu_j = sum_i M_ji R_i N_i + phi_j A
+# ==========================================
+
+def migration_matrix(edges_nm, bias_nm, sigma_nm, n_sub=5):
+    """Length migration M[j, i] = P(reported in bin j | true length in bin i): a Gaussian of mean L + bias_i and
+    standard deviation sigma_i, averaged over `n_sub` points L of the true bin. Columns sum to at most one (the
+    rest migrates outside the histogram).
+
+    Returns:
+        np.ndarray: Matrix (n_bins, n_bins).
+    """
+    edges = np.asarray(edges_nm, float)
+    nb = len(edges) - 1
     M = np.zeros((nb, nb))
     for i in range(nb):
-        lo, hi = edges[i], edges[i + 1]
-        L = lo + (np.arange(n_sub) + 0.5) / n_sub * (hi - lo)
-        mean = L + b0 + b1 * L
-        sig = np.maximum(np.sqrt(s0sq + s1sq * L ** 2), 1.0)
-        cdf = _norm.cdf((edges[:, None] - mean[None, :]) / sig[None, :])
+        L = edges[i] + (np.arange(n_sub) + 0.5) / n_sub * (edges[i + 1] - edges[i])
+        cdf = _norm.cdf((edges[:, None] - (L + bias_nm[i])[None, :]) / max(sigma_nm[i], 1.0))
         M[:, i] = np.diff(cdf, axis=0).mean(axis=1)
     return M
 
 
-def _response_shifts(model):
-    """Length-response parameters displaced by +1 sigma along each independent direction.
-
-    The directions are the two principal axes of the (b1, b0) fit covariance and a relative error
-    sqrt(2 / n_pairs) on each of the two variance coefficients.
-
-    Args:
-        model (dict): Output of `calibrate_detection_model`.
+def detection_model(descriptor):
+    """Detection model built from a descriptor table: recall R_i, migration M_ji and false-positive rate phi_j.
 
     Returns:
-        list: Four (bias, var) parameter sets.
+        dict: edges [nm], R, M, phi [per cm^2 per bin].
     """
-    gt, pr = model['pairs'][:, 0], model['pairs'][:, 1]
-    _, cov = np.polyfit(gt, pr - gt, 1, cov=True)           # covariance of [b1, b0]
-    w, v = np.linalg.eigh(cov)
-    (b0, b1), (s0sq, s1sq) = model['bias'], model['var']
-    out = []
-    for k in range(2):
-        d = v[:, k] * np.sqrt(max(w[k], 0.))
-        out.append(((b0 + d[1], b1 + d[0]), (s0sq, s1sq)))
-    rel = np.sqrt(2. / len(gt))
-    out.append(((b0, b1), (s0sq * (1. + rel), s1sq)))
-    out.append(((b0, b1), (s0sq, s1sq * (1. + rel))))
-    return out
+    edges = np.append(descriptor['bin_lo_nm'].to_numpy(), descriptor['bin_hi_nm'].iloc[-1])
+    return {'edges': edges, 'R': descriptor['recall_fold'].to_numpy(),
+            'M': migration_matrix(edges, descriptor['bias_fold_nm'].to_numpy(), descriptor['sigma_fold_nm'].to_numpy()),
+            'phi': descriptor['fp_per_cm2'].to_numpy()}
 
 
-def fold_detection(counts_true, model, area_cm2, fp_mode='density', include_response=True):
-    """Folds a sliced spectrum with the detection model.
-
-    Returns the expected reported histogram and the covariance of its calibration uncertainty, propagated to
-    first order without sampling. Poisson counting noise (variance mu_j) is not included in the covariance.
+def fold_detection(counts_true, model, area_cm2, return_parts=False):
+    """Expected reported histogram mu_j = sum_i M_ji R_i N_i + phi_j A.
 
     Args:
-        counts_true (np.ndarray): Sliced spectrum N_i, expected tracks per bin (e.g. from `slice_spectrum`).
-        model (dict): Output of `calibrate_detection_model`.
-        area_cm2 (float): Analysed area of the measured sample, which sets the false-positive yield [cm^2].
-        fp_mode (str, optional): 'density' takes the false positives from their rate per area (valid for any
-            track density); 'precision' divides by the binned precision (same track density as the
-            validation set). Defaults to 'density'.
-        include_response (bool, optional): Include the uncertainty of the length response. Defaults to True.
+        counts_true (np.ndarray): Sliced spectrum N_i, expected tracks per bin of `model['edges']` on the analysed
+            area (e.g. from `slice_spectrum`).
+        model (dict): Output of `detection_model`.
+        area_cm2 (float): Analysed area A of the measured sample [cm^2].
+        return_parts (bool, optional): Also return the true-track and false-positive parts.
 
     Returns:
-        tuple: (mu, C_cal) with the expected counts per bin and their calibration covariance.
-
-    Raises:
-        ValueError: If `fp_mode` is not 'density' or 'precision'.
+        np.ndarray or tuple: mu, or (mu, true-track part, false-positive part).
     """
-    if fp_mode not in ('density', 'precision'):
-        raise ValueError("fp_mode must be 'density' or 'precision'")
     N = np.asarray(counts_true, float)
-    R, varR = _beta_mean_var(model['Ra'], model['Rb'])
-    P, varP = _beta_mean_var(model['TPp'] + 0.5, model['FP'] + 0.5)
-    fpd = (model['FP'] + 0.5) / model['area']               # Gamma posterior mean [per cm^2]
-    var_fpd = (model['FP'] + 0.5) / model['area'] ** 2      # Gamma posterior variance
-
-    def _mu(M):
-        tp = M @ (R * N)
-        return tp + fpd * area_cm2 if fp_mode == 'density' else tp / P
-
-    M = detection_response_matrix(model['edges'], model['bias'], model['var'])
-    mu = _mu(M)
-    J = M * N[None, :]
-    if fp_mode == 'density':
-        C = (J * varR[None, :]) @ J.T + np.diag(var_fpd * area_cm2 ** 2)
-    else:
-        J = J / P[:, None]
-        C = (J * varR[None, :]) @ J.T + np.diag(((M @ (R * N)) / P ** 2) ** 2 * varP)
-    if include_response:
-        for bias, var in _response_shifts(model):
-            d = _mu(detection_response_matrix(model['edges'], bias, var)) - mu
-            C += np.outer(d, d)
-    return mu, C
+    if len(N) != len(model['R']):
+        raise ValueError(f"The spectrum has {len(N)} bins, the detection model {len(model['R'])}: use the same edges.")
+    signal = model['M'] @ (model['R'] * N)
+    fp = model['phi'] * area_cm2
+    return (signal + fp, signal, fp) if return_parts else signal + fp
 
 
-def merge_bins_auto(mu, min_expected=10.):
-    """Greedily merges adjacent bins until each group has at least `min_expected` expected counts.
-
-    Args:
-        mu (np.ndarray): Expected counts per bin.
-        min_expected (float, optional): Minimum expected counts per merged bin. Defaults to 10.
-
-    Returns:
-        list: Lists of bin indices, one per merged bin.
-    """
-    groups, cur, acc = [], [], 0.
-    for j, m in enumerate(mu):
-        cur.append(j)
-        acc += m
-        if acc >= min_expected:
-            groups.append(cur)
-            cur, acc = [], 0.
-    if cur:
-        if groups:
-            groups[-1] += cur
-        else:
-            groups.append(cur)
-    return groups
-
-
-def aggregate_bins(observed, mu, C, groups):
-    """Merges bins: counts and expectations add, covariances transform as A C A^T.
-
-    Args:
-        observed (np.ndarray): Measured counts per bin.
-        mu (np.ndarray): Expected counts per bin.
-        C (np.ndarray): Covariance of the expected counts.
-        groups (list): Bin groups from `merge_bins_auto`.
-
-    Returns:
-        tuple: (observed, mu, C) after merging.
-    """
-    A = np.zeros((len(groups), len(mu)))
-    for g, idx in enumerate(groups):
-        A[g, idx] = 1.
-    return A @ np.asarray(observed, float), A @ mu, A @ C @ A.T
-
-
-def detection_chi2(observed, mu, C_cal):
-    """Chi-square goodness of fit with the full covariance chi2 = (n - mu)^T [diag(mu) + C_cal]^-1 (n - mu).
-
-    The Gaussian approximation needs about 10 expected counts per bin: merge bins first with `merge_bins_auto`.
-
-    Args:
-        observed (np.ndarray): Measured counts per (merged) bin.
-        mu (np.ndarray): Expected counts per (merged) bin.
-        C_cal (np.ndarray): Calibration covariance of the expected counts.
+def poisson_chi2(observed, mu):
+    """Poisson likelihood-ratio chi2 (Baker-Cousins), 2 sum[mu - n + n ln(n / mu)], valid at low counts without
+    merging bins. Bins with mu = 0 and n = 0 are skipped. ndof is the number of bins used: subtract the parameters
+    fitted to the data (e.g. 1 for a free normalisation).
 
     Returns:
         tuple: (chi2, ndof, p-value).
     """
-    d = np.asarray(observed, float) - mu
-    chi2 = float(d @ np.linalg.solve(np.diag(mu) + C_cal, d))
-    return chi2, len(d), float(_chi2_dist.sf(chi2, len(d)))
-# ======================================================================================
-# END OF DETECTION MODEL
-# ======================================================================================
+    n, mu = np.asarray(observed, float), np.asarray(mu, float)
+    use = (mu > 0) | (n > 0)
+    n, mu = n[use], np.maximum(mu[use], 1e-12)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        terms = mu - n + np.where(n > 0, n * np.log(n / mu), 0.)
+    chi2 = float(2. * terms.sum())
+    return chi2, int(use.sum()), float(_chi2_dist.sf(chi2, int(use.sum())))
+
 
 # ==========================================
 # INFERENCE
 # ==========================================
 
-class OptimusPrimus:
-    """Track detection on z-stacks of image tiles with trained segmentation and classification models."""
-
-    def __init__(self, image_spec, seg_model_spec=None, cls_model_spec=None, image_config=None, tiles_subdir=TILES_SUBDIR,
-                 seg_model_config=None, class_model_config=None, parallel=True):
-        """
-        Args:
-            image_spec (str): Image set, i.e. the folder image_folder_path/image_spec/tiles_subdir with the tiles.
-            seg_model_spec (str, optional): Segmentation checkpoint name (without .pth). Defaults to the training
-                naming scheme for `image_spec`, seg_model_<encoder>_<image_spec>.
-            cls_model_spec (str, optional): Classifier checkpoint name (without .pth). Defaults to
-                class_model_<encoder>_<image_spec>.
-            image_config, seg_model_config, class_model_config (dict, optional): Overrides of the module defaults.
-            tiles_subdir (str, optional): Tiles subfolder. Defaults to TILES_SUBDIR.
-            parallel (bool, optional): Without a GPU, spread the image-quality analysis over all CPU cores.
-
-        Raises:
-            FileNotFoundError: If the tiles folder or a checkpoint does not exist.
-        """
-        img_cfg = {**IMAGE_CONFIG, **(image_config or {})}
-        seg_cfg = {**SEG_MODEL_CONFIG, **(seg_model_config or {})}
-        cls_cfg = {**CLASS_MODEL_CONFIG, **(class_model_config or {})}
-
-        self.image_spec = image_spec
-        self.image_path = os.path.join(img_cfg['image_folder_path'], image_spec, tiles_subdir)
-        self.img_height, self.img_width = img_cfg['img_height'], img_cfg['img_width']
-        self.pixel_resolution_um_per_px = img_cfg['pixel_resolution_um_per_px']
-
-        self.seg_model_arc, self.seg_encoder, self.seg_encoder_weights = seg_cfg['model_arc'], seg_cfg['encoder'], seg_cfg['encoder_weights']
-        self.cls_model_type = cls_cfg['encoder']
-        self.seg_model_th, self.cls_model_th = seg_cfg['threshold'], cls_cfg['threshold']
-
-        self.seg_model_spec = seg_model_spec or make_seg_model_spec(self.seg_encoder, image_spec)
-        self.cls_model_spec = cls_model_spec or make_class_model_spec(self.cls_model_type, image_spec)
-        self.seg_model_path = os.path.join(seg_cfg['model_folder_path'], self.seg_model_spec + ".pth")
-        self.cls_model_path = os.path.join(cls_cfg['model_folder_path'], self.cls_model_spec + ".pth")
-
-        for folder in INFERENCE_OUTPUT_FOLDERS.values():
-            os.makedirs(folder, exist_ok=True)
-        self.seg_output_path = os.path.join(INFERENCE_OUTPUT_FOLDERS['seg'], f"{image_spec}_{self.seg_model_spec}.csv")
-        self.seg_cls_output_path = os.path.join(INFERENCE_OUTPUT_FOLDERS['seg_class'], f"{image_spec}_{self.seg_model_spec}_{self.cls_model_spec}.csv")
-        efficiency = efficiency_csv_paths(self.seg_model_spec, self.cls_model_spec, seg_cfg['model_folder_path'], cls_cfg['model_folder_path'])
-        self.seg_binned_efficiency_path, self.seg_cls_binned_efficiency_path = efficiency['seg'], efficiency['seg_class']
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.parallel = parallel
-        self.seg_ellipses = self.seg_cls_ellipses = None
-
-        for path, what in ((self.image_path, "Image folder"), (self.seg_model_path, "Segmentation model"), (self.cls_model_path, "Classification model")):
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{what} not found at '{path}'")
-
-        self.image_groups = self._load_image_groups()
-        tile_area_cm2 = self.img_height * self.img_width * (self.pixel_resolution_um_per_px * 1e-4) ** 2 if self.pixel_resolution_um_per_px else None
-        self.tot_area_cm2 = len(self.image_groups) * tile_area_cm2 if tile_area_cm2 else None
-
-    def perform_full_inference(self, seg_th=None, cls_th=None, visualize=False, n_top_images=5):
-        """Segmentation and segmentation + classification of every z-stack; results are stored in `seg_ellipses` /
-        `seg_cls_ellipses` and saved to `seg_output_path` / `seg_cls_output_path`.
-
-        Args:
-            seg_th, cls_th (float, optional): Thresholds. Default to the model configurations.
-            visualize (bool, optional): Show each image with its final mask.
-            n_top_images (int, optional): Sharpest focal planes used per z-stack. Defaults to 5.
-        """
-        seg_th = self.seg_model_th if seg_th is None else seg_th
-        cls_th = self.cls_model_th if cls_th is None else cls_th
-        print(f"[OPTIMUS-PRIMUS] {len(self.image_groups)} z-stacks in {self.image_path}")
-
-        stacks = self._select_sharpest(n_top_images)
-        seg_model = build_seg_model(self.seg_model_arc, self.seg_encoder, weights_path=self.seg_model_path, device=self.device).eval()
-        cls_model = build_class_model(self.cls_model_type, weights_path=self.cls_model_path, device=self.device).eval()
-        preprocessing = get_seg_preprocessing(self.seg_encoder, self.seg_encoder_weights, self.img_height, self.img_width)
-        class_transform = get_class_transform()
-
-        records = {mode: [] for mode in MODES}
-        for group_key, file_list in tqdm(stacks.items(), desc="Processing z-stacks"):
-            image, seg_mask = predict_stack_mask(file_list, seg_model, preprocessing, self.device, seg_th)
-            cls_mask = create_class_mask(image, seg_mask, cls_model, class_transform, self.device, cls_th)
-            name = os.path.basename(file_list[0])
-            records['seg'] += self._ellipse_records(seg_mask, name)
-            records['seg_class'] += self._ellipse_records(cls_mask, name)
-            if visualize:
-                show_images([(image, f"Original - {group_key}"), (cls_mask, "Filtered class mask")])
-
-        self.seg_ellipses, self.seg_cls_ellipses = pd.DataFrame(records['seg']), pd.DataFrame(records['seg_class'])
-        self.seg_ellipses.to_csv(self.seg_output_path, index=False)
-        self.seg_cls_ellipses.to_csv(self.seg_cls_output_path, index=False)
-        print(f"[OUTPUT] segmentation: {len(self.seg_ellipses)} tracks -> {self.seg_output_path}")
-        print(f"[OUTPUT] segmentation + classification: {len(self.seg_cls_ellipses)} tracks -> {self.seg_cls_output_path}")
-
-    def inference_from_file(self, mode, csv_path=None):
-        """Loads saved results of `mode` ('seg' or 'seg_class') from `csv_path` (default: this instance's output path).
-
-        Returns:
-            pandas.DataFrame: The loaded tracks.
-        """
-        _check_mode(mode)
-        csv_path = csv_path or (self.seg_output_path if mode == 'seg' else self.seg_cls_output_path)
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found at '{csv_path}'")
-        df = pd.read_csv(csv_path)
-        if mode == 'seg':
-            self.seg_ellipses = df
-        else:
-            self.seg_cls_ellipses = df
-        return df
-
-    def get_track_distributions(self, mode, metric='len_um'):
-        """Track density over the analysed area (all z-stacks, with or without tracks) and summary statistics of
-        `metric`.
-
-        Returns:
-            dict: track_density_per_cm2, mean, std, low (25%), median, high (75%).
-        """
-        _check_mode(mode)
-        ellipses = self.seg_ellipses if mode == 'seg' else self.seg_cls_ellipses
-        if ellipses is None:
-            raise ValueError(f"No '{mode}' results: run perform_full_inference() or inference_from_file() first.")
-        density = len(ellipses) / self.tot_area_cm2 if self.tot_area_cm2 else None
-        low, median, high = ellipses[metric].quantile([0.25, 0.5, 0.75])
-        summary = {"track_density_per_cm2": density, "mean": ellipses[metric].mean(), "std": ellipses[metric].std(),
-                   "low": low, "median": median, "high": high}
-        area = f"{self.tot_area_cm2:.3f} cm^2" if self.tot_area_cm2 else "unknown area"
-        print(f"[{mode}] {len(ellipses)} tracks on {area}; {metric}: mean {summary['mean']:.3f}, std {summary['std']:.3f}, median {median:.3f}")
-        return summary
-
-    def detection_logs_path(self, mode='seg_class'):
-        """Validation logs of these models, written by OptimusPrimusTraining.evaluate_binned_efficiency."""
-        _check_mode(mode)
-        return detection_logs_file(self.seg_binned_efficiency_path if mode == 'seg' else self.seg_cls_binned_efficiency_path)
-
-    def _load_image_groups(self):
-        """Groups the tiles Frame<n>_Acquisition_<id>_<i>_<j>.png into z-stacks keyed Frame<n>_<i>_<j>."""
-        pattern = re.compile(r'Frame(\d+)_Acquisition_(\d+)_(\d+)_(\d+)\.png$')
-        groups = {}
-        for fpath in sorted(glob.glob(os.path.join(self.image_path, '*.png'))):
-            match = pattern.match(os.path.basename(fpath))
-            if match:
-                n, _, i, j = match.groups()
-                groups.setdefault(f"Frame{n}_{i}_{j}", []).append(fpath)
-        return groups
-
-    def _select_sharpest(self, n_top_images=5):
-        """The `n_top_images` sharpest focal planes of each z-stack, sharpest first."""
-        paths = [p for files in self.image_groups.values() for p in files]
-        workers = resolve_num_workers(self.parallel)
-        if workers > 1:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                results = list(tqdm(executor.map(compute_sharpness_score, paths, chunksize=8), total=len(paths), desc="Image quality analysis"))
-        else:
-            results = [compute_sharpness_score(p) for p in tqdm(paths, desc="Image quality analysis")]
-        scores = {}
-        for path, score, error in results:
-            if error:
-                print(error)
-            scores[path] = score
-        return {key: sorted(files, key=scores.get, reverse=True)[:n_top_images] for key, files in self.image_groups.items()}
-
-    def _ellipse_records(self, mask, image_filename):
-        """One record per fitted track of `mask`."""
-        records = []
-        for track_id, e in enumerate(fit_ellipses(mask), start=1):
-            record = {"image_filename": image_filename, "track_id": track_id,
-                      "centroid_x_px_ellipse": round(e['center'][0], 1), "centroid_y_px_ellipse": round(e['center'][1], 1),
-                      "major_axis_px": round(e['major_px'], 2), "minor_axis_px": round(e['minor_px'], 2),
-                      "orientation_deg": round(e['angle_deg'], 2)}
-            if self.pixel_resolution_um_per_px is not None:
-                record['len_um'] = round(e['major_px'] * self.pixel_resolution_um_per_px, 2)
-            records.append(record)
-        return records
-
-
-# ==========================================
-# TRAINING AND EVALUATION
-# ==========================================
-
-class OptimusPrimusTraining:
-    """Training of the segmentation and classification networks and binned evaluation of the pipeline."""
-
-    def __init__(self, train_image_dir, image_spec, train_image=None, training_parameters=None, image_config=None,
-                 seg_model_config=None, class_model_config=None, parallel=True):
-        """
-        Args:
-            train_image_dir (str): Folder with the annotated training images; masks in its `mask_subdir`.
-            image_spec (str): Name used for the checkpoints (seg_model_<encoder>_<image_spec>, ...).
-            train_image, training_parameters, image_config, seg_model_config, class_model_config (dict, optional):
-                Overrides of the module defaults. Architectures and encoders come from the model configurations.
-            parallel (bool, optional): Without a GPU, load the segmentation data with all CPU cores. With more
-                than one GPU, models are wrapped in DataParallel.
-
-        Raises:
-            FileNotFoundError: If the image or mask folder does not exist.
-        """
-        train_cfg = {**TRAIN_IMAGE, **(train_image or {})}
-        img_cfg = {**IMAGE_CONFIG, **(image_config or {})}
-        seg_cfg = {**SEG_MODEL_CONFIG, **(seg_model_config or {})}
-        cls_cfg = {**CLASS_MODEL_CONFIG, **(class_model_config or {})}
-        self.params = {**TRAINING_PARAMETERS, **(training_parameters or {})}
-
-        self.image_dir, self.image_spec = train_image_dir, image_spec
-        self.mask_dir = os.path.join(train_image_dir, train_cfg['mask_subdir'])
-        split_dir = os.path.join(train_image_dir, train_cfg['data_split_subdir'])
-        self.split_path = os.path.join(split_dir, train_cfg['split_filename'])
-        self.image_extensions, self.mask_extension = train_cfg['image_extensions'], train_cfg['mask_extension']
-        self.test_split_ratio, self.val_split_ratio = train_cfg['test_split_ratio'], train_cfg['val_split_ratio']
-
-        # disk-mode classifier patches, next to the training tiles folder
-        parent = os.path.dirname(os.path.normpath(train_image_dir))
-        self.class_manual_track_dir = os.path.join(parent, 'manual_track')
-        self.class_manual_bkg_dir = os.path.join(parent, 'manual_bkg')
-
-        self.image_height, self.image_width = img_cfg['img_height'], img_cfg['img_width']
-        self.pixel_resolution_um_per_px = img_cfg['pixel_resolution_um_per_px']
-
-        self.seg_model_arc, self.seg_encoder, self.seg_encoder_weights = seg_cfg['model_arc'], seg_cfg['encoder'], seg_cfg['encoder_weights']
-        self.class_model_type, self.class_pretrained = cls_cfg['encoder'], cls_cfg['pretrained']
-        self.seg_model_th, self.cls_model_th = seg_cfg['threshold'], cls_cfg['threshold']
-
-        self.seg_best_model_folder = seg_cfg['model_folder_path']
-        self.seg_best_model_spec = make_seg_model_spec(self.seg_encoder, image_spec)
-        self.seg_best_model_path = os.path.join(self.seg_best_model_folder, f"{self.seg_best_model_spec}.pth")
-        self.class_best_model_folder = cls_cfg['model_folder_path']
-        self.class_best_model_spec = make_class_model_spec(self.class_model_type, image_spec)
-        self.class_best_model_path = os.path.join(self.class_best_model_folder, f"{self.class_best_model_spec}.pth")
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.parallel = parallel
-
-        for path, what in ((train_image_dir, "Image directory"), (self.mask_dir, "Mask directory")):
-            if not os.path.isdir(path):
-                raise FileNotFoundError(f"{what} not found at '{path}'")
-        for folder in (split_dir, self.seg_best_model_folder, self.class_best_model_folder):
-            os.makedirs(folder, exist_ok=True)
-
-    # ---------------------------------------------------------------- segmentation
-
-    def perform_seg_training(self):
-        """Trains the segmentation network (0.5 Dice + 0.5 BCE on logits, AdamW, ReduceLROnPlateau on the monitored
-        validation metric, early stopping after `seg_min_epochs`). The best checkpoint is saved to
-        `seg_best_model_path` and the per-epoch metrics next to it."""
-        p = self.params
-        self._load_split()
-        preprocessing = get_seg_preprocessing(self.seg_encoder, self.seg_encoder_weights)
-        resize = A.Resize(self.image_height, self.image_width, interpolation=cv2.INTER_LINEAR)
-        train_augs = A.Compose([resize, A.HorizontalFlip(p=AUGMENTATION_PARAMETERS['H_FLIP_PROB']),
-                                A.VerticalFlip(p=AUGMENTATION_PARAMETERS['V_FLIP_PROB']),
-                                A.RandomBrightnessContrast(p=AUGMENTATION_PARAMETERS['BRIGHTNESS_CONTRAST_PROB'])])
-        workers, pin = resolve_num_workers(self.parallel), torch.cuda.is_available()
-        train_loader = DataLoader(SegmentationDataset(self.train_files, train_augs, preprocessing), batch_size=p['seg_batch_size'],
-                                  shuffle=True, num_workers=workers, pin_memory=pin, drop_last=True)
-        val_loader = DataLoader(SegmentationDataset(self.val_files, A.Compose([resize]), preprocessing), batch_size=p['seg_batch_size'],
-                                shuffle=False, num_workers=workers, pin_memory=pin)
-
-        model = _parallelize(build_seg_model(self.seg_model_arc, self.seg_encoder, self.seg_encoder_weights, device=self.device))
-        dice_loss, bce_loss = smp.losses.DiceLoss(mode="binary", from_logits=True), smp.losses.SoftBCEWithLogitsLoss()
-
-        def loss_fn(pred, target):
-            return 0.5 * dice_loss(pred, target) + 0.5 * bce_loss(pred, target)
-
-        optimizer = optim.AdamW(model.parameters(), lr=p['seg_learning_rate'])
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=8)
-        metrics_csv = os.path.join(self.seg_best_model_folder, f"{self.seg_best_model_spec}_training_metrics.csv")
-        best, counter, logs = -1.0, 0, []
-        try:
-            for epoch in range(p['seg_epochs']):
-                model.train()
-                train_loss = 0.0
-                for images, masks in tqdm(train_loader, desc=f"Seg train E{epoch + 1}", leave=False):
-                    images, masks = images.to(self.device, dtype=torch.float32), masks.to(self.device, dtype=torch.float32)
-                    optimizer.zero_grad()
-                    loss = loss_fn(model(images), masks)
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.item()
-
-                model.eval()
-                val_loss, counts = 0.0, np.zeros(3)            # pixel tp, fp, fn over the whole validation set
-                with torch.no_grad():
-                    for images, masks in val_loader:
-                        images, masks = images.to(self.device, dtype=torch.float32), masks.to(self.device, dtype=torch.float32)
-                        outputs = model(images)
-                        val_loss += loss_fn(outputs, masks).item()
-                        pred, truth = torch.sigmoid(outputs) > p['seg_threshold'], masks > 0.5
-                        counts += [(pred & truth).sum().item(), (pred & ~truth).sum().item(), (~pred & truth).sum().item()]
-                scores = _segmentation_scores(*counts, beta=p['seg_val_beta'])
-                logs.append({"epoch": epoch + 1, "train_loss": train_loss / max(len(train_loader), 1),
-                             "val_loss": val_loss / max(len(val_loader), 1), **{f"val_{k.lower()}": v for k, v in scores.items()}})
-                monitored = scores[p['seg_metric_to_monitor']]
-                print(f"Epoch {epoch + 1}: train loss {logs[-1]['train_loss']:.4f}, val loss {logs[-1]['val_loss']:.4f}, "
-                      f"{p['seg_metric_to_monitor']} {monitored:.4f}")
-
-                if monitored > best:
-                    best, counter = monitored, 0
-                    torch.save(_state_dict(model), self.seg_best_model_path)
-                    print(f"Saved segmentation checkpoint: {self.seg_best_model_path}")
-                else:
-                    counter += 1
-                    if counter >= p['seg_patience'] and epoch > p['seg_min_epochs']:
-                        print("Early stopping triggered")
-                        break
-                scheduler.step(monitored)
-        except KeyboardInterrupt:
-            print("\nTraining interrupted by user.")
-        finally:
-            pd.DataFrame(logs).to_csv(metrics_csv, index=False)
-            print(f"[INFO] Segmentation training finished. Metrics saved at: {metrics_csv}")
-
-    # ---------------------------------------------------------------- classification
-
-    def perform_class_training(self, seg_model_path=None, seg_th=None, keep_patches_in_memory=False, negatives='rims'):
-        """Trains the patch classifier on tracks (label 1) and segmentation false positives (label 0).
-
-        Args:
-            seg_model_path (str, optional): Segmentation checkpoint used to find the candidates. Defaults to
-                `seg_best_model_path`.
-            seg_th (float, optional): Segmentation threshold for the candidates. Defaults to the operating point.
-            keep_patches_in_memory (bool, optional): Keep the patches in RAM instead of saving them as PNG under
-                `class_manual_track_dir` / `class_manual_bkg_dir`. Defaults to False.
-            negatives (str, optional): How samples are labelled, 'rims' (default), 'no_rims' or 'unmatched'; see
-                `class_training_candidates`.
-        """
-        p = self.params
-        self._load_split()
-        train_samples, val_samples = self._create_class_training_dataset(seg_model_path or self.seg_best_model_path, seg_th,
-                                                                         keep_patches_in_memory, negatives)
-        for split, samples in (('train', train_samples), ('val', val_samples)):
-            n_pos = sum(t for _, t in samples)
-            if n_pos == 0 or n_pos == len(samples):
-                raise ValueError(f"The {split} samples of negatives='{negatives}' have no {'positives' if n_pos == 0 else 'negatives'} "
-                                 f"({len(samples)} samples): the classifier cannot be trained. Try a lower segmentation "
-                                 f"threshold (more candidates) or another `negatives` mode.")
-        train_loader = DataLoader(TrackDataset(train_samples, get_class_transform(train=True)), batch_size=p['class_batch_size'], shuffle=True)
-        val_loader = DataLoader(TrackDataset(val_samples, get_class_transform()), batch_size=p['class_batch_size'], shuffle=False)
-
-        model = _parallelize(build_class_model(self.class_model_type, pretrained=self.class_pretrained, device=self.device))
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([p['class_boost_precision_weight']], device=self.device))
-        optimizer = optim.AdamW(model.parameters(), lr=p['class_learning_rate'], weight_decay=1e-3)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=p['class_patience'])
-
-        best_dice, logs, eps = -1.0, [], 1e-8          # -1: the first epoch is always saved, even if its Dice is 0
-        for epoch in range(p['class_epochs']):
-            model.train()
-            train_loss = 0.0
-            for imgs, labels in tqdm(train_loader, desc=f"Class train E{epoch + 1}", leave=False):
-                imgs, labels = imgs.to(self.device), labels.to(self.device)
-                optimizer.zero_grad()
-                loss = loss_fn(model(imgs), labels)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-
-            model.eval()
-            val_loss, tp, fp, fn, tn = 0.0, 0, 0, 0, 0
-            with torch.no_grad():
-                for imgs, labels in val_loader:
-                    imgs, labels = imgs.to(self.device), labels.to(self.device)
-                    outputs = model(imgs)
-                    val_loss += loss_fn(outputs, labels).item()
-                    pred, truth = torch.sigmoid(outputs) > p['class_threshold'], labels > 0.5
-                    tp += (pred & truth).sum().item()
-                    fp += (pred & ~truth).sum().item()
-                    fn += (~pred & truth).sum().item()
-                    tn += (~pred & ~truth).sum().item()
-            val_loss /= max(len(val_loader), 1)
-            logs.append({"epoch": epoch + 1, "train_loss": train_loss / max(len(train_loader), 1), "val_loss": val_loss,
-                         "val_accuracy": (tp + tn) / (tp + tn + fp + fn + eps), "val_precision": tp / (tp + fp + eps),
-                         "val_recall": tp / (tp + fn + eps), "val_iou": tp / (tp + fp + fn + eps),
-                         "val_dice": 2 * tp / (2 * tp + fp + fn + eps)})
-            scheduler.step(val_loss)
-            if logs[-1]['val_dice'] > best_dice:
-                best_dice = logs[-1]['val_dice']
-                torch.save(_state_dict(model), self.class_best_model_path)
-                print(f"Epoch {epoch + 1}: val Dice {best_dice:.4f}, saved classification checkpoint: {self.class_best_model_path}")
-
-        metrics_csv = os.path.join(self.class_best_model_folder, f"{self.class_best_model_spec}_training_metrics.csv")
-        pd.DataFrame(logs).to_csv(metrics_csv, index=False)
-        print(f"[INFO] Classification training finished. Metrics saved at: {metrics_csv}")
-
-    def _create_class_training_dataset(self, seg_model_path, threshold=None, keep_patches_in_memory=False,
-                                       negatives='rims', iou_threshold=0.5):
-        """Classifier samples of the train and val splits as 64x64 aligned patches, labelled according to
-        `negatives` (see `class_training_candidates`). A summary of the samples is printed and stored in
-        `self.class_dataset_summary`.
-
-        Returns:
-            dict: Calculated execution dictionary logs containing targeted efficiency tables and bins arrays.
-            
-        Raises:
-            ValueError: If an unrecognized mode string identifier parameter is passed.
-        """
-        if seg_model_path is None: seg_model_path = self.seg_best_model_path
-        if cls_model_path is None: cls_model_path = self.class_best_model_path
-        if seg_th is None: seg_th = self.seg_threshold
-        if cls_th is None: cls_th = self.class_threshold
-        
-        seg_model_spec = os.path.splitext(os.path.basename(seg_model_path))[0]
-        cls_model_spec = os.path.splitext(os.path.basename(cls_model_path))[0]
-        
-        self.seg_eff_output_spec = "binned_efficiency_" + seg_model_spec + ".csv"
-        self.seg_binned_efficiency_path = os.path.join(self.seg_best_model_folder, self.seg_eff_output_spec)
-        
-        self.seg_cls_eff_output_spec = "binned_efficiency_" + seg_model_spec + "_" + cls_model_spec + ".csv"
-        self.seg_cls_binned_efficiency_path = os.path.join(self.class_best_model_folder, self.seg_cls_eff_output_spec)
-            
-        print(f"\n[OPTIMUS-PRIMUS | EVALUATION PIPELINE] MODE = {mode}")
-        with open(self.split_path, "r") as f: splits = json.load(f)
-        tot_files = splits["val"] + splits["test"]
-
-        inference_model = self._create_segmentation_model(weights_path=seg_model_path)
-        inference_model.eval()
-        
-        preprocessing_fn = smp.encoders.get_preprocessing_fn(self.seg_encoder, self.seg_encoder_weights)
-        preprocessing = get_preprocessing(preprocessing_fn, self.image_height, self.image_width)
-        class_transform = get_val_augs()
-
-        gt_log, pred_log = [], []
-
-        if mode == 'seg':
-            for img_path, mask_path in tqdm(tot_files, desc="Evaluating Efficiency"):
-                gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                _, pred_mask_full = self._compute_seg_masks(img_path, inference_model, preprocessing, threshold=seg_th)
-                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, pred_mask_full, iou_threshold, gt_log, pred_log)
-                
-                if visualize:
-                    self._plot_verification(cv2.imread(img_path), gt_mask_full, pred_mask_full, f"Seg Evaluation - {os.path.basename(img_path)}")
-
-            efficiency_dict = self._evaluate_efficiency(gt_log, pred_log, num_bins, mode)
-            self.seg_efficiency_table = efficiency_dict['efficiency_table']
-
-        elif mode == 'seg_class':
-            cls_model = self._create_class_model(cls_weights=cls_model_path)
-            for img_path, mask_path in tqdm(tot_files, desc="Evaluating Efficiency"):
-                gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                original_vis_image, pred_mask_full = self._compute_seg_masks(img_path, inference_model, preprocessing, threshold=seg_th)
-                final_confirmed_mask = create_class_mask(original_vis_image, pred_mask_full, cls_model, class_transform, self.device, threshold=cls_th)
-                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, final_confirmed_mask, iou_threshold, gt_log, pred_log)
-                
-                if visualize:
-                    self._plot_verification(original_vis_image, gt_mask_full, final_confirmed_mask, f"Seg+Class Evaluation - {os.path.basename(img_path)}")
-            
-            efficiency_dict = self._evaluate_efficiency(gt_log, pred_log, num_bins, mode)
-            self.seg_cls_efficiency_table = efficiency_dict['efficiency_table']
-        else:
-            raise ValueError("mode need to be 'seg' or 'seg_class'")
-        
-        return efficiency_dict
-    
-    def efficiency_distribution_from_file(self, csv_path=None):
-        """Loads calibration distribution datasets directly into internal efficiency execution structures.
-
-        Args:
-            csv_path (str, optional): Target file system source path string. Defaults to None.
-
-        Returns:
-            None
-
-        Raises:
-            FileNotFoundError: If target path is invalid or file missing.
-        """
-        if not os.path.exists(csv_path): raise FileNotFoundError(f"ERROR: CSV file not found at '{csv_path}'")
-        
-        if 'segmentation' in csv_path:
-            self.seg_efficiency_table = pd.read_csv(csv_path, index_col=0)
-        elif 'seg_class' in csv_path:
-            self.seg_cls_efficiency_table = pd.read_csv(csv_path, index_col=0)
-        
-    def apply_detection_model_efficiency(self, x_bins, counts, meas_error=1000.):
-        """Applies loaded recall/precision matrices to adjust raw count statistics dynamically.
-
-        Args:
-            x_bins (np.ndarray): Target matrix tracking numeric bin margins.
-            counts (np.ndarray): Array structure sequence containing item occurrences numbers.
-            meas_error (float, optional): Operational dispersion scaling coefficient adjustments. Defaults to 1000.0.
-
-        Returns:
-            np.ndarray: Shifted and smoothed efficiency distribution matrix framework.
-        """
-        if self.seg_cls_efficiency_table is not None:
-            efficiency_table = self.seg_cls_efficiency_table
-        elif self.seg_efficiency_table is not None:
-            efficiency_table = self.seg_efficiency_table
-        else:
-            return counts
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        recall = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Recall'])
-        precision = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Precision'])
-
-        counts_with_efficiency = counts * recall / precision
-        counts_with_measure = smear_spectrum(counts_with_efficiency, len(x_bins)//2*2-1, meas_error/np.diff(x_bins)[0], meas_error/np.diff(x_bins)[0])
-        return counts_with_measure
-    
-    def _get_training_pairs(self):
-        """Builds mapping relationships coordinates between data images and corresponding label masks.
-
-        Returns:
-            list: Parsed tuples catalog list matching unique (image_file_path, mask_file_path) pairs.
-
-        Raises:
-            FileNotFoundError: If the designated source training directory is empty or missing.
-            ValueError: If no valid matching target image-mask pairs can be verified on disk.
-        """
-        image_files = sorted(glob.glob(os.path.join(self.image_dir, '*.png')))
-        if not image_files: raise FileNotFoundError(f"Error: No image files found in '{self.image_dir}'")
-
-        file_pairs = []
-        for img_path in image_files:
-            img_stem = os.path.splitext(os.path.basename(img_path))[0]
-            mask_path = os.path.join(self.mask_dir, img_stem + self.mask_extension)
-            if os.path.exists(mask_path): file_pairs.append((img_path, mask_path))
-
-        if not file_pairs: raise ValueError("Error: Could not create any image-mask pairs.")
-        return file_pairs
-    
-    def _split_dataset(self, file_pairs):
-        """Applies stochastic splits to categorize inputs into unique operational cohorts.
-
-        Args:
-            file_pairs (list): Consolidated list array configurations holding image-mask file pairs.
-
-        Returns:
-            None
-        """
-        if os.path.exists(self.split_path):
-            with open(self.split_path, "r") as f: splits = json.load(f)
-            self.train_files, self.val_files, self.test_files = splits["train"], splits["val"], splits["test"]
-        else:
-            total_samples = len(file_pairs)
-            test_size = int(total_samples * self.test_split_ratio)
-            val_size = int(total_samples * self.val_split_ratio)
-
-            if test_size > 0: train_val_files, self.test_files = train_test_split(file_pairs, test_size=test_size, shuffle=True)
-            else: train_val_files, self.test_files = file_pairs, []
-
-            if val_size > 0 and len(train_val_files) >= val_size:
-                val_split_adjusted = val_size / len(train_val_files)
-                self.train_files, self.val_files = train_test_split(train_val_files, test_size=val_split_adjusted, shuffle=True)
-            else: self.train_files, self.val_files = train_val_files, []
-
-            splits = {"train": self.train_files, "val": self.val_files, "test": self.test_files}
-            with open(self.split_path, "w") as f: json.dump(splits, f, indent=4)
-    
-    def _create_dataloader(self):
-        """Prepares PyTorch streaming data structures supporting active processing execution threads.
-
-        Returns:
-            None
-        """
-        train_augs_pipeline = self._get_seg_train_augs()
-        val_test_augs_pipeline = self._get_seg_val_test_augs()
-        preprocessing_pipeline = self._get_train_preprocessing()
-
-        train_dataset = self.SegmentationDataset(file_pairs=self.train_files, augmentations=train_augs_pipeline, preprocessing=preprocessing_pipeline, input_channels=self.input_channels_config)
-        val_dataset = self.SegmentationDataset(file_pairs=self.val_files, augmentations=val_test_augs_pipeline, preprocessing=preprocessing_pipeline, input_channels=self.input_channels_config)
-
-        num_workers = resolve_num_workers(self.parallel)
-        self.train_loader = DataLoader(train_dataset, batch_size=self.seg_batch_size, shuffle=True, num_workers=num_workers, pin_memory=torch.cuda.is_available(), drop_last=True)
-        self.val_loader = DataLoader(val_dataset, batch_size=self.seg_batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available(), drop_last=False)
-        
-    def _get_train_preprocessing(self):
-        """Resolves target pre-processing transforms depending on segmentation backbone selection.
-
-        Returns:
-            A.Compose: Constructed albumentations pre-processing configurations block object.
-        """
-        try: preprocessing_fn = smp.encoders.get_preprocessing_fn(self.seg_encoder, self.seg_encoder_weights)
-        except Exception:
-            def basic_preprocessing_fn(image): return image.astype(np.float32) / 255.0
-            preprocessing_fn = basic_preprocessing_fn 
-        
-        _transform = []
-        if preprocessing_fn: _transform.append(A.Lambda(image=preprocessing_fn, name="EncoderPreprocessing"))
-        _transform.append(ToTensorV2())
-        return A.Compose(_transform)
-    
-    def _get_seg_train_augs(self, augmentation_parameters=AUGMENTATION_PARAMETERS):
-        """Constructs stochastic geometrical transformation pipelines for training augmentation.
-
-        Args:
-            augmentation_parameters (dict, optional): Baseline probability mappings parameters. Defaults to AUGMENTATION_PARAMETERS.
-
-        Returns:
-            A.Compose: Complete Albumentations pipeline composition module framework.
-        """
-        return A.Compose([
-            A.Resize(int(self.image_height), int(self.image_width), interpolation=cv2.INTER_LINEAR),
-            A.HorizontalFlip(p=augmentation_parameters.get('H_FLIP_PROB', 0.5)),
-            A.VerticalFlip(p=augmentation_parameters.get('V_FLIP_PROB', 0.5)),
-            A.RandomBrightnessContrast(p=augmentation_parameters.get('BRIGHTNESS_CONTRAST_PROB', 0.4)),
-        ])
-
-    def _get_seg_val_test_augs(self):
-        """Provides static geometry spatial adjustments matching validation system execution shapes.
-
-        Returns:
-            A.Compose: Resizing transform structure targeting base spatial dimensions limits.
-        """
-        return A.Compose([A.Resize(int(self.image_height), int(self.image_width), interpolation=cv2.INTER_LINEAR)])
-
-    def _create_segmentation_model(self, weights_path=None):
-        """Initializes structural segmentation network model architectures inside targeted memory spaces.
-
-        Args:
-            weights_path (str, optional): Target checkpoint path file to assign checkpoint values. Defaults to None.
-
-        Returns:
-            nn.Module: Built PyTorch segmentation model instance ready for deployment.
-        """
-        model = smp.create_model(arch=self.seg_model_arc, encoder_name=self.seg_encoder, encoder_weights=self.seg_encoder_weights if weights_path is None else None, in_channels=self.input_channels_config, classes=1, activation=None)
-        if weights_path:
-            if not os.path.exists(weights_path):
-                raise FileNotFoundError(f"ERROR: Segmentation checkpoint not found at '{weights_path}'")
-            model.load_state_dict(torch.load(weights_path, map_location=self.device, weights_only=True))
-
-        self.ngpu = torch.cuda.device_count()
-        if self.ngpu > 1:
-            print(f"Using {self.ngpu} GPUs")
-            model = torch.nn.DataParallel(model)
-
-        model.to(self.device)
-        return model
-
-    def _create_class_model(self, cls_weights=None):
-        """Builds custom patch classification networks targeting specified layer output nodes.
-
-        Args:
-            cls_weights (str, optional): Target baseline check-point workspace weight files. Defaults to None.
-
-        Returns:
-            nn.Module: Configured classification deep neural network module wrapper.
-        """
-        model = timm.create_model(self.class_model_type, pretrained=(cls_weights is None), num_classes=1)
-        model.conv_stem.stride = (1, 1)
-        model.blocks[1][0].conv_dw.stride = (1, 1)
-        in_features = model.classifier.in_features
-        model.classifier = nn.Sequential(nn.Dropout(p=0.3), nn.Linear(in_features, 1))
-        if cls_weights:
-            if not os.path.exists(cls_weights):
-                raise FileNotFoundError(f"ERROR: Classification checkpoint not found at '{cls_weights}'")
-            state_dict = torch.load(cls_weights, map_location=self.device, weights_only=True)
-            if list(state_dict.keys())[0].startswith('module.'): state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            model.load_state_dict(state_dict)
-        model = model.to(self.device)
-
-        self.ngpu = torch.cuda.device_count()
-        if self.ngpu > 1:
-            print(f"Using {self.ngpu} GPUs via DataParallel!")
-            model = nn.DataParallel(model)
-
-        return model
-
-    def _get_class_train_augs(self):
-        """Retrieves stochastic augmentations optimizing target classification data patch structures.
-
-        Returns:
-            A.Compose: Configured training transform object mapping sequence variations.
-        """
-        return A.Compose([
-            A.Resize(64, 64), A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5), A.RandomBrightnessContrast(p=0.3),
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()
-        ])
-
-    def _compute_seg_masks(self, image_path, model, preprocessing, threshold=None):
-        """Funnels execution frames through networks to capture target binary response masks.
-
-        Args:
-            image_path (str): File image locator string.
-            model (nn.Module): Segmentation model tracking workspace logic unit.
-            preprocessing (A.Compose): Functional image pixel transforms parameters layer.
-            threshold (float, optional): Detection classification confidence ceiling cutoffs. Defaults to None.
-
-        Returns:
-            tuple: A tuple containing:
-                - image (np.ndarray): Decoded base standard visual RGB frame array matrix.
-                - pred_mask (np.ndarray): Extracted binary spatial output evaluation mapping array.
-        """
-        if threshold is None: threshold = self.seg_threshold
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        sample = preprocessing(image=image)
-        preprocessed = sample['image'].unsqueeze(0).to(self.device, dtype=torch.float32)
-        with torch.no_grad():
-            pred = model(preprocessed)
-            pred_mask = (torch.sigmoid(pred) > threshold).cpu().numpy().astype(np.uint8).squeeze()
-        return image, pred_mask
-
-    def _create_class_training_dataset(self, seg_model_path, threshold=None, keep_patches_in_memory=False):
-        """Iterates over split input pools extracting candidate object fragments to compile classification inputs.
-
-        Args:
-            seg_model_path (str): File check-point resource mapping directory for segmentation models.
-            threshold (float, optional): Detection parsing cutoff constraints coefficients. Defaults to None.
-            keep_patches_in_memory (bool, optional): If True, extracted patches are kept as in-memory
-                arrays and never written to disk. A warning is printed if the combined train+val patch
-                count exceeds `MAX_IN_MEMORY_PATCHES_WARNING`, since this mode holds every patch in RAM
-                at once with no eviction. If False (default), patches are saved as PNG files
-                to disk under `self.class_manual_track_dir` / `self.class_manual_bkg_dir` (positioned
-                as siblings of the original segmentation training tiles folder), split into 'train'
-                and 'val' subfolders, and the returned samples reference those file paths instead of
-                in-memory arrays. Defaults to False.
-
-        Returns:
-            tuple: A tuple of lists containing:
-                - train_samples (list): Extracted training samples as (patch, label) tuples, where
-                  patch is an in-memory array if `keep_patches_in_memory` is True, or a file path
-                  (str) otherwise.
-                - val_samples (list): Extracted verification samples in the same format.
-        """
-        if threshold is None: threshold = self.seg_threshold
-        seg_model = self._create_segmentation_model(weights_path=seg_model_path)
-        seg_model.eval()
-        
-        preprocessing_fn = smp.encoders.get_preprocessing_fn(self.seg_encoder, self.seg_encoder_weights)
-        preprocessing = get_preprocessing(preprocessing_fn, self.image_height, self.image_width)
-        
-        if not keep_patches_in_memory:
-            for folder in (self.class_manual_track_dir, self.class_manual_bkg_dir):
-                shutil.rmtree(folder, ignore_errors=True)
-
-        self.class_dataset_summary = {}
-
-        def extract(file_list, split):
-            samples, counts, n_touching = [], [0, 0], 0
-            for img_path, mask_path in tqdm(file_list, desc=f"Patches ({split})", leave=False):
-                image, pred_mask = predict_seg_mask(img_path, seg_model, preprocessing, self.device, threshold)
-                gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                for mask, region, target, touches in class_training_candidates(gt_mask, pred_mask, negatives, iou_threshold):
-                    n_touching += int(touches and target == 0)
-                    patch = get_64x64_centered_patch(image, mask, region)
-                    if keep_patches_in_memory:
-                        samples.append((patch, target))
-                        continue
-                    folder = os.path.join(self.class_manual_track_dir if target else self.class_manual_bkg_dir, split)
-                    os.makedirs(folder, exist_ok=True)
-                    path = os.path.join(folder, f"{'track' if target else 'bkg'}_{counts[target]}.png")
-                    cv2.imwrite(path, cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
-                    samples.append((path, target))
-                    counts[target] += 1
-            n_pos = sum(t for _, t in samples)
-            self.class_dataset_summary[split] = {'positives': n_pos, 'negatives': len(samples) - n_pos, 'negatives_touching_annotation': n_touching}
-            print(f"[{split}, negatives='{negatives}'] {n_pos} positives, {len(samples) - n_pos} negatives "
-                  f"({n_touching} of them touch an annotation)")
-            return samples
-
-        train_samples, val_samples = extract(self.train_files, 'train'), extract(self.val_files, 'val')
-        total = len(train_samples) + len(val_samples)
-        if keep_patches_in_memory and total > MAX_IN_MEMORY_PATCHES_WARNING:
-            print(f"Warning: {total} patches (~{total * 64 * 64 * 3 / 1024 ** 2:.0f} MB) are held in RAM; "
-                  f"consider keep_patches_in_memory=False.")
-        return train_samples, val_samples
-
-    def _match_instances_by_iou(self, gt_mask, pred_mask, iou_threshold, gt_log, pred_log):
-        """
-        Match ground truth and predicted instances using Intersection over Union (IoU).
-
-        Args:
-        ----------
-        gt_mask : np.ndarray
-            Ground truth binary mask.
-
-        pred_mask : np.ndarray
-            Predicted binary mask.
-
-        iou_threshold : float
-            Minimum IoU required to consider a valid match between instances.
-
-        gt_log : list
-            List used to accumulate ground truth instance metadata and match status.
-
-        pred_log : list
-            List used to accumulate predicted instance metadata and match status.
-
-        Returns
-        -------
-        tuple
-            gt_log : list
-                Updated ground truth log with match labels.
-
-            pred_log : list
-                Updated prediction log with match labels.
-        """
-        gt_instances = extract_instances(gt_mask)
-        pred_instances = extract_instances(pred_mask)
-        
-        for pred in pred_instances:
-            best_iou = 0
-            best_gt_idx = -1
-                            
-            for idx, gt in enumerate(gt_instances):
-                if gt['matched']:
-                    continue
-                                
-                intersection = np.logical_and(pred['mask'], gt['mask']).sum()
-                if intersection == 0: continue
-                            
-                union = np.logical_or(pred['mask'], gt['mask']).sum()
-                iou = intersection / union
-                            
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = idx
-                                
-            if best_iou >= iou_threshold:
-                pred['matched'] = True
-                gt_instances[best_gt_idx]['matched'] = True
-        
-        for gt in gt_instances:
-            gt_log.append({'len_um': gt['size'], 'is_true_positive': gt['matched']})
-        for pred in pred_instances:
-            pred_log.append({'len_um': pred['size'], 'is_true_positive': pred['matched']})
-            
-        return gt_log, pred_log
-
-    def _evaluate_efficiency(self, gt_log, pred_log, num_bins, mode):
-        """
-        Evaluate detection performance by computing size-binned recall and precision of detected tracks.
-
-        Args:
-            mode (str): 'seg' (segmentation only) or 'seg_class' (segmentation + classification).
-            seg_model_path, cls_model_path (str, optional): Checkpoints. Default to the trained ones.
-            seg_th, cls_th (float, optional): Thresholds. Default to the operating points of the model configurations.
-            iou_threshold (float, optional): Minimum IoU of a match. Defaults to 0.5.
-            num_bins (int, optional): Equal-population length bins of the table. Defaults to 10.
-            visualize (bool, optional): Show image, annotation and prediction for each file.
-
-        Returns:
-            dict: precision, recall, efficiency_table, df_gt, df_pred, bins, pair_log, val_area_cm2, detection_logs_path.
-        """
-        _check_mode(mode)
-        seg_model_path = seg_model_path or self.seg_best_model_path
-        cls_model_path = cls_model_path or self.class_best_model_path
-        seg_th = self.seg_model_th if seg_th is None else seg_th
-        cls_th = self.cls_model_th if cls_th is None else cls_th
-
-        def spec(path):
-            return os.path.splitext(os.path.basename(path))[0]
-        efficiency = efficiency_csv_paths(spec(seg_model_path), spec(cls_model_path), self.seg_best_model_folder, self.class_best_model_folder)
-        self.seg_binned_efficiency_path, self.seg_cls_binned_efficiency_path = efficiency['seg'], efficiency['seg_class']
-
-        self._load_split()
-        seg_model = build_seg_model(self.seg_model_arc, self.seg_encoder, weights_path=seg_model_path, device=self.device).eval()
-        cls_model = build_class_model(self.class_model_type, weights_path=cls_model_path, device=self.device) if mode == 'seg_class' else None
-        preprocessing = get_seg_preprocessing(self.seg_encoder, self.seg_encoder_weights, self.image_height, self.image_width)
-        class_transform = get_class_transform()
-        um = self.pixel_resolution_um_per_px
-
-        gt_log, pred_log, pair_log, area_cm2 = [], [], [], 0.0
-        for img_path, mask_path in tqdm(self.val_files + self.test_files, desc=f"Evaluating ({mode})"):
-            gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            image, pred_mask = predict_seg_mask(img_path, seg_model, preprocessing, self.device, seg_th)
-            if cls_model is not None:
-                pred_mask = create_class_mask(image, pred_mask, cls_model, class_transform, self.device, cls_th)
-            g, r, pairs = match_instances_by_iou(gt_mask, pred_mask, iou_threshold, um)
-            gt_log += g
-            pred_log += r
-            pair_log += pairs
-            if um is not None:
-                area_cm2 += gt_mask.shape[0] * gt_mask.shape[1] * (um * 1e-4) ** 2
-            if visualize:
-                show_images([(image, "Input"), (gt_mask, "Ground truth"), (pred_mask, mode)], title=os.path.basename(img_path))
-
-        unit = 'um' if um else 'px'
-        table, df_gt, df_pred, bins = binned_efficiency_table(gt_log, pred_log, num_bins, unit)
-        table.to_csv(efficiency[mode])
-        recall, precision = df_gt['is_true_positive'].mean(), df_pred['is_true_positive'].mean()
-        n_tp = int(df_gt['is_true_positive'].sum())
-        print(f"[{mode}] recall {recall:.3f}, precision {precision:.3f} | TP {n_tp}, "
-              f"FP {len(df_pred) - int(df_pred['is_true_positive'].sum())}, FN {len(df_gt) - n_tp}")
-
-        logs_path = detection_logs_file(efficiency[mode])
-        save_detection_logs(logs_path, gt_log, pred_log, pair_log, area_cm2 if um is not None else None, unit)
-        print(f"[OUTPUT] binned efficiency: {efficiency[mode]} | detection-model logs: {logs_path}")
-        return {'precision': precision, 'recall': recall, 'efficiency_table': table, 'df_gt': df_gt, 'df_pred': df_pred,
-                'bins': bins, 'pair_log': pair_log, 'val_area_cm2': area_cm2, 'detection_logs_path': logs_path}
-
-    def classifier_operating_curve(self, seg_model_path=None, cls_model_path=None, seg_th=None, thresholds=None, iou_threshold=0.5):
-        """Pipeline-level counts, recall and precision of segmentation + classification on the val + test images for a
-        sweep of classifier thresholds, with the instance matching of `evaluate_binned_efficiency`. Compare classifiers
-        (e.g. trained with different `negatives`) at equal precision instead of at a single threshold.
-
-        Args:
-            seg_model_path, cls_model_path (str, optional): Checkpoints. Default to the trained ones.
-            seg_th (float, optional): Segmentation threshold. Defaults to the operating point.
-            thresholds (array-like, optional): Classifier thresholds. Defaults to 0.05, 0.10, ..., 0.95.
-            iou_threshold (float, optional): Minimum IoU of a match. Defaults to 0.5.
-
-        Returns:
-            pandas.DataFrame: One row per threshold with TP, FP, FN, recall, precision and f05 (F-beta, beta = 0.5).
-        """
-        thresholds = np.arange(0.05, 0.96, 0.05) if thresholds is None else np.asarray(thresholds, float)
-        seg_th = self.seg_model_th if seg_th is None else seg_th
-        self._load_split()
-        seg_model = build_seg_model(self.seg_model_arc, self.seg_encoder, weights_path=seg_model_path or self.seg_best_model_path, device=self.device).eval()
-        cls_model = build_class_model(self.class_model_type, weights_path=cls_model_path or self.class_best_model_path, device=self.device)
-        preprocessing = get_seg_preprocessing(self.seg_encoder, self.seg_encoder_weights, self.image_height, self.image_width)
-        class_transform = get_class_transform()
-
-        counts = np.zeros((len(thresholds), 3))                       # TP, FP, FN per threshold
-        for img_path, mask_path in tqdm(self.val_files + self.test_files, desc="Operating curve"):
-            gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            image, pred_mask = predict_seg_mask(img_path, seg_model, preprocessing, self.device, seg_th)
-            labeled = label(pred_mask)
-            regions = regionprops(labeled)
-            probs = np.array(classify_regions(image, pred_mask, regions, cls_model, class_transform, self.device))
-            for k, t in enumerate(thresholds):
-                kept = np.isin(labeled, [r.label for r, p in zip(regions, probs) if p > t]).astype(np.uint8)
-                g, r, _ = match_instances_by_iou(gt_mask, kept, iou_threshold)
-                tp = sum(x['is_true_positive'] for x in g)
-                counts[k] += [tp, len(r) - sum(x['is_true_positive'] for x in r), len(g) - tp]
-
-        tp, fp, fn = counts.T
-        recall, precision = tp / np.maximum(tp + fn, 1), tp / np.maximum(tp + fp, 1)
-        f05 = 1.25 * precision * recall / np.maximum(0.25 * precision + recall, 1e-12)
-        return pd.DataFrame({'threshold': thresholds, 'TP': tp.astype(int), 'FP': fp.astype(int), 'FN': fn.astype(int),
-                             'recall': recall, 'precision': precision, 'f05': f05})
-
-    # ---------------------------------------------------------------- data split
-
-    def _load_split(self):
-        """Sets train/val/test (image, mask) pairs from `split_path`, creating and saving the split the first time."""
-        if os.path.exists(self.split_path):
-            with open(self.split_path, "r") as f:
-                splits = json.load(f)
-        else:
-            pairs = []
-            for img_path in sorted(glob.glob(os.path.join(self.image_dir, self.image_extensions))):
-                mask_path = os.path.join(self.mask_dir, os.path.splitext(os.path.basename(img_path))[0] + self.mask_extension)
-                if os.path.exists(mask_path):
-                    pairs.append((img_path, mask_path))
-            if not pairs:
-                raise FileNotFoundError(f"No image-mask pairs found in '{self.image_dir}' / '{self.mask_dir}'")
-            test_size, val_size = int(len(pairs) * self.test_split_ratio), int(len(pairs) * self.val_split_ratio)
-            train_val, test = train_test_split(pairs, test_size=test_size, random_state=42) if test_size > 0 else (pairs, [])
-            train, val = train_test_split(train_val, test_size=val_size, random_state=42) if 0 < val_size < len(train_val) else (train_val, [])
-            splits = {"train": train, "val": val, "test": test}
-            with open(self.split_path, "w") as f:
-                json.dump(splits, f, indent=4)
-        self.train_files, self.val_files, self.test_files = splits["train"], splits["val"], splits["test"]
+@dataclass
+class InferenceResult:
+    """Tracks found by `run_inference` and what produced them."""
+    tracks: pd.DataFrame
+    mode: str                       # 'seg' or 'seg_class'
+    area_cm2: float
+    n_images: int
+    images: object
+    seg_model: str
+    seg_th: float
+    cls_model: object               # None for a segmentation-only run
+    cls_th: object
+    um_per_px: float
+    detection_logs: object          # descriptor logs of these models and thresholds (None if not computed)
+    csv_path: object
+
+    @property
+    def lengths_nm(self):
+        return self.tracks['len_um'].to_numpy() * 1e3
+
+    def histogram(self, edges_nm):
+        """Measured counts n_j in the bins `edges_nm`."""
+        return np.histogram(self.lengths_nm, bins=edges_nm)[0]
+
+    def summary(self):
+        """Number of tracks, analysed area, density and length quartiles."""
+        L = self.tracks['len_um'] if len(self.tracks) else pd.Series(dtype=float)
+        return {'mode': self.mode, 'n_images': self.n_images, 'n_tracks': len(self.tracks), 'area_cm2': self.area_cm2,
+                'density_per_cm2': len(self.tracks) / self.area_cm2 if self.area_cm2 else None,
+                'len_um_mean': L.mean(), 'len_um_q25': L.quantile(0.25), 'len_um_median': L.median(),
+                'len_um_q75': L.quantile(0.75)}
+
+
+_TRACK_COLUMNS = ["image_filename", "track_id", "centroid_x_px_ellipse", "centroid_y_px_ellipse", "major_axis_px",
+                  "minor_axis_px", "orientation_deg", "len_um"]
+
+
+def run_inference(images, seg_model, cls_model=None, seg_th=None, cls_th=None, um_per_px=None,
+                  output_dir=INFERENCE_ROOT, parallel=True, visualize=False):
+    """Detects tracks on `images`: segmentation, then (if `cls_model` is given) classification of the candidates.
+    With `cls_model=None` the run is segmentation only.
+
+    Every z-stack is analysed on its sharpest focal plane (`collect_images`). Architectures, encoders, image size,
+    pixel resolution and default thresholds come from the records stored with the models. The tracks are saved as
+    <output_dir>/<images>__<model>_st<t>[_ct<c>].csv with a .json of the run, and the descriptor logs of the same
+    models and thresholds are attached when they exist.
+
+    Args:
+        images (str or list): Folder of tiles (or its parent with a TILES_SUBDIR subfolder), a file or a list of files.
+        seg_model (str): Segmentation model folder or .pth (mandatory).
+        cls_model (str, optional): Classifier .pth; None for a segmentation-only run.
+        seg_th, cls_th (float, optional): Thresholds. Default to the operating points stored with the models.
+        um_per_px (float, optional): Pixel size. Defaults to the one the segmentation model was trained with.
+        output_dir (str, optional): Defaults to INFERENCE_ROOT; None does not save.
+        parallel (bool, optional): Parallel sharpness analysis without a GPU.
+        visualize (bool, optional): Show each image with its final mask.
+
+    Returns:
+        InferenceResult
+    """
+    seg_pth, seg_record = resolve_seg_model(seg_model)
+    seg_th = seg_record['threshold'] if seg_th is None else seg_th
+    cls_pth, cls_record = resolve_cls_model(cls_model, seg_record) if cls_model is not None else (None, None)
+    if cls_record is not None:
+        cls_th = cls_record['threshold'] if cls_th is None else cls_th
+    else:
+        cls_th = None
+    mode = 'seg' if cls_pth is None else 'seg_class'
+    um = seg_record['image_config']['pixel_resolution_um_per_px'] if um_per_px is None else um_per_px
+
+    files = collect_images(images, parallel)
+    print(f"[{mode}] {len(files)} images | segmentation: {seg_record['name']} (th {seg_th:g})"
+          + (f" | classifier: {cls_record['tag']} (th {cls_th:g})" if cls_record else " | no classifier"))
+    device = _device()
+    seg_net, preprocessing = _load_seg(seg_pth, seg_record, device)
+    cls_net = _load_cls(cls_pth, cls_record, device) if cls_pth else None
+    transform = get_class_transform()
+
+    records, area_cm2 = [], 0.0
+    for path in tqdm(files, desc=f"Inference ({mode})"):
+        image, mask = predict_seg_mask(path, seg_net, preprocessing, device, seg_th)
+        if cls_net is not None:
+            mask = create_class_mask(image, mask, cls_net, transform, device, cls_th)
+        records += _ellipse_records(mask, os.path.basename(path), um)
+        if um is not None:
+            area_cm2 += image.shape[0] * image.shape[1] * (um * 1e-4) ** 2
+        if visualize:
+            show_images([(image, os.path.basename(path)), (mask, mode)])
+    tracks = pd.DataFrame(records, columns=_TRACK_COLUMNS if um is not None else _TRACK_COLUMNS[:-1])
+
+    logs_path, _, base = descriptor_paths(seg_pth, seg_th, cls_pth, cls_th)
+    if not os.path.exists(logs_path):
+        print(f"Note: no descriptor for these models and thresholds; run describe_model to create '{logs_path}'.")
+        logs_path = None
+    csv_path = None
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, f"{_images_tag(images)}__{base}.csv")
+        tracks.to_csv(csv_path, index=False)
+    result = InferenceResult(tracks, mode, area_cm2 if um is not None else None, len(files),
+                             images if isinstance(images, str) else list(images), seg_pth, seg_th, cls_pth, cls_th, um,
+                             logs_path, csv_path)
+    if csv_path:
+        meta = {k: v for k, v in result.__dict__.items() if k != 'tracks'}
+        _save_json(os.path.splitext(csv_path)[0] + '.json', meta)
+    area = f"{area_cm2:.4f} cm^2" if um is not None else "unknown area"
+    print(f"[OUTPUT] {len(tracks)} tracks on {area}" + (f" -> {csv_path}" if csv_path else ""))
+    return result
+
+
+def load_inference(csv_path):
+    """Reloads a run saved by `run_inference` (the csv and its json).
+
+    Returns:
+        InferenceResult
+    """
+    meta_path = os.path.splitext(csv_path)[0] + '.json'
+    for path in (csv_path, meta_path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"'{path}' not found")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return InferenceResult(tracks=pd.read_csv(csv_path), **meta)
