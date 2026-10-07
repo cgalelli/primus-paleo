@@ -25,6 +25,8 @@ from skimage.transform import rotate
 from skimage.measure import label, regionprops
 from sklearn.model_selection import train_test_split
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from scipy.stats import norm as _norm, chi2 as _chi2_dist
+from scipy.optimize import nnls as _nnls, linear_sum_assignment
 import json
 
 # ==========================================
@@ -111,54 +113,6 @@ TILES_SUBDIR = "tiles"
 # UTILITY FUNCTIONS
 # ==========================================
 
-def _asymmetric_gaussian_kernel(size, sigma_left, sigma_right=None):
-    """Generates a normalized 1D asymmetric Gaussian kernel array.
-
-    Args:
-        size (int): The total size of the kernel (must be an odd integer).
-        sigma_left (float): Standard deviation applied to the left side of the kernel center.
-        sigma_right (float, optional): Standard deviation applied to the right side of the kernel center. 
-            Defaults to None, which maps to match sigma_left.
-
-    Returns:
-        np.ndarray: A 1D normalized numpy float array representing the asymmetric Gaussian distribution.
-        
-    Raises:
-        ValueError: If size is an even integer.
-    """
-    if size % 2 == 0:
-        raise ValueError("Kernel size must be odd.")
-
-    center = size // 2
-    x = np.arange(size)
-
-    if sigma_right is None:
-        sigma_right = sigma_left
-    
-    kernel = np.zeros(size)
-    kernel[:center] = np.exp(-(x[:center] - center)**2 / (2 * sigma_left**2))
-    kernel[center] = 1.0
-    kernel[center+1:] = np.exp(-(x[center+1:] - center)**2 / (2 * sigma_right**2))
-    
-    return kernel / np.sum(kernel)
-
-
-def smear_spectrum(counts, size, sigma_left, sigma_right=None):
-    """Convolves a given spectrum signal with an asymmetric Gaussian kernel.
-
-    Args:
-        counts (np.ndarray): The 1D input array/signal to smear.
-        size (int): Spatial pixel size of the Gaussian kernel window.
-        sigma_left (float): Left side standard deviation profile.
-        sigma_right (float, optional): Right side standard deviation profile. Defaults to None.
-
-    Returns:
-        np.ndarray: The smeared spectrum convolved array signal matching input counts shape.
-    """
-    smeared_counts = np.convolve(counts, _asymmetric_gaussian_kernel(size, sigma_left, sigma_right), mode='same')
-    return smeared_counts
-
-    
 def slice_tif_to_png_tiles(images_per_group, input_dir, output_spec=TILES_SUBDIR, tile_size=IMAGE_CONFIG['img_height']):
     """Slices large TIF/TIFF files into smaller uniform square PNG tiles.
 
@@ -576,6 +530,312 @@ def create_class_mask(image, mask, model, transform, device, threshold=None):
 # CORE PIPELINE CLASSES
 # ==========================================
 
+# ======================================================================================
+# DETECTION MODEL: recall, length response and false positives of the recognition pipeline
+#
+# Turns a sliced theoretical spectrum N_i (expected tracks per bin of etched size, nm) into the
+# histogram that OptimusPrimus is expected to report, with uncertainties:
+#     recall R_i (true/annotated length) -> length response M_ji -> false positives phi_j (per area)
+#     mu_j = sum_i M_ji R_i N_i + phi_j A                       (fp_mode='density', default)
+#     mu_j = (sum_i M_ji R_i N_i) / P_j                         (fp_mode='precision')
+# Uncertainties: Poisson variance mu_j plus a first-order calibration covariance C_cal.
+# The calibration uses the *_detection_logs.json written by OptimusPrimusTraining.evaluate_binned_efficiency.
+# All lengths are in nm; the logged lengths are in um and are converted with `len_scale`.
+# ======================================================================================
+def _records(log):
+    """Converts a validation log into a list of dictionaries.
+
+    Args:
+        log (list or pandas.DataFrame): Per-instance records.
+
+    Returns:
+        list: The records as dictionaries.
+    """
+    return log.to_dict('records') if hasattr(log, 'to_dict') else list(log)
+
+
+def load_detection_logs(path):
+    """Reads the validation logs written by `OptimusPrimusTraining.evaluate_binned_efficiency`.
+
+    Args:
+        path (str): Path of the *_detection_logs.json file.
+
+    Returns:
+        dict: Keys 'gt_log', 'pred_log', 'pair_log', 'val_area_cm2' and 'length_unit'.
+    """
+    with open(path, 'r') as f:
+        logs = json.load(f)
+    logs['pair_log'] = [tuple(p) for p in logs['pair_log']]
+    return logs
+
+
+def fit_length_response(gt_len, pred_len):
+    """Fits the length-measurement response from matched (annotated, reported) pairs.
+
+    The bias is b(L) = b0 + b1 L and the variance sigma^2(L) = s0^2 + (s1 L)^2.
+
+    Args:
+        gt_len (np.ndarray): Annotated lengths.
+        pred_len (np.ndarray): Lengths reported for the same tracks.
+
+    Returns:
+        tuple: ((b0, b1), (s0^2, s1^2)).
+
+    Raises:
+        ValueError: If fewer than 10 pairs are given.
+    """
+    gt_len = np.asarray(gt_len, float)
+    pred_len = np.asarray(pred_len, float)
+    if len(gt_len) < 10:
+        raise ValueError("At least 10 matched pairs are needed to fit the length response.")
+    resid = pred_len - gt_len
+    b1, b0 = np.polyfit(gt_len, resid, 1)
+    r2 = (resid - (b0 + b1 * gt_len)) ** 2
+    (s0sq, s1sq), _ = _nnls(np.column_stack([np.ones_like(gt_len), gt_len ** 2]), r2)
+    return (b0, b1), (s0sq, s1sq)
+
+
+def calibrate_detection_model(gt_log, pred_log, pair_log, edges_nm, val_area_cm2, len_scale=1.e3, min_count=5):
+    """Measures recall, precision, false-positive counts and length response on the annotated validation set.
+
+    Args:
+        gt_log (list or pandas.DataFrame): Annotated instances with 'len_um' and 'is_true_positive'.
+        pred_log (list or pandas.DataFrame): Reported instances with 'len_um' and 'is_true_positive'.
+        pair_log (list): Matched (annotated length, reported length) pairs.
+        edges_nm (np.ndarray): Bin edges shared by the spectrum, the validation counts and the measurement [nm].
+        val_area_cm2 (float): Total area of the validation images [cm^2].
+        len_scale (float, optional): Factor converting the logged lengths to nm. Defaults to 1e3 (um).
+        min_count (int, optional): Bins with fewer annotated tracks inherit the recall of the nearest
+            populated bin. Defaults to 5.
+
+    Returns:
+        dict: Calibration model with the binned counts, the Beta parameters of the recall ('Ra', 'Rb'),
+            the length-response parameters ('bias', 'var') and the validation area.
+
+    Raises:
+        ValueError: If no bin has at least `min_count` annotated tracks.
+    """
+    edges = np.asarray(edges_nm, float)
+    nb = len(edges) - 1
+    gt, pr = _records(gt_log), _records(pred_log)
+    g_len = np.array([r['len_um'] for r in gt], float) * len_scale
+    g_tp = np.array([bool(r['is_true_positive']) for r in gt])
+    p_len = np.array([r['len_um'] for r in pr], float) * len_scale
+    p_tp = np.array([bool(r['is_true_positive']) for r in pr])
+    pairs = np.asarray(pair_log, float).reshape(-1, 2) * len_scale
+
+    def _bins(x):
+        idx = np.digitize(x, edges) - 1
+        return idx, (idx >= 0) & (idx < nb)
+
+    ig, in_g = _bins(g_len)
+    ip, in_p = _bins(p_len)
+    G = np.bincount(ig[in_g], minlength=nb)             # annotated tracks per true-length bin
+    TPg = np.bincount(ig[in_g & g_tp], minlength=nb)    # ... of which detected
+    Q = np.bincount(ip[in_p], minlength=nb)             # detections per reported-length bin
+    TPp = np.bincount(ip[in_p & p_tp], minlength=nb)    # ... of which true
+    FP = Q - TPp
+
+    Ra, Rb = TPg + 0.5, (G - TPg) + 0.5                 # Beta posterior of the recall (Jeffreys prior)
+    ok = np.where(G >= min_count)[0]
+    if len(ok) == 0:
+        raise ValueError("No bin has enough annotated tracks: use coarser bins.")
+    for i in np.where(G < min_count)[0]:
+        j = ok[np.argmin(np.abs(ok - i))]
+        Ra[i], Rb[i] = Ra[j], Rb[j]
+
+    bias, var = fit_length_response(pairs[:, 0], pairs[:, 1])
+    return dict(edges=edges, G=G, TPg=TPg, Q=Q, TPp=TPp, FP=FP, Ra=Ra, Rb=Rb,
+                area=float(val_area_cm2), pairs=pairs, bias=bias, var=var)
+
+
+def _beta_mean_var(a, b):
+    """Mean and variance of a Beta(a, b) distribution."""
+    return a / (a + b), a * b / ((a + b) ** 2 * (a + b + 1.))
+
+
+def binned_recall_precision(model, return_errors=False):
+    """Posterior-mean recall (per true-length bin) and precision (per reported-length bin).
+
+    Args:
+        model (dict): Output of `calibrate_detection_model`.
+        return_errors (bool, optional): If True, the standard deviations are also returned. Defaults to False.
+
+    Returns:
+        tuple: (R, P) or (R, P, sigma_R, sigma_P).
+    """
+    R, varR = _beta_mean_var(model['Ra'], model['Rb'])
+    P, varP = _beta_mean_var(model['TPp'] + 0.5, model['FP'] + 0.5)
+    return (R, P, np.sqrt(varR), np.sqrt(varP)) if return_errors else (R, P)
+
+
+def detection_response_matrix(edges, bias, var, n_sub=5):
+    """Builds the length-migration matrix M[j, i] = P(reported in bin j | true length in bin i).
+
+    Columns sum to at most one: the remainder migrates outside the histogram range.
+
+    Args:
+        edges (np.ndarray): Bin edges [nm].
+        bias (tuple): (b0, b1) of the length bias.
+        var (tuple): (s0^2, s1^2) of the length variance.
+        n_sub (int, optional): Sub-points per true bin used to integrate over the bin. Defaults to 5.
+
+    Returns:
+        np.ndarray: Matrix of shape (n_bins, n_bins).
+    """
+    edges = np.asarray(edges, float)
+    nb = len(edges) - 1
+    b0, b1 = bias
+    s0sq, s1sq = var
+    M = np.zeros((nb, nb))
+    for i in range(nb):
+        lo, hi = edges[i], edges[i + 1]
+        L = lo + (np.arange(n_sub) + 0.5) / n_sub * (hi - lo)
+        mean = L + b0 + b1 * L
+        sig = np.maximum(np.sqrt(s0sq + s1sq * L ** 2), 1.0)
+        cdf = _norm.cdf((edges[:, None] - mean[None, :]) / sig[None, :])
+        M[:, i] = np.diff(cdf, axis=0).mean(axis=1)
+    return M
+
+
+def _response_shifts(model):
+    """Length-response parameters displaced by +1 sigma along each independent direction.
+
+    The directions are the two principal axes of the (b1, b0) fit covariance and a relative error
+    sqrt(2 / n_pairs) on each of the two variance coefficients.
+
+    Args:
+        model (dict): Output of `calibrate_detection_model`.
+
+    Returns:
+        list: Four (bias, var) parameter sets.
+    """
+    gt, pr = model['pairs'][:, 0], model['pairs'][:, 1]
+    _, cov = np.polyfit(gt, pr - gt, 1, cov=True)           # covariance of [b1, b0]
+    w, v = np.linalg.eigh(cov)
+    (b0, b1), (s0sq, s1sq) = model['bias'], model['var']
+    out = []
+    for k in range(2):
+        d = v[:, k] * np.sqrt(max(w[k], 0.))
+        out.append(((b0 + d[1], b1 + d[0]), (s0sq, s1sq)))
+    rel = np.sqrt(2. / len(gt))
+    out.append(((b0, b1), (s0sq * (1. + rel), s1sq)))
+    out.append(((b0, b1), (s0sq, s1sq * (1. + rel))))
+    return out
+
+
+def fold_detection(counts_true, model, area_cm2, fp_mode='density', include_response=True):
+    """Folds a sliced spectrum with the detection model.
+
+    Returns the expected reported histogram and the covariance of its calibration uncertainty, propagated to
+    first order without sampling. Poisson counting noise (variance mu_j) is not included in the covariance.
+
+    Args:
+        counts_true (np.ndarray): Sliced spectrum N_i, expected tracks per bin (e.g. from `slice_spectrum`).
+        model (dict): Output of `calibrate_detection_model`.
+        area_cm2 (float): Analysed area of the measured sample, which sets the false-positive yield [cm^2].
+        fp_mode (str, optional): 'density' takes the false positives from their rate per area (valid for any
+            track density); 'precision' divides by the binned precision (same track density as the
+            validation set). Defaults to 'density'.
+        include_response (bool, optional): Include the uncertainty of the length response. Defaults to True.
+
+    Returns:
+        tuple: (mu, C_cal) with the expected counts per bin and their calibration covariance.
+
+    Raises:
+        ValueError: If `fp_mode` is not 'density' or 'precision'.
+    """
+    if fp_mode not in ('density', 'precision'):
+        raise ValueError("fp_mode must be 'density' or 'precision'")
+    N = np.asarray(counts_true, float)
+    R, varR = _beta_mean_var(model['Ra'], model['Rb'])
+    P, varP = _beta_mean_var(model['TPp'] + 0.5, model['FP'] + 0.5)
+    fpd = (model['FP'] + 0.5) / model['area']               # Gamma posterior mean [per cm^2]
+    var_fpd = (model['FP'] + 0.5) / model['area'] ** 2      # Gamma posterior variance
+
+    def _mu(M):
+        tp = M @ (R * N)
+        return tp + fpd * area_cm2 if fp_mode == 'density' else tp / P
+
+    M = detection_response_matrix(model['edges'], model['bias'], model['var'])
+    mu = _mu(M)
+    J = M * N[None, :]
+    if fp_mode == 'density':
+        C = (J * varR[None, :]) @ J.T + np.diag(var_fpd * area_cm2 ** 2)
+    else:
+        J = J / P[:, None]
+        C = (J * varR[None, :]) @ J.T + np.diag(((M @ (R * N)) / P ** 2) ** 2 * varP)
+    if include_response:
+        for bias, var in _response_shifts(model):
+            d = _mu(detection_response_matrix(model['edges'], bias, var)) - mu
+            C += np.outer(d, d)
+    return mu, C
+
+
+def merge_bins_auto(mu, min_expected=10.):
+    """Greedily merges adjacent bins until each group has at least `min_expected` expected counts.
+
+    Args:
+        mu (np.ndarray): Expected counts per bin.
+        min_expected (float, optional): Minimum expected counts per merged bin. Defaults to 10.
+
+    Returns:
+        list: Lists of bin indices, one per merged bin.
+    """
+    groups, cur, acc = [], [], 0.
+    for j, m in enumerate(mu):
+        cur.append(j)
+        acc += m
+        if acc >= min_expected:
+            groups.append(cur)
+            cur, acc = [], 0.
+    if cur:
+        if groups:
+            groups[-1] += cur
+        else:
+            groups.append(cur)
+    return groups
+
+
+def aggregate_bins(observed, mu, C, groups):
+    """Merges bins: counts and expectations add, covariances transform as A C A^T.
+
+    Args:
+        observed (np.ndarray): Measured counts per bin.
+        mu (np.ndarray): Expected counts per bin.
+        C (np.ndarray): Covariance of the expected counts.
+        groups (list): Bin groups from `merge_bins_auto`.
+
+    Returns:
+        tuple: (observed, mu, C) after merging.
+    """
+    A = np.zeros((len(groups), len(mu)))
+    for g, idx in enumerate(groups):
+        A[g, idx] = 1.
+    return A @ np.asarray(observed, float), A @ mu, A @ C @ A.T
+
+
+def detection_chi2(observed, mu, C_cal):
+    """Chi-square goodness of fit with the full covariance chi2 = (n - mu)^T [diag(mu) + C_cal]^-1 (n - mu).
+
+    The Gaussian approximation needs about 10 expected counts per bin: merge bins first with `merge_bins_auto`.
+
+    Args:
+        observed (np.ndarray): Measured counts per (merged) bin.
+        mu (np.ndarray): Expected counts per (merged) bin.
+        C_cal (np.ndarray): Calibration covariance of the expected counts.
+
+    Returns:
+        tuple: (chi2, ndof, p-value).
+    """
+    d = np.asarray(observed, float) - mu
+    chi2 = float(d @ np.linalg.solve(np.diag(mu) + C_cal, d))
+    return chi2, len(d), float(_chi2_dist.sf(chi2, len(d)))
+# ======================================================================================
+# END OF DETECTION MODEL
+# ======================================================================================
+
+
 class OptimusPrimus:
     """Production runtime inference management engine for the track identification architecture."""
     
@@ -833,33 +1093,6 @@ class OptimusPrimus:
         elif 'seg_class' in csv_path:
             self.seg_cls_efficiency_table = pd.read_csv(csv_path, index_col=0)
             print("Loading efficiency table from CSV and storing it in self.seg_cls_efficiency_table.")
-        
-    def apply_detection_model_efficiency(self, x_bins, counts, meas_error=1000.):
-        """Applies empirical calibration correction parameters over raw counts using loaded efficiency data.
-
-        Args:
-            x_bins (np.ndarray): Geometric size bin boundaries matching calibration curves.
-            counts (np.ndarray): Collected raw instance frequency numbers per bin interval.
-            meas_error (float, optional): Experimental measurement system error parameter. Defaults to 1000.0.
-
-        Returns:
-            np.ndarray: Corrected and calibrated distribution spectrum array matching inputs shape.
-        """
-        if self.seg_cls_efficiency_table is not None:
-            efficiency_table = self.seg_cls_efficiency_table
-        elif self.seg_efficiency_table is not None:
-            efficiency_table = self.seg_efficiency_table
-        else:
-            print("Efficiency tables not initialized.")
-            return counts
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        recall = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Recall'])
-        precision = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Precision'])
-
-        counts_with_efficiency = counts * recall / precision
-        counts_with_measure = smear_spectrum(counts_with_efficiency, len(x_bins)//2*2-1, meas_error/np.diff(x_bins)[0], meas_error/np.diff(x_bins)[0])
-        return counts_with_measure
 
     def _load_image_groups(self):
         """Scans the image directory and groups multi-focus sequential structures via regex parsing.
@@ -1523,13 +1756,16 @@ class OptimusPrimusTraining:
         preprocessing = get_preprocessing(preprocessing_fn, self.image_height, self.image_width)
         class_transform = get_val_augs()
 
-        gt_log, pred_log = [], []
+        gt_log, pred_log, pair_log = [], [], []
+        val_area_cm2 = 0.
+        um_per_px = self.pixel_resolution_um_per_px
 
         if mode == 'seg':
             for img_path, mask_path in tqdm(tot_files, desc="Evaluating Efficiency"):
                 gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if um_per_px is not None: val_area_cm2 += gt_mask_full.shape[0] * gt_mask_full.shape[1] * (um_per_px * 1e-4) ** 2
                 _, pred_mask_full = self._compute_seg_masks(img_path, inference_model, preprocessing, threshold=seg_th)
-                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, pred_mask_full, iou_threshold, gt_log, pred_log)
+                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, pred_mask_full, iou_threshold, gt_log, pred_log, pair_log)
                 
                 if visualize:
                     self._plot_verification(cv2.imread(img_path), gt_mask_full, pred_mask_full, f"Seg Evaluation - {os.path.basename(img_path)}")
@@ -1541,9 +1777,10 @@ class OptimusPrimusTraining:
             cls_model = self._create_class_model(cls_weights=cls_model_path)
             for img_path, mask_path in tqdm(tot_files, desc="Evaluating Efficiency"):
                 gt_mask_full = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if um_per_px is not None: val_area_cm2 += gt_mask_full.shape[0] * gt_mask_full.shape[1] * (um_per_px * 1e-4) ** 2
                 original_vis_image, pred_mask_full = self._compute_seg_masks(img_path, inference_model, preprocessing, threshold=seg_th)
                 final_confirmed_mask = create_class_mask(original_vis_image, pred_mask_full, cls_model, class_transform, self.device, threshold=cls_th)
-                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, final_confirmed_mask, iou_threshold, gt_log, pred_log)
+                gt_log, pred_log = self._match_instances_by_iou(gt_mask_full, final_confirmed_mask, iou_threshold, gt_log, pred_log, pair_log)
                 
                 if visualize:
                     self._plot_verification(original_vis_image, gt_mask_full, final_confirmed_mask, f"Seg+Class Evaluation - {os.path.basename(img_path)}")
@@ -1553,7 +1790,37 @@ class OptimusPrimusTraining:
         else:
             raise ValueError("mode need to be 'seg' or 'seg_class'")
         
+        # Per-instance validation logs, saved next to the binned-efficiency csv, for the detection model
+        efficiency_csv = self.seg_binned_efficiency_path if mode == 'seg' else self.seg_cls_binned_efficiency_path
+        logs_path = os.path.splitext(efficiency_csv)[0] + "_detection_logs.json"
+        self._save_detection_logs(logs_path, gt_log, pred_log, pair_log, val_area_cm2 if um_per_px is not None else None)
+        efficiency_dict.update(pair_log=pair_log, val_area_cm2=val_area_cm2, detection_logs_path=logs_path)
+        
         return efficiency_dict
+    
+    def _save_detection_logs(self, path, gt_log, pred_log, pair_log, val_area_cm2):
+        """Writes the per-instance validation logs used to calibrate the detection model.
+
+        Args:
+            path (str): Output json file.
+            gt_log (list): Annotated instances with size and match status.
+            pred_log (list): Reported instances with size and match status.
+            pair_log (list): (annotated size, reported size) of the matched pairs.
+            val_area_cm2 (float or None): Total area of the validation images [cm^2] (None if no pixel calibration).
+
+        Returns:
+            None
+        """
+        payload = {
+            'length_unit': 'um' if self.pixel_resolution_um_per_px else 'px',
+            'val_area_cm2': None if val_area_cm2 is None else float(val_area_cm2),
+            'gt_log': [{'len_um': float(r['len_um']), 'is_true_positive': bool(r['is_true_positive'])} for r in gt_log],
+            'pred_log': [{'len_um': float(r['len_um']), 'is_true_positive': bool(r['is_true_positive'])} for r in pred_log],
+            'pair_log': [[float(a), float(b)] for a, b in pair_log],
+        }
+        with open(path, 'w') as f:
+            json.dump(payload, f)
+        print(f"Detection-model validation logs saved to {path}")
     
     def efficiency_distribution_from_file(self, csv_path=None):
         """Loads calibration distribution datasets directly into internal efficiency execution structures.
@@ -1574,32 +1841,6 @@ class OptimusPrimusTraining:
         elif 'seg_class' in csv_path:
             self.seg_cls_efficiency_table = pd.read_csv(csv_path, index_col=0)
         
-    def apply_detection_model_efficiency(self, x_bins, counts, meas_error=1000.):
-        """Applies loaded recall/precision matrices to adjust raw count statistics dynamically.
-
-        Args:
-            x_bins (np.ndarray): Target matrix tracking numeric bin margins.
-            counts (np.ndarray): Array structure sequence containing item occurrences numbers.
-            meas_error (float, optional): Operational dispersion scaling coefficient adjustments. Defaults to 1000.0.
-
-        Returns:
-            np.ndarray: Shifted and smoothed efficiency distribution matrix framework.
-        """
-        if self.seg_cls_efficiency_table is not None:
-            efficiency_table = self.seg_cls_efficiency_table
-        elif self.seg_efficiency_table is not None:
-            efficiency_table = self.seg_efficiency_table
-        else:
-            return counts
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        recall = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Recall'])
-        precision = np.interp(x_mids, efficiency_table['Bin_mid'], efficiency_table['Precision'])
-
-        counts_with_efficiency = counts * recall / precision
-        counts_with_measure = smear_spectrum(counts_with_efficiency, len(x_bins)//2*2-1, meas_error/np.diff(x_bins)[0], meas_error/np.diff(x_bins)[0])
-        return counts_with_measure
-    
     def _get_training_pairs(self):
         """Builds mapping relationships coordinates between data images and corresponding label masks.
 
@@ -1879,9 +2120,15 @@ class OptimusPrimusTraining:
 
         return train_samples, val_samples
 
-    def _match_instances_by_iou(self, gt_mask, pred_mask, iou_threshold, gt_log, pred_log):
+    def _match_instances_by_iou(self, gt_mask, pred_mask, iou_threshold, gt_log, pred_log, pair_log=None):
         """
-        Match ground truth and predicted instances using Intersection over Union (IoU).
+        Match ground truth and predicted instances using a globally-optimal Intersection over Union (IoU)
+        assignment (Hungarian algorithm, `scipy.optimize.linear_sum_assignment`).
+
+        Unlike a greedy scan-order match, where an early prediction can lock in a suboptimal ground truth and
+        block a later, better-fitting prediction from claiming it, this solves for the assignment that
+        maximizes the total IoU over all ground truth / prediction pairs at once, so the result does not
+        depend on the (arbitrary) order in which instances are extracted from the masks.
 
         Args:
         ----------
@@ -1900,6 +2147,10 @@ class OptimusPrimusTraining:
         pred_log : list
             List used to accumulate predicted instance metadata and match status.
 
+        pair_log : list, optional
+            If given, the (annotated size, reported size) of every matched pair is appended to it;
+            used to calibrate the length response of the detection model.
+
         Returns
         -------
         tuple
@@ -1911,29 +2162,28 @@ class OptimusPrimusTraining:
         """
         gt_instances = extract_instances(gt_mask)
         pred_instances = extract_instances(pred_mask)
-        
-        for pred in pred_instances:
-            best_iou = 0
-            best_gt_idx = -1
-                            
-            for idx, gt in enumerate(gt_instances):
-                if gt['matched']:
-                    continue
-                                
-                intersection = np.logical_and(pred['mask'], gt['mask']).sum()
-                if intersection == 0: continue
-                            
-                union = np.logical_or(pred['mask'], gt['mask']).sum()
-                iou = intersection / union
-                            
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = idx
-                                
-            if best_iou >= iou_threshold:
-                pred['matched'] = True
-                gt_instances[best_gt_idx]['matched'] = True
-        
+
+        if gt_instances and pred_instances:
+            iou_matrix = np.zeros((len(gt_instances), len(pred_instances)))
+            for i, gt in enumerate(gt_instances):
+                for j, pred in enumerate(pred_instances):
+                    intersection = np.logical_and(gt['mask'], pred['mask']).sum()
+                    if intersection == 0:
+                        continue
+                    union = np.logical_or(gt['mask'], pred['mask']).sum()
+                    iou_matrix[i, j] = intersection / union
+
+            # Hungarian algorithm: the assignment that maximizes the total IoU
+            # (linear_sum_assignment minimizes the cost, so the IoU matrix is negated).
+            gt_idx, pred_idx = linear_sum_assignment(-iou_matrix)
+
+            for i, j in zip(gt_idx, pred_idx):
+                if iou_matrix[i, j] >= iou_threshold:
+                    gt_instances[i]['matched'] = True
+                    pred_instances[j]['matched'] = True
+                    if pair_log is not None:
+                        pair_log.append((gt_instances[i]['size'], pred_instances[j]['size']))
+
         for gt in gt_instances:
             gt_log.append({'len_um': gt['size'], 'is_true_positive': gt['matched']})
         for pred in pred_instances:

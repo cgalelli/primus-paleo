@@ -1,7 +1,3 @@
-Data/processed_recoils/*
-Plots/*
 Data/images/*
-!Data/images/*.ipynb
 Data/Geant4_data/build/*
-Primus_analysis.ipynb
-*.pyc
+Data/Geant4_data/CmakeLists.txt
