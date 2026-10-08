@@ -1,0 +1,5 @@
+{
+  "target_length_m": 200.0,
+  "target_radius_m": 10.0,
+  "depth_reference_z_m": 100.0
+}
