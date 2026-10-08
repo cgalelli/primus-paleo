@@ -1,5 +1,10 @@
 Data/images/*
 Data/Geant4_data/build/*
 Data/Geant4_data/CmakeLists.txt
-__pycache__/flux_history.cpython-312.pyc
-__pycache__/mineral_utils.cpython-312.pyc
+__pycache__/
+models/*/*/context/
+models/*/*/unsorted/
+models/*/*/track/
+models/*/*/bkg/
+*.zip
+make_*.py
