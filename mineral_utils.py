@@ -962,18 +962,13 @@ class Paleodetector:
         return x_bins, total_tracks_mg
 
 
-    def _geant4_geometry(self, data_dir, legacy_reference_m, legacy_density_g_cm3=None):
+    def _geant4_geometry(self, data_dir):
         """Geometry of a Geant4 output directory.
 
         Read from <data_dir>/geometry.json, written by the steering notebook.
-        Directories without it (older runs) fall back to the legacy values.
 
         Args:
             data_dir (str): Geant4 output directory.
-            legacy_reference_m (float): Target top face [m] assumed without
-                geometry.json; the length is then taken as twice this value.
-            legacy_density_g_cm3 (float, optional): Density assumed without
-                geometry.json. Defaults to None.
 
         Returns:
             dict: 'depth_reference_z_m' (z of the target top face [m]),
@@ -983,9 +978,9 @@ class Paleodetector:
             return self._geometry_cache[data_dir]
 
         geo = {
-            "depth_reference_z_m": float(legacy_reference_m),
-            "target_length_m": 2.0 * float(legacy_reference_m),
-            "density_g_cm3": legacy_density_g_cm3,
+            "depth_reference_z_m": 100.,
+            "target_length_m": 2.0 * 100.,
+            "density_g_cm3": 2.65,
         }
         meta_path = os.path.join(data_dir, "geometry.json")
         if os.path.exists(meta_path):
@@ -995,27 +990,23 @@ class Paleodetector:
             geo["target_length_m"] = float(meta.get("target_length_m", 2.0 * geo["depth_reference_z_m"]))
             if meta.get("density_g_cm3") is not None:
                 geo["density_g_cm3"] = float(meta["density_g_cm3"])
-        elif self.verbose > 0:
-            print(f"Warning: no geometry.json in {data_dir}, "
-                  f"assuming target top face at z = {legacy_reference_m} m (legacy).")
 
         self._geometry_cache[data_dir] = geo
         return geo
 
 
-    def _geant4_depth_reference_m(self, data_dir, legacy_reference_m):
+    def _geant4_depth_reference_m(self, data_dir):
         """z coordinate of the target top face of a Geant4 output directory.
 
         Depth below the top face is depth_reference_z_m - z_mm * 1e-3.
 
         Args:
             data_dir (str): Geant4 output directory.
-            legacy_reference_m (float): Value used without geometry.json [m].
 
         Returns:
             float: z of the target top face [m].
         """
-        return self._geant4_geometry(data_dir, legacy_reference_m)["depth_reference_z_m"]
+        return self._geant4_geometry(data_dir)["depth_reference_z_m"]
 
 
     def _load_depth_interpolators(self, species='mu-'):
@@ -1063,13 +1054,10 @@ class Paleodetector:
             FileNotFoundError: If the StdRock directory has no output files.
             ValueError: If fewer than two energies are usable.
         """
-        data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock_{tab_species}")
+        data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock/{tab_species}")
         is_muon = tab_species == 'mu-'
 
-        # Legacy values: used only if the directory has no geometry.json.
-        geo = self._geant4_geometry(
-            data_dir, legacy_reference_m=500. if is_muon else 100., legacy_density_g_cm3=2.65
-        )
+        geo = self._geant4_geometry(data_dir)
         z_ref_m = geo["depth_reference_z_m"]
         rho = geo["density_g_cm3"] if geo["density_g_cm3"] is not None else 2.65
         target_mwe = geo["target_length_m"] * rho
@@ -1107,14 +1095,14 @@ class Paleodetector:
 
         if self.verbose > 0 and (skipped or truncated):
             if skipped:
-                print(f"Warning: StdRock_{tab_species}: skipped {len(skipped)} energies with too few "
+                print(f"Warning: StdRock/{tab_species}: skipped {len(skipped)} energies with too few "
                       f"depth samples (e.g. {skipped[:3]} GeV).")
             if truncated:
-                print(f"Warning: StdRock_{tab_species}: skipped {len(truncated)} energies whose "
+                print(f"Warning: StdRock/{tab_species}: skipped {len(truncated)} energies whose "
                       f"depths reach the end of the target (from {min(truncated):g} GeV); "
                       f"use a longer StdRock target to cover them.")
         if len(energies) < 2:
-            raise ValueError(f"StdRock_{tab_species}: need at least 2 usable energies, found {len(energies)}.")
+            raise ValueError(f"StdRock/{tab_species}: need at least 2 usable energies, found {len(energies)}.")
 
         table = {'energies': np.array(energies), 'p': p_nodes, 'q': np.array(rows)}
         if not is_muon:
@@ -1138,7 +1126,6 @@ class Paleodetector:
         """
         table = self._depth_tables[tab_species]
         q = _loglog_interp_rows(energies_gev, table['energies'], table['q'])
-        # keep nodes non-decreasing after interpolation/extrapolation
         return np.maximum.accumulate(q, axis=-1)
 
 
@@ -1238,10 +1225,10 @@ class Paleodetector:
     def _load_stdrock_neutron_rows(self, species, energy_bins_gev, total_simulated_particles=1e4):
         """Neutrons produced by the primaries of the StdRock runs.
 
-        Reads the neutron rows of StdRock_<species> at the lower edge E_i of each
+        Reads the neutron rows of StdRock/<species> at the lower edge E_i of each
         energy cell. Depths are absolute (from the surface, where the primary
         enters) and already include the transport of the primary through the
-        rock. For mu+, StdRock_mu+ is used if present; otherwise the mu- runs
+        rock. For mu+, StdRock/mu+ is used if present; otherwise the mu- runs
         without the stopping step (no capture neutrons) stand in for it.
 
         Args:
@@ -1260,15 +1247,12 @@ class Paleodetector:
         tab_species = species
         drop_stopping = False
         if species == 'mu+' and not os.path.isdir(
-            os.path.join(self.data_path, "Geant4_data", "StdRock_mu+")
+            os.path.join(self.data_path, "Geant4_data", "StdRock/mu+")
         ):
             tab_species, drop_stopping = 'mu-', True
 
-        data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock_{tab_species}")
-        geo = self._geant4_geometry(
-            data_dir, legacy_reference_m=500. if tab_species != 'neutron' else 100.,
-            legacy_density_g_cm3=2.65,
-        )
+        data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock/{tab_species}")
+        geo = self._geant4_geometry(data_dir)
         rho = geo["density_g_cm3"] if geo["density_g_cm3"] is not None else 2.65
         z_ref_m = geo["depth_reference_z_m"]
 
@@ -1349,7 +1333,7 @@ class Paleodetector:
         primary down to the window is included), weighted by the primary
         intensity integrated over each energy cell:
 
-            A_b,m = sum_s sum_i Phi_s,i(t) * (StdRock_s neutrons of cell m in bin b per primary of cell i)
+            A_b,m = sum_s sum_i Phi_s,i(t) * (StdRock/<species> neutrons of cell m in bin b per primary of cell i)
 
         Generations inside the window use the StdRock neutron runs (offset
         matrix C_n). Neutrons are born uniformly within their bin, so a
@@ -1397,11 +1381,11 @@ class Paleodetector:
         for species in species_list:
             rows = self._load_stdrock_neutron_rows(species, energy_bins_gev, total_simulated_particles)
             if rows['missing'] and self.verbose > 0:
-                print(f"Warning: StdRock_{species}: no file for {len(rows['missing'])} primary "
+                print(f"Warning: StdRock/{species}: no file for {len(rows['missing'])} primary "
                       f"energies (e.g. {rows['missing'][:3]} GeV); their neutrons are missing.")
             beyond = slant > TRUNCATION_FRACTION * rows['target_mwe']
             if self.verbose > 0 and np.any(beyond[:, -1]):
-                print(f"Warning: vertical overburden beyond the StdRock_{species} target "
+                print(f"Warning: vertical overburden beyond the StdRock/{species} target "
                       f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondary neutrons "
                       "from that species are missing there; use a longer StdRock target.")
 
