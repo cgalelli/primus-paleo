@@ -32,6 +32,7 @@ import glob
 import json
 import shutil
 import hashlib
+import time
 import datetime
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -938,6 +939,7 @@ def _fit_segmentation(train_files, val_files, record, params, seg_pth, parallel)
     best, best_epoch, counter, logs, interrupted = -1.0, 0, 0, [], False
     try:
         for epoch in range(p['seg_epochs']):
+            t_start = time.time()
             model.train()
             train_loss = 0.0
             for images, masks in tqdm(train_loader, desc=f"Seg train E{epoch + 1}", leave=False):
@@ -962,7 +964,7 @@ def _fit_segmentation(train_files, val_files, record, params, seg_pth, parallel)
                          "val_loss": val_loss / max(len(val_loader), 1), **{f"val_{k.lower()}": v for k, v in scores.items()}})
             monitored = scores[p['seg_metric_to_monitor']]
             print(f"Epoch {epoch + 1}: train loss {logs[-1]['train_loss']:.4f}, val loss {logs[-1]['val_loss']:.4f}, "
-                  f"{p['seg_metric_to_monitor']} {monitored:.4f}")
+                  f"{p['seg_metric_to_monitor']} {monitored:.4f} ({time.time() - t_start:.0f} s)")
 
             if monitored > best:
                 best, best_epoch, counter = monitored, epoch + 1, 0
@@ -1358,7 +1360,11 @@ def describe_model(seg_model, cls_model=None, seg_th=None, cls_th=None, edges_nm
     if um is None:
         print("No pixel calibration: the descriptor table needs lengths in um and the area; only the logs were written.")
         return None
-    table = detection_descriptor(load_detection_logs(logs_path), edges_nm)
+    try:
+        table = detection_descriptor(load_detection_logs(logs_path), edges_nm)
+    except ValueError as e:      # e.g. an undertrained model with no matched tracks: keep the logs, skip the table
+        print(f"Warning: no descriptor table ({e}). The logs are at {logs_path}.")
+        return None
     table.to_csv(table_path, index=False)
     print(f"[OUTPUT] descriptor: {table_path}")
     return table
