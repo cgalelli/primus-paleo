@@ -37,10 +37,9 @@ Changing the scenario means editing the configuration, not the code. To reproduc
 
 - training and inference on image patches, with an option to keep patches in memory (with a RAM warning for large datasets);
 - multi-GPU training through PyTorch `DataParallel`;
-- exact, order-independent matching of detected and manually annotated tracks via the Hungarian algorithm (`scipy.optimize.linear_sum_assignment`);
 - safe checkpoint handling (explicit errors on missing paths, `weights_only=True` on all loads).
 
-`Test_optimusprimus.ipynb` shows a minimal end-to-end usage example.
+`Test_optimusprimus.ipynb` shows a typical end-to-end usage example.
 
 ## Installation
 
@@ -51,12 +50,6 @@ git clone https://github.com/cgalelli/primus-paleo.git
 cd primus-paleo
 ```
 
-If you already have a clone made under the old name, update its remote:
-
-```bash
-git remote set-url origin https://github.com/cgalelli/primus-paleo.git
-```
-
 ### Dependencies
 
 For the **simulation notebooks**:
@@ -65,9 +58,13 @@ For the **simulation notebooks**:
 pip install numpy scipy matplotlib mendeleev pyyaml jupyter
 ```
 
-For **OptimusPrimus**, additionally install PyTorch following the instructions at [pytorch.org](https://pytorch.org/get-started/locally/) for your platform (a CUDA-enabled build is recommended for training).
+For **OptimusPrimus**, additionally install PyTorch following the instructions at [pytorch.org](https://pytorch.org/get-started/locally/) for your platform (a CUDA-enabled build is recommended for training; inference can be performed on CPU). As well as:
 
-Some steps of the full simulation chain rely on external tools (MCEq, Geant4), which must be installed separately.
+```bash
+pip install scikit-learn scikit-image
+```
+
+Some steps of the full simulation chain rely on external tools (MCEq, Geant4), which must be installed separately. If only using the provided astrophysical flux scenarios and minerals, these are not necessary.
 
 ## Citation
 
@@ -121,7 +118,7 @@ If you use this code or the associated results in your research, please cite the
 
 ## Acknowledgments
 
-PRImuS is an INFN experiment funded by the CSN5 Young Scientist Grant 2024.
+PRImuS is an INFN experiment funded by the CSN5 Young Scientist Grant.
 
 ## Contact
 
