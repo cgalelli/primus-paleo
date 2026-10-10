@@ -92,6 +92,7 @@ TRAINING_PARAMETERS = {
     'seg_threshold': 0.5,                   # threshold of the validation metrics during training
     'seg_metric_to_monitor': 'Dice/F1',     # one of 'FBeta', 'IoU', 'Dice/F1', 'Recall', 'Precision'
     'seg_val_beta': 2.0,
+    'seg_augmentation': 'basic',            # 'basic' (flips, brightness/contrast) or 'legacy' (see SEG_AUGMENTATION_PRESETS)
     'class_boost_precision_weight': 0.7,
     'class_learning_rate': 3e-5,
     'class_epochs': 80,
@@ -109,10 +110,18 @@ TRAIN_IMAGE = {
     'split_seed': 42,
 }
 
-AUGMENTATION_PARAMETERS = {
-    'H_FLIP_PROB': 0.5,
-    'V_FLIP_PROB': 0.5,
-    'BRIGHTNESS_CONTRAST_PROB': 0.4,
+# Segmentation training augmentations. 'legacy' follows the previous pipeline (track_identification note): flips and
+# 90-degree rotations, affine, elastic, brightness/contrast, Gaussian noise, CLAHE. The note gives the types, not the
+# values: these are conservative values for thin (~4 px) tracks on 1024 px tiles. Applied jointly to image and mask
+# (geometric ones), on the uint8 image before normalisation; validation is never augmented.
+SEG_AUGMENTATION_PRESETS = {
+    'basic': {'flip_p': 0.5, 'brightness_contrast_p': 0.4},
+    'legacy': {'flip_p': 0.5, 'rot90_p': 0.5,
+               'affine_p': 0.5, 'scale': (0.9, 1.1), 'translate': 0.05, 'rotate': 15, 'shear': 5,
+               'elastic_p': 0.25, 'elastic_alpha': 30, 'elastic_sigma': 6,
+               'brightness_contrast_p': 0.5, 'brightness_limit': 0.2, 'contrast_limit': 0.2,
+               'noise_p': 0.3, 'noise_std': (0.01, 0.04),
+               'clahe_p': 0.2, 'clahe_clip': (1.0, 3.0)},
 }
 
 MODELS_ROOT = "Data/models/"
@@ -225,9 +234,46 @@ def seg_model_name(image_spec, n_tiles, file_hash, seg_cfg, params):
 
     Example: seg_ARCI-URAS26F2_n150-3fa2c1_MAnet-efficientnet-b7_ep200-bs2-lr3e-04-Dice-F1
     """
+    aug = params.get('seg_augmentation', 'basic')
     return (f"seg_{_slug(image_spec)}_n{n_tiles}-{file_hash}_{seg_cfg['model_arc']}-{_slug(seg_cfg['encoder'])}"
             f"_ep{params['seg_epochs']}-bs{params['seg_batch_size']}-lr{params['seg_learning_rate']:.0e}"
-            f"-{_slug(params['seg_metric_to_monitor'])}")
+            f"-{_slug(params['seg_metric_to_monitor'])}" + ("" if aug == 'basic' else f"-aug-{_slug(aug)}"))
+
+
+def _albu_major():
+    return int(A.__version__.split('.')[0])
+
+
+def get_seg_train_augmentation(preset, height, width):
+    """Training augmentation of the segmentation network (`SEG_AUGMENTATION_PRESETS`), for albumentations 1.x and 2.x.
+
+    Raises:
+        ValueError: If `preset` is unknown.
+    """
+    if preset not in SEG_AUGMENTATION_PRESETS:
+        raise ValueError(f"seg_augmentation must be one of {list(SEG_AUGMENTATION_PRESETS)}, got '{preset}'")
+    c, v2 = SEG_AUGMENTATION_PRESETS[preset], _albu_major() >= 2
+    ops = [A.Resize(height, width, interpolation=cv2.INTER_LINEAR),
+           A.HorizontalFlip(p=c['flip_p']), A.VerticalFlip(p=c['flip_p'])]
+    if 'rot90_p' in c:
+        ops.append(A.RandomRotate90(p=c['rot90_p']))
+    if 'affine_p' in c:
+        border = dict(border_mode=cv2.BORDER_REFLECT_101) if v2 else dict(mode=cv2.BORDER_REFLECT_101)
+        ops.append(A.Affine(scale=c['scale'], translate_percent=(-c['translate'], c['translate']), rotate=(-c['rotate'], c['rotate']),
+                            shear=(-c['shear'], c['shear']), interpolation=cv2.INTER_LINEAR, mask_interpolation=cv2.INTER_NEAREST,
+                            p=c['affine_p'], **border))
+    if 'elastic_p' in c:
+        ops.append(A.ElasticTransform(alpha=c['elastic_alpha'], sigma=c['elastic_sigma'], p=c['elastic_p']))
+    ops.append(A.RandomBrightnessContrast(brightness_limit=c.get('brightness_limit', 0.2),
+                                          contrast_limit=c.get('contrast_limit', 0.2), p=c['brightness_contrast_p']))
+    if 'noise_p' in c:
+        lo, hi = c['noise_std']                                   # std as a fraction of the 0-255 range
+        noise = (A.GaussNoise(std_range=(lo, hi), p=c['noise_p']) if v2 else
+                 A.GaussNoise(var_limit=((lo * 255) ** 2, (hi * 255) ** 2), p=c['noise_p']))
+        ops.append(noise)
+    if 'clahe_p' in c:
+        ops.append(A.CLAHE(clip_limit=c['clahe_clip'], p=c['clahe_p']))
+    return A.Compose(ops)
 
 
 def cls_model_tag(source_tag, patch_th, cls_cfg, params):
@@ -876,6 +922,8 @@ def train_segmentation(train_image_dir, image_spec, training_parameters=None, im
     seg_cfg = {**SEG_MODEL_CONFIG, **(seg_model_config or {})}
     params = {**TRAINING_PARAMETERS, **(training_parameters or {})}
 
+    if params['seg_augmentation'] not in SEG_AUGMENTATION_PRESETS:
+        raise ValueError(f"seg_augmentation must be one of {list(SEG_AUGMENTATION_PRESETS)}, got '{params['seg_augmentation']}'")
     pairs = _annotated_pairs(train_image_dir, train_cfg)
     split = _make_split(pairs, train_cfg)
     name = seg_model_name(image_spec, len(pairs), _short_hash([os.path.basename(p[0]) for p in pairs]), seg_cfg, params)
@@ -896,7 +944,9 @@ def train_segmentation(train_image_dir, image_spec, training_parameters=None, im
               'model': {k: seg_cfg[k] for k in ('model_arc', 'encoder', 'encoder_weights')},
               'threshold': seg_cfg['threshold'],
               'training_parameters': {k: v for k, v in params.items() if k.startswith('seg_')},
-              'augmentations': AUGMENTATION_PARAMETERS}
+              'augmentation': {'preset': params['seg_augmentation'],
+                               'parameters': SEG_AUGMENTATION_PRESETS.get(params['seg_augmentation']),
+                               'albumentations': A.__version__}}
     print(f"[SEGMENTATION] {name}\n  {len(pairs)} annotated tiles: {record['n_split']}")
     record['training_result'] = _fit_segmentation(split['train'], split['val'], record, params, seg_pth, parallel)
     _save_json(_record_path(seg_pth), record)
@@ -918,9 +968,7 @@ def _fit_segmentation(train_files, val_files, record, params, seg_pth, parallel)
     device = _device()
     preprocessing = get_seg_preprocessing(m['encoder'], m['encoder_weights'])
     resize = A.Resize(img['img_height'], img['img_width'], interpolation=cv2.INTER_LINEAR)
-    train_augs = A.Compose([resize, A.HorizontalFlip(p=AUGMENTATION_PARAMETERS['H_FLIP_PROB']),
-                            A.VerticalFlip(p=AUGMENTATION_PARAMETERS['V_FLIP_PROB']),
-                            A.RandomBrightnessContrast(p=AUGMENTATION_PARAMETERS['BRIGHTNESS_CONTRAST_PROB'])])
+    train_augs = get_seg_train_augmentation(p['seg_augmentation'], img['img_height'], img['img_width'])
     workers, pin = resolve_num_workers(parallel), torch.cuda.is_available()
     train_loader = DataLoader(SegmentationDataset(train_files, train_augs, preprocessing), batch_size=p['seg_batch_size'],
                               shuffle=True, num_workers=workers, pin_memory=pin, drop_last=True)
