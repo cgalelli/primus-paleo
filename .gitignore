@@ -2,4 +2,5 @@ Data/images/*
 Data/Geant4_data/build/*
 Data/Geant4_data/CmakeLists.txt
 __pycache__/
-models/**
+Data/models/**
+Data/profiler_calibration
