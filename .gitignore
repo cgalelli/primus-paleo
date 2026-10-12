@@ -6,5 +6,5 @@ models/*/*/context/
 models/*/*/unsorted/
 models/*/*/track/
 models/*/*/bkg/
-*.zip
-make_*.py
+
+*/pth
