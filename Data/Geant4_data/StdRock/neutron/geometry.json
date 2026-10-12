@@ -1,0 +1,6 @@
+{
+  "target_length_m": 1000.0,
+  "target_radius_m": 10.0,
+  "depth_reference_z_m": 500.0,
+  "density_g_cm3": 2.65
+}
