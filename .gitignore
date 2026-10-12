@@ -2,9 +2,4 @@ Data/images/*
 Data/Geant4_data/build/*
 Data/Geant4_data/CmakeLists.txt
 __pycache__/
-models/*/*/context/
-models/*/*/unsorted/
-models/*/*/track/
-models/*/*/bkg/
-
-*/pth
+models/**
