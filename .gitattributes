@@ -4,10 +4,10 @@ Data/Geant4_data/run_geant.ipynb  -export-ignore
 Data/Geant4_data/Run.cc  -export-ignore
 Data/Geant4_data/src  -export-ignore
 Data/Geant4_data/include  -export-ignore
-Data/profiler_calibration/**  export-ignore
-Data/profiler_calibration export-ignore
 
 Data/flux_data/**    export-ignore
+
+Data/*.npz
 
 Papers/**      export-ignore
 
