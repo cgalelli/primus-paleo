@@ -27,7 +27,7 @@ authors:
     affiliation: "INFN, Sezione di Milano"
     orcid: "https://orcid.org/0000-0002-7372-9703"
   
-# identifiers:
-#   - type: doi
-#     value: "10.5281/zenodo.XXXXXXX"
-#     description: "Concept DOI (all versions)"
+identifiers:
+   - type: doi
+     value: "10.5281/zenodo.23320945"
+     description: "Concept DOI (all versions)"
