@@ -162,8 +162,7 @@ class FluxTemplate:
         h_obs_km = params.pop("h_obs_km", None)
         interaction_model = params.pop("interaction_model", DEFAULT_INTERACTION_MODEL)
 
-        param_name = "_".join(str(val) for val in params.values())
-        name = kind + "_" + param_name + str(geomagnetic_cutoff) + "GV"
+        name = "_".join([kind, *(str(val) for val in params.values()), f"{geomagnetic_cutoff}GV"])
         if h_obs_km: 
             name = name + "_" + str(h_obs_km) + "km"
 
@@ -549,33 +548,77 @@ def _zenith_averaged_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG,
     return muons, neutrons
 
 
-def _corrected_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS):
-    """
-    `_zenith_averaged_secondaries`, plus the unit rescale (m^-2 -> cm^-2)
-    and low-energy neutron fix used for the *steady* Baseline/SN/Egal
-    templates: below `e_grid[15]`, MCEq's neutron solution is replaced
-    by a power-law anchored at `e_grid[32]` (an existing, pre-batch-
-    solve correction, not something new here), and both arrays are
-    floored at 1e-44 before being handed to FluxTemplate's log-space
-    interpolator.
+LOW_E_NEUTRONS = {
+    'e_match_gev': 1.0,      # where the Gordon fit has the cosmic-ray slope (-2.69) and MCEq is still sensible
+    'blend_dex': 0.25,       # half-width of the matching window and of the tanh transition [decades]
+    'e_min_gev': 1e-3,       # the template grid is extended down to here (lowest Geant4 energy)
+    'n_per_decade': 10,      # points per decade of the extension
+    'evaporation': True,     # keep the ~1 MeV evaporation peak of the fit
+}
 
-    Fixed: this used to not accept `weights` at all, silently relying on
-    `_zenith_averaged_secondaries`'s own default lining up with whatever
-    `angles` was passed here. Harmless while every call site uses the
-    default `DEFAULT_ANGLES_DEG`, but a latent bug the moment a custom
-    angle set is ever passed without also passing matching weights.
+def gordon_neutron_spectrum(energy_gev, evaporation=True):
+    """Sea-level neutron spectrum of Gordon et al., IEEE TNS 51 (2004) 3427 (fit adopted in JESD89A).
+
+    Args:
+        energy_gev (array_like): Kinetic energy [GeV].
+        evaporation (bool, optional): Include the evaporation term. Defaults to True.
+
+    Returns:
+        np.ndarray: dPhi/dE [n cm^-2 s^-1 GeV^-1].
     """
-    e_grid = mceq_run.e_grid
+    ln_e = np.log(np.asarray(energy_gev, dtype=float) * 1e3)
+    phi = 1.006e-6 * np.exp(-0.35 * ln_e ** 2 + 2.1451 * ln_e)
+    if evaporation:
+        phi = phi + 1.011e-3 * np.exp(-0.4106 * ln_e ** 2 - 0.667 * ln_e)
+    return phi * 1e3 / (4 * np.pi)                                 
+
+
+def _loglog(x_new, x, y):
+    """Log-log linear interpolation, extrapolating linearly: what FluxTemplate does outside its grid."""
+    f = interp1d(np.log10(x), np.log10(np.clip(y, 1e-300, None)), kind='linear',
+                 bounds_error=False, fill_value='extrapolate')
+    return np.power(10.0, f(np.log10(x_new)))
+
+
+def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS):
+    """
+    `_zenith_averaged_secondaries` and the primary flux on the MCEq grid extended down to
+    LOW_E_NEUTRONS['e_min_gev'], with the low-energy neutron correction. Used by every template (steady and,
+    per time step, transient).
+
+    Neutrons: k = geometric mean of MCEq / Gordon over e_match * 10^(+-blend_dex), then a log-space tanh join,
+        log Phi = s log Phi_MCEq + (1 - s) log(k Phi_Gordon),   s = (1 + tanh(log10(E / e_match) / blend_dex)) / 2
+    so flux and slope are continuous. Muons and the primary are only extended as FluxTemplate would have
+    extrapolated them (unchanged where they were queried before). Everything is floored at 1e-44 for
+    FluxTemplate's log-space interpolator.
+
+    Returns:
+        tuple: (e_ext, muons, neutrons, primary) on e_ext.
+
+    Raises:
+        ValueError: If fewer than 2 MCEq grid points lie in the matching window.
+    """
+    c = LOW_E_NEUTRONS
+    e_grid = np.asarray(mceq_run.e_grid, dtype=float)
     muons, neutrons = _zenith_averaged_secondaries(mceq_run, angles, weights)
+    neutrons = np.clip(neutrons, 1e-300, None)                       # a decayed transient may be exactly 0
 
-    E0 = e_grid[32]
-    g_pre = 2.6
-    anflux = (neutrons[32] / (np.exp(-1 / E0))) * np.exp(-1. / e_grid) * (e_grid / E0) ** (-g_pre)
-    neutrons = np.where(e_grid > e_grid[15], neutrons, anflux)
+    n_low = max(int(np.ceil(np.log10(e_grid[0] / c['e_min_gev']) * c['n_per_decade'])), 0)
+    e_ext = np.concatenate([np.logspace(np.log10(c['e_min_gev']), np.log10(e_grid[0]), n_low + 1)[:-1], e_grid])
 
-    np.clip(neutrons, 1e-44, None, out=neutrons)
-    np.clip(muons, 1e-44, None, out=muons)
-    return muons, neutrons
+    win = np.abs(np.log10(e_grid / c['e_match_gev'])) <= c['blend_dex']
+    if win.sum() < 2:
+        raise ValueError(f"Only {win.sum()} MCEq grid points around {c['e_match_gev']} GeV; "
+                         "change LOW_E_NEUTRONS['e_match_gev'] or 'blend_dex'.")
+    gordon = lambda e: gordon_neutron_spectrum(e, c['evaporation'])
+    k = np.exp(np.mean(np.log(neutrons[win] / gordon(e_grid[win]))))
+    s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
+    neutrons = np.exp(s * np.log(_loglog(e_ext, e_grid, neutrons))
+                      + (1.0 - s) * np.log(np.clip(k * gordon(e_ext), 1e-300, None)))
+
+    muons = _loglog(e_ext, e_grid, np.clip(muons, 1e-44, None))
+    primary = _loglog(e_ext, e_grid, model_instance.total_flux(e_grid))
+    return e_ext, np.clip(muons, 1e-44, None), np.clip(neutrons, 1e-44, None), primary
 
 
 def _set_h_obs(mceq_run, h_obs_cm):
@@ -629,7 +672,6 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
     theta_deg=0.0
     )
 
-    e_grid = mceq_run.e_grid
     angles = DEFAULT_ANGLES_DEG
 
     if params is None:
@@ -645,8 +687,7 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
         _set_h_obs(mceq_run, reference_h_obs_cm)
 
-        muons, neutrons = _corrected_secondaries(mceq_run, angles)
-        primary = model_instance.total_flux(e_grid)
+        e_ext, muons, neutrons, primary = _corrected_secondaries(mceq_run, model_instance, angles)
 
     else:
         muons, neutrons, primary = [], [], []
@@ -660,25 +701,14 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
             _set_h_obs(mceq_run, reference_h_obs_cm)
 
-            muons_t, neutrons_t = _zenith_averaged_secondaries(mceq_run, angles)
-            primary_t = model_instance.total_flux(e_grid)
-
-            E0 = e_grid[32]
-
-            g_pre = 2.6 
-
-            anflux = (neutrons_t[32] / (np.exp(-1 / E0))) * np.exp(-1. / e_grid) * (e_grid / E0) ** (-g_pre)
-            neutrons_t = np.where(e_grid > e_grid[15], neutrons_t, anflux)
-
-            np.clip(neutrons_t, 1e-44, None, out=neutrons_t)
-            np.clip(muons_t, 1e-44, None, out=muons_t)
+            e_ext, muons_t, neutrons_t, primary_t = _corrected_secondaries(mceq_run, model_instance, angles)
 
             neutrons.append(neutrons_t)
             muons.append(muons_t)
             primary.append(primary_t)
 
     return FluxTemplate(
-        name, e_grid,
+        name, e_ext,
         {
             "primary": np.array(primary) * 1e-4,
             "mu+": np.array(muons) / 2.0,
