@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator, interp1d
-from scipy.special import roots_jacobi
+from scipy.special import erfc, roots_jacobi
 
 def _hemisphere_gauss_legendre(n_angles):
     """
@@ -520,44 +520,50 @@ class EgalHG12(PrimaryFlux):
         return flux
 
 
+# MCEq solutions summed into each template species (MCEq names)
+MCEQ_SPECIES = {
+    'mu': ('total_mu+', 'total_mu-'),   # split equally into "mu+" and "mu-" in the template
+    'neutron': ('n0',),
+    'proton': ('p+',),
+    # Neutrinos: same convention as the other species (downward hemisphere, cos-weighted). They are not attenuated
+    # and also arrive from below, so the full-sky (4 pi) rate and the absence of a depth table are handled where
+    # the template is used, not here. Below e_grid[0] they are only extended as FluxTemplate would extrapolate.
+    'nu_mu': ('total_numu',),
+    'nu_mu_bar': ('total_antinumu',),
+    'nu_e': ('total_nue',),
+    'nu_e_bar': ('total_antinue',),
+}
+
+
 def _zenith_averaged_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG,
                                   weights=DEFAULT_ANGLE_WEIGHTS):
     """
-    Zenith-averaged muon and neutron flux, in MCEq's raw (un-rescaled)
-    units, at `mceq_run`'s *current* configuration (interaction model,
-    primary model/params, density model -- whatever is already set on
-    the instance), using one `solve_fullsky` batch call instead of a
-    per-angle loop, and solid-angle quadrature `weights` (default:
-    Gauss-Legendre in cos(theta), see `_hemisphere_gauss_legendre`)
-    instead of a plain average.
- 
-    Deliberately returns un-rescaled, un-clipped arrays (no *1e4, no
-    low-energy neutron replacement) so callers can apply those in
-    whatever order they need -- `_build_template`'s steady and
-    transient branches historically did so at different points, and
-    this keeps both numerically identical to before.
+    Zenith-averaged flux of every MCEQ_SPECIES entry, in MCEq's raw units, at `mceq_run`'s *current*
+    configuration (interaction model, primary model/params, density model), using one `solve_fullsky` batch
+    call and the solid-angle quadrature `weights` (see `_hemisphere_gauss_legendre`).
+
+    Returns:
+        dict: species -> flux on mceq_run.e_grid (un-rescaled, un-clipped).
     """
     result = mceq_run.solve_fullsky(zenith_grid=angles)
-    e_grid = mceq_run.e_grid
-    muons = np.zeros_like(e_grid)
-    neutrons = np.zeros_like(e_grid)
+    out = {key: np.zeros_like(mceq_run.e_grid) for key in MCEQ_SPECIES}
     for theta, w in zip(angles, weights):
-        muons += w * (result.get_solution('total_mu+', zenith=float(theta), mag=0)
-                       + result.get_solution('total_mu-', zenith=float(theta), mag=0))
-        neutrons += w * result.get_solution('n0', zenith=float(theta), mag=0)
-    return muons, neutrons
+        for key, names in MCEQ_SPECIES.items():
+            for name in names:
+                out[key] += w * result.get_solution(name, zenith=float(theta), mag=0)
+    return out
 
 
-LOW_E_NEUTRONS = {
-    'e_match_gev': 1.0,      # where the Gordon fit has the cosmic-ray slope (-2.69) and MCEq is still sensible
-    'blend_dex': 0.25,       # half-width of the matching window and of the tanh transition [decades]
-    'e_min_gev': 1e-3,       # the template grid is extended down to here (lowest Geant4 energy)
-    'n_per_decade': 10,      # points per decade of the extension
-    'evaporation': True,     # keep the ~1 MeV evaporation peak of the fit
-}
-
+# --- Low-energy nucleons ------------------------------------------------------------------------------------------
+# MCEq is not meant for nucleons below a few GeV and its grid stops at e_grid[0]. Below ~1 GeV each nucleon flux is a
+# fixed shape normalised to MCEq around e_match, so it follows every change of the MCEq solution (primary flux,
+# events, cutoff) as a rescaling. Above e_match the MCEq solution is kept.
 def gordon_neutron_spectrum(energy_gev, evaporation=True):
     """Sea-level neutron spectrum of Gordon et al., IEEE TNS 51 (2004) 3427 (fit adopted in JESD89A).
+
+    New York City, outdoors, sea level: 12.7 n cm^-2 h^-1 above 10 MeV, 19.6 above 1 MeV. Two log-normal terms, the
+    cascade peak (~90 MeV) and the evaporation peak (~1 MeV); fluence rate (all directions, ground albedo included),
+    valid up to ~1 GeV (above, the log-normal tail falls too steeply).
 
     Args:
         energy_gev (array_like): Kinetic energy [GeV].
@@ -566,11 +572,50 @@ def gordon_neutron_spectrum(energy_gev, evaporation=True):
     Returns:
         np.ndarray: dPhi/dE [n cm^-2 s^-1 GeV^-1].
     """
-    ln_e = np.log(np.asarray(energy_gev, dtype=float) * 1e3)
+    ln_e = np.log(np.asarray(energy_gev, dtype=float) * 1e3)          # the fit uses E in MeV
     phi = 1.006e-6 * np.exp(-0.35 * ln_e ** 2 + 2.1451 * ln_e)
     if evaporation:
         phi = phi + 1.011e-3 * np.exp(-0.4106 * ln_e ** 2 - 0.667 * ln_e)
-    return phi * 1e3 / (4 * np.pi)                                 
+    return phi * 1e3                                                 # per MeV -> per GeV
+
+
+def proton_equilibrium_shape(energy_gev, mean_excitation_ev=85.7):
+    """Shape of the proton flux in ionisation equilibrium, dPhi/dE = Q(E) / S(E).
+
+    A charged particle produced at rate q(E') per gram and slowed by ionisation has, in equilibrium,
+    dPhi/dE = (1 / S(E)) * Q(E), with Q(E) = integral_E^inf q(E') dE' the production of protons above E. Above a few
+    tens of MeV protons and neutrons come out of the same nuclear cascades in about equal numbers, so q is taken with
+    the shape of the cascade term of the sea-level neutron spectrum (gordon_neutron_spectrum, which in equilibrium
+    is proportional to the neutron production): Q is then an erfc in ln E. S is the Bethe stopping power (air,
+    I = 85.7 eV, no shell or density corrections). Nuclear absorption of the protons and evaporation protons (low
+    energy, Coulomb barrier) are neglected: the shape is meant below the matching energy only.
+
+    Result: dPhi/dE ~ E^0.75 below ~10 MeV, maximum near 100 MeV, slope ~ -1.8 at 1 GeV; with the normalisation at
+    1 GeV taken from MCEq, p/n ~ 1 % at 10 MeV, ~15 % at 100 MeV, ~60 % at 300 MeV (for p/n = 2 at 1 GeV).
+
+    Args:
+        energy_gev (array_like): Kinetic energy [GeV].
+        mean_excitation_ev (float, optional): Mean excitation energy of the medium [eV]. Defaults to 85.7 (air).
+
+    Returns:
+        np.ndarray: Unnormalised shape (arbitrary units).
+    """
+    e = np.asarray(energy_gev, dtype=float)
+    m_p, m_e = 0.93827, 0.51100e-3                                    # GeV
+    gamma = 1.0 + e / m_p
+    beta2 = 1.0 - 1.0 / gamma ** 2
+    log_term = np.log(2.0 * m_e * 1e9 * beta2 * gamma ** 2 / mean_excitation_ev) - beta2
+    inv_stopping = beta2 / np.clip(log_term, 1e-3, None)             # 1 / S up to a constant
+    b, c = 0.35, 3.1451                                              # cascade term of the Gordon fit, in u = ln(E/MeV)
+    production_above = erfc(np.sqrt(b) * (np.log(e * 1e3) - c / (2.0 * b)))   # Q(E) up to a constant
+    return inv_stopping * production_above
+
+
+LOW_E_SPLICE = {   # template species -> low-energy shape and join
+    'neutron': {'shape': gordon_neutron_spectrum, 'e_match_gev': 1.0, 'blend_dex': 0.25},
+    'proton': {'shape': proton_equilibrium_shape, 'e_match_gev': 1.0, 'blend_dex': 0.25},
+}
+LOW_E_GRID = {'e_min_gev': 1e-3, 'n_per_decade': 10}   # template grid extended down to the lowest Geant4 energy
 
 
 def _loglog(x_new, x, y):
@@ -582,43 +627,45 @@ def _loglog(x_new, x, y):
 
 def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS):
     """
-    `_zenith_averaged_secondaries` and the primary flux on the MCEq grid extended down to
-    LOW_E_NEUTRONS['e_min_gev'], with the low-energy neutron correction. Used by every template (steady and,
-    per time step, transient).
+    `_zenith_averaged_secondaries` and the primary flux on the MCEq grid extended down to LOW_E_GRID['e_min_gev'],
+    with the low-energy correction of every LOW_E_SPLICE species. Used by every template (steady and, per time
+    step, transient).
 
-    Neutrons: k = geometric mean of MCEq / Gordon over e_match * 10^(+-blend_dex), then a log-space tanh join,
-        log Phi = s log Phi_MCEq + (1 - s) log(k Phi_Gordon),   s = (1 + tanh(log10(E / e_match) / blend_dex)) / 2
-    so flux and slope are continuous. Muons and the primary are only extended as FluxTemplate would have
-    extrapolated them (unchanged where they were queried before). Everything is floored at 1e-44 for
+    For each spliced species: k = geometric mean of MCEq / shape over e_match * 10^(+-blend_dex), then a log-space
+    tanh join,
+        log Phi = s log Phi_MCEq + (1 - s) log(k shape),   s = (1 + tanh(log10(E / e_match) / blend_dex)) / 2
+    so flux and slope are continuous. The other species (muons) and the primary are only extended as FluxTemplate
+    would have extrapolated them (unchanged where they were queried before). Fluxes are floored at 1e-44 for
     FluxTemplate's log-space interpolator.
 
     Returns:
-        tuple: (e_ext, muons, neutrons, primary) on e_ext.
+        tuple: (e_ext, fluxes, primary): extended grid, dict species -> flux on e_ext, primary flux on e_ext.
 
     Raises:
-        ValueError: If fewer than 2 MCEq grid points lie in the matching window.
+        ValueError: If fewer than 2 MCEq grid points lie in a matching window.
     """
-    c = LOW_E_NEUTRONS
     e_grid = np.asarray(mceq_run.e_grid, dtype=float)
-    muons, neutrons = _zenith_averaged_secondaries(mceq_run, angles, weights)
-    neutrons = np.clip(neutrons, 1e-300, None)                       # a decayed transient may be exactly 0
+    n_low = max(int(np.ceil(np.log10(e_grid[0] / LOW_E_GRID['e_min_gev']) * LOW_E_GRID['n_per_decade'])), 0)
+    e_ext = np.concatenate([np.logspace(np.log10(LOW_E_GRID['e_min_gev']), np.log10(e_grid[0]), n_low + 1)[:-1],
+                            e_grid])
 
-    n_low = max(int(np.ceil(np.log10(e_grid[0] / c['e_min_gev']) * c['n_per_decade'])), 0)
-    e_ext = np.concatenate([np.logspace(np.log10(c['e_min_gev']), np.log10(e_grid[0]), n_low + 1)[:-1], e_grid])
-
-    win = np.abs(np.log10(e_grid / c['e_match_gev'])) <= c['blend_dex']
-    if win.sum() < 2:
-        raise ValueError(f"Only {win.sum()} MCEq grid points around {c['e_match_gev']} GeV; "
-                         "change LOW_E_NEUTRONS['e_match_gev'] or 'blend_dex'.")
-    gordon = lambda e: gordon_neutron_spectrum(e, c['evaporation'])
-    k = np.exp(np.mean(np.log(neutrons[win] / gordon(e_grid[win]))))
-    s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
-    neutrons = np.exp(s * np.log(_loglog(e_ext, e_grid, neutrons))
-                      + (1.0 - s) * np.log(np.clip(k * gordon(e_ext), 1e-300, None)))
-
-    muons = _loglog(e_ext, e_grid, np.clip(muons, 1e-44, None))
+    fluxes = {}
+    for key, flux in _zenith_averaged_secondaries(mceq_run, angles, weights).items():
+        flux = np.clip(flux, 1e-300, None)                           # a decayed transient may be exactly 0
+        mceq_ext = _loglog(e_ext, e_grid, flux)
+        if key in LOW_E_SPLICE:
+            c = LOW_E_SPLICE[key]
+            win = np.abs(np.log10(e_grid / c['e_match_gev'])) <= c['blend_dex']
+            if win.sum() < 2:
+                raise ValueError(f"{key}: only {win.sum()} MCEq grid points around {c['e_match_gev']} GeV; "
+                                 "change LOW_E_SPLICE e_match_gev or blend_dex.")
+            k = np.exp(np.mean(np.log(flux[win] / c['shape'](e_grid[win]))))
+            s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
+            mceq_ext = np.exp(s * np.log(mceq_ext)
+                              + (1.0 - s) * np.log(np.clip(k * c['shape'](e_ext), 1e-300, None)))
+        fluxes[key] = np.clip(mceq_ext, 1e-44, None)
     primary = _loglog(e_ext, e_grid, model_instance.total_flux(e_grid))
-    return e_ext, np.clip(muons, 1e-44, None), np.clip(neutrons, 1e-44, None), primary
+    return e_ext, fluxes, primary
 
 
 def _set_h_obs(mceq_run, h_obs_cm):
@@ -687,10 +734,10 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
         _set_h_obs(mceq_run, reference_h_obs_cm)
 
-        e_ext, muons, neutrons, primary = _corrected_secondaries(mceq_run, model_instance, angles)
+        e_ext, fluxes, primary = _corrected_secondaries(mceq_run, model_instance, angles)
 
     else:
-        muons, neutrons, primary = [], [], []
+        steps, primary = [], []
 
         for age_kyr in t_since_kyr:
 
@@ -701,19 +748,21 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
             _set_h_obs(mceq_run, reference_h_obs_cm)
 
-            e_ext, muons_t, neutrons_t, primary_t = _corrected_secondaries(mceq_run, model_instance, angles)
-
-            neutrons.append(neutrons_t)
-            muons.append(muons_t)
+            e_ext, fluxes_t, primary_t = _corrected_secondaries(mceq_run, model_instance, angles)
+            steps.append(fluxes_t)
             primary.append(primary_t)
+
+        fluxes = {key: np.array([f[key] for f in steps]) for key in MCEQ_SPECIES}
 
     return FluxTemplate(
         name, e_ext,
         {
             "primary": np.array(primary) * 1e-4,
-            "mu+": np.array(muons) / 2.0,
-            "mu-": np.array(muons) / 2.0,
-            "neutron": np.array(neutrons),
+            "mu+": fluxes['mu'] / 2.0,
+            "mu-": fluxes['mu'] / 2.0,
+            "neutron": fluxes['neutron'],
+            "proton": fluxes['proton'],
+            **{key: fluxes[key] for key in ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar')},
         },
         t_since_kyr=t_since_kyr,
     )
