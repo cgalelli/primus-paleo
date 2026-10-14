@@ -520,14 +520,11 @@ class EgalHG12(PrimaryFlux):
         return flux
 
 
-# MCEq solutions summed into each template species (MCEq names)
 MCEQ_SPECIES = {
-    'mu': ('total_mu+', 'total_mu-'),   # split equally into "mu+" and "mu-" in the template
+    'mu+': ('total_mu+',),          # the trailing comma makes these tuples: ('x') is just the string 'x'
+    'mu-': ('total_mu-',),
     'neutron': ('n0',),
     'proton': ('p+',),
-    # Neutrinos: same convention as the other species (downward hemisphere, cos-weighted). They are not attenuated
-    # and also arrive from below, so the full-sky (4 pi) rate and the absence of a depth table are handled where
-    # the template is used, not here. Below e_grid[0] they are only extended as FluxTemplate would extrapolate.
     'nu_mu': ('total_numu',),
     'nu_mu_bar': ('total_antinumu',),
     'nu_e': ('total_nue',),
@@ -611,11 +608,30 @@ def proton_equilibrium_shape(energy_gev, mean_excitation_ev=85.7):
     return inv_stopping * production_above
 
 
-LOW_E_SPLICE = {   # template species -> low-energy shape and join
-    'neutron': {'shape': gordon_neutron_spectrum, 'e_match_gev': 1.0, 'blend_dex': 0.25},
-    'proton': {'shape': proton_equilibrium_shape, 'e_match_gev': 1.0, 'blend_dex': 0.25},
+# Template species -> low-energy shape and join. Between e_bridge and e_match the shape is continued by a power law
+# E^-gamma (the shapes reach slope -gamma at e_bridge: Gordon at 1 GeV, the proton form at ~3 GeV), so that MCEq is
+# matched at e_match, above the few-GeV region where its nucleon solution is not reliable.
+LOW_E_SPLICE = {
+    'neutron': {'shape': gordon_neutron_spectrum, 'e_bridge_gev': 1.0, 'gamma': 2.7,
+                'e_match_gev': 7.0, 'blend_dex': 0.25},
+    'proton': {'shape': proton_equilibrium_shape, 'e_bridge_gev': 3.0, 'gamma': 2.7,
+               'e_match_gev': 7.0, 'blend_dex': 0.25},
 }
-LOW_E_GRID = {'e_min_gev': 1e-3, 'n_per_decade': 10}   # template grid extended down to the lowest Geant4 energy
+# Neutrinos below e_match: MCEq is continued by a log-normal in E peaking at E_peak,
+#     Phi(E) = Phi(E_m) * exp(-a [ln^2(E / E_peak) - ln^2(E_m / E_peak)]),   a = -slope / (2 ln(E_m / E_peak)),
+# with slope the local MCEq log-slope around E_m, so flux and slope are continuous at E_m and the extension follows
+# any change of the MCEq solution. The atmospheric neutrino spectrum peaks at a few tens of MeV, the scale of the
+# decay energies at rest (29.8 MeV for pi -> mu nu, 52.8 MeV Michel endpoint), and falls below: the FLUKA calculation
+# (Battistoni et al., Astropart. Phys. 23 (2005) 526) peaks at ~40 MeV for both flavours, with dN/dE ~ E^0.6 between
+# 13 and 40 MeV and a peak ~3x the flux at 0.2 GeV; this form gives ~E^0.7 and ~2x for a slope of -1 at 0.2 GeV.
+# Indicative only (no separate decay-at-rest Michel peak, no geomagnetic effects); use FLUKA for accurate fluxes.
+NEUTRINO_LOW_E = {
+    'species': ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar'),
+    'e_match_gev': 0.2,      # just above the bottom of the MCEq grid
+    'fit_dex': 0.15,         # half-width of the window where the MCEq slope is measured [decades]
+    'e_peak_gev': 0.04,      # peak of dN/dE (FLUKA: ~40 MeV)
+}
+LOW_E_GRID = {'e_min_gev': 1e-4, 'n_per_decade': 10}   # template grid extended down to the lowest Geant4 energy
 
 
 def _loglog(x_new, x, y):
@@ -631,12 +647,12 @@ def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, 
     with the low-energy correction of every LOW_E_SPLICE species. Used by every template (steady and, per time
     step, transient).
 
-    For each spliced species: k = geometric mean of MCEq / shape over e_match * 10^(+-blend_dex), then a log-space
-    tanh join,
+    For each spliced species the shape is continued above e_bridge by shape(e_bridge) (E / e_bridge)^-gamma;
+    k = geometric mean of MCEq / shape over e_match * 10^(+-blend_dex), then a log-space tanh join,
         log Phi = s log Phi_MCEq + (1 - s) log(k shape),   s = (1 + tanh(log10(E / e_match) / blend_dex)) / 2
-    so flux and slope are continuous. The other species (muons) and the primary are only extended as FluxTemplate
-    would have extrapolated them (unchanged where they were queried before). Fluxes are floored at 1e-44 for
-    FluxTemplate's log-space interpolator.
+    so flux and slope are continuous. Muons and the primary are only extended as FluxTemplate would have
+    extrapolated them (unchanged where they were queried before); neutrinos are continued below
+    NEUTRINO_LOW_E['e_match_gev'] by a log-normal peaking at e_peak_gev. Fluxes are floored at 1e-44 for FluxTemplate's log-space interpolator.
 
     Returns:
         tuple: (e_ext, fluxes, primary): extended grid, dict species -> flux on e_ext, primary flux on e_ext.
@@ -653,16 +669,28 @@ def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, 
     for key, flux in _zenith_averaged_secondaries(mceq_run, angles, weights).items():
         flux = np.clip(flux, 1e-300, None)                           # a decayed transient may be exactly 0
         mceq_ext = _loglog(e_ext, e_grid, flux)
+        if key in NEUTRINO_LOW_E['species']:
+            c = NEUTRINO_LOW_E
+            em, ep = c['e_match_gev'], c['e_peak_gev']
+            win = np.abs(np.log10(e_grid / em)) <= c['fit_dex']
+            if win.sum() < 2:
+                raise ValueError(f"{key}: only {win.sum()} MCEq grid points around {em} GeV; "
+                                 "change NEUTRINO_LOW_E e_match_gev or fit_dex.")
+            slope = np.polyfit(np.log(e_grid[win]), np.log(flux[win]), 1)[0]
+            a = max(-slope, 0.0) / (2.0 * np.log(em / ep))           # same local slope at E_m
+            low = _loglog(em, e_grid, flux) * np.exp(-a * (np.log(e_ext / ep) ** 2 - np.log(em / ep) ** 2))
+            mceq_ext = np.where(e_ext < em, low, mceq_ext)
         if key in LOW_E_SPLICE:
             c = LOW_E_SPLICE[key]
+            eb = c['e_bridge_gev']
+            shape = lambda e: np.where(e <= eb, c['shape'](np.minimum(e, eb)), c['shape'](eb) * (e / eb) ** -c['gamma'])
             win = np.abs(np.log10(e_grid / c['e_match_gev'])) <= c['blend_dex']
             if win.sum() < 2:
                 raise ValueError(f"{key}: only {win.sum()} MCEq grid points around {c['e_match_gev']} GeV; "
                                  "change LOW_E_SPLICE e_match_gev or blend_dex.")
-            k = np.exp(np.mean(np.log(flux[win] / c['shape'](e_grid[win]))))
+            k = np.exp(np.mean(np.log(flux[win] / shape(e_grid[win]))))
             s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
-            mceq_ext = np.exp(s * np.log(mceq_ext)
-                              + (1.0 - s) * np.log(np.clip(k * c['shape'](e_ext), 1e-300, None)))
+            mceq_ext = np.exp(s * np.log(mceq_ext) + (1.0 - s) * np.log(np.clip(k * shape(e_ext), 1e-300, None)))
         fluxes[key] = np.clip(mceq_ext, 1e-44, None)
     primary = _loglog(e_ext, e_grid, model_instance.total_flux(e_grid))
     return e_ext, fluxes, primary
@@ -758,11 +786,7 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
         name, e_ext,
         {
             "primary": np.array(primary) * 1e-4,
-            "mu+": fluxes['mu'] / 2.0,
-            "mu-": fluxes['mu'] / 2.0,
-            "neutron": fluxes['neutron'],
-            "proton": fluxes['proton'],
-            **{key: fluxes[key] for key in ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar')},
+            **{key: fluxes[key] for key in MCEQ_SPECIES},
         },
         t_since_kyr=t_since_kyr,
     )
