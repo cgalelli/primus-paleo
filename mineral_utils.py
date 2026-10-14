@@ -4,7 +4,6 @@ import os
 import re
 import json
 from scipy.interpolate import interp1d
-from scipy.integrate import quad
 from mendeleev import element
 from tqdm import tqdm
 from multiprocessing import Pool
@@ -27,6 +26,31 @@ WATT_B_PER_MEV = 3.7
 _NAMED_FRAGMENTS = {"neutron", "proton", "deuteron", "triton", "alpha"}
 _LIGHT_ION_SYMBOLS = {"proton": "H1", "deuteron": "H2", "triton": "H3", "alpha": "He4"}
 _ION_NAME_RE = re.compile(r"^([A-Z][a-z]?)(\d+)(?:\[[^\]]*\])?$")
+
+# Track sums. "total" adds every charged fragment; "total_no_light_ions", the default, leaves out hydrogen and helium
+# (Z <= LIGHT_ION_MAX_Z: p, d, t, 3He, alpha). Their energy loss is almost all ionisation spread along the path
+# (dE/dx at most ~0.1 keV/nm for protons and ~0.4 keV/nm for alphas, at the Bragg peak), which leaves isolated point
+# defects rather than the continuous damaged core that etches faster than the bulk (V > 1), so in crystals such as
+# halite they are not expected to give etchable tracks. Heavier recoils (Z >= 3) are kept.
+TOTAL_ALL_FRAGMENTS = "total"
+TOTAL_NO_LIGHT_IONS = "total_no_light_ions"
+TRACK_SUMS = (TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)
+DEFAULT_TRACK_SUM = TOTAL_NO_LIGHT_IONS
+LIGHT_ION_MAX_Z = 2
+_LIGHT_ION_ELEMENTS = {"H", "He"}   # elements with Z <= LIGHT_ION_MAX_Z
+
+
+def is_light_ion(fragment):
+    """True for hydrogen and helium fragments (proton, deuteron, triton, alpha, He3, ...).
+
+    Args:
+        fragment (str): Fragment key (see normalize_fragment_name).
+
+    Returns:
+        bool: Whether the fragment has Z <= LIGHT_ION_MAX_Z.
+    """
+    symbol = _LIGHT_ION_SYMBOLS.get(fragment, fragment)
+    return ''.join(filter(str.isalpha, symbol)) in _LIGHT_ION_ELEMENTS
 
 
 def normalize_fragment_name(name):
@@ -245,6 +269,25 @@ def _slab_probability(q_rows, p, z_min_grid, z_max_grid, tail_lambdas=None):
         F_hi, _ = _piecewise_cdf_and_integral(z_max_grid[..., j], q_rows[j], p, lam)
         prob[..., j] = F_hi - F_lo
     return prob
+
+
+def _rebin_density(density, grid_edges, out_edges):
+    """Counts in out_edges from a density given per bin of a fine grid (constant inside each fine bin).
+
+    The cumulative count is exact at the fine-grid edges and linear between them, so the total is conserved and
+    no numerical quadrature is needed; counts outside the fine grid are zero.
+
+    Args:
+        density (np.ndarray): Density in each fine bin [per unit length], len(grid_edges) - 1 values.
+        grid_edges (np.ndarray): Fine-grid edges.
+        out_edges (np.ndarray): Output bin edges, same units.
+
+    Returns:
+        np.ndarray: Counts in each output bin.
+    """
+    grid_edges = np.asarray(grid_edges, dtype=float)
+    cumulative = np.concatenate(([0.0], np.cumsum(np.asarray(density, dtype=float) * np.diff(grid_edges))))
+    return np.diff(np.interp(np.asarray(out_edges, dtype=float), grid_edges, cumulative))
 
 
 def set_integration_x_bins_nm(integration_x_bins_nm):
@@ -880,6 +923,8 @@ class Paleodetector:
         """
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
+        if self.verbose>0:
+            print(f"Calculating radiogenic neutron contribution from {background_type}")
         
         if background_type == 'fission_n':
             flux_interpolator = self.radiogenic_spectrum
@@ -952,6 +997,7 @@ class Paleodetector:
         energy_bins_gev=None, 
         background_types=('fission_n', 'alpha_n'),
         total_simulated_particles=1e4, 
+        nucleus=DEFAULT_TRACK_SUM,
         ): 
         """Track-length rate from radiogenic neutrons.
 
@@ -964,6 +1010,8 @@ class Paleodetector:
                 Defaults to ('fission_n', 'alpha_n').
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
+                Defaults to 'total_no_light_ions'.
 
         Returns:
             np.ndarray: dR/dx summed over sources [tracks per mg per kyr per nm].
@@ -971,10 +1019,10 @@ class Paleodetector:
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
-
         x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
 
         sum_drdx = np.zeros_like(x_mids)
+        found = False
 
         for background_type in background_types:
 
@@ -982,8 +1030,12 @@ class Paleodetector:
 
             drdx = self._convert_recoil_to_track_spectrum(recoil_data, x_bins=x_bins, energy_bins_gev=energy_bins_gev, species='neutron')
 
-            sum_drdx += drdx['total']
+            if nucleus in drdx:                                    # a fragment may be absent from one source
+                sum_drdx += drdx[nucleus]
+                found = True
 
+        if not found:
+            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS} or a fragment key.")
         return sum_drdx
 
 
@@ -994,6 +1046,7 @@ class Paleodetector:
         background_types=('fission_n', 'alpha_n'),
         total_simulated_particles=1e4, 
         x_grid=TRACK_LENGTH_BINS_NM, 
+        nucleus=DEFAULT_TRACK_SUM,
         ):
         """Track counts from radiogenic neutrons over the sample age.
 
@@ -1008,29 +1061,28 @@ class Paleodetector:
                 Defaults to 1e4.
             x_grid (np.ndarray, optional): Fine track-length grid used for the
                 calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
+                Defaults to 'total_no_light_ions'.
 
         Returns:
             tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
             accumulated over total_age_kyr.
         """
+
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        x_mids_grid = x_grid[:-1] + np.diff(x_grid) / 2.0
 
         sum_drdx = self.calculate_background_neutron_spectrum(
             x_grid, 
             energy_bins_gev, 
             background_types,
             total_simulated_particles, 
+            nucleus=nucleus,
             )
 
         sum_drdx *= self.total_age_kyr
 
-        total_tracks_interp  = interp1d(x_mids_grid, np.array(sum_drdx),  bounds_error=False, fill_value='extrapolate')
-
-        total_tracks_g = np.array([quad(total_tracks_interp, x_bins[i], x_bins[i+1])[0] for i in range(len(x_mids))])
+        total_tracks_g = _rebin_density(sum_drdx, x_grid, x_bins)
 
         return x_bins, total_tracks_g
     
@@ -1140,6 +1192,8 @@ class Paleodetector:
                 Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
             x_grid (np.ndarray, optional): Fine track-length grid used for the
                 calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
+                Defaults to 'total_no_light_ions'.
 
         Returns:
             tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
@@ -1147,14 +1201,9 @@ class Paleodetector:
         """
         x_bins = _resolve_x_bins(x_bins)
 
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-        x_mids_grid = x_grid[:-1] + np.diff(x_grid) / 2.0
-
         drdx = self.calculate_fission_spectrum(x_grid) * self.total_age_kyr
 
-        total_tracks_interp  = interp1d(x_mids_grid, np.array(drdx),  bounds_error=False, fill_value='extrapolate')
-
-        total_tracks_g = np.asarray([quad(total_tracks_interp, x_bins[i], x_bins[i+1])[0] for i in range(len(x_mids))])
+        total_tracks_g = _rebin_density(drdx, x_grid, x_bins)
 
         total_tracks_mg = total_tracks_g * 1e-3
 
@@ -2012,6 +2061,7 @@ class Paleodetector:
 
         dRdx_by_nucleus = {}
         dRdx_total = np.zeros((n_t, len(x_bins) - 1))
+        dRdx_heavy = np.zeros((n_t, len(x_bins) - 1))
 
         for nuclide_name in all_fragments:
             if nuclide_name not in recoil_data or nuclide_name == 'neutron':
@@ -2049,8 +2099,11 @@ class Paleodetector:
 
             dRdx_by_nucleus[nuclide_name] = dRdx_nucleus_mg
             dRdx_total += dRdx_nucleus_mg
+            if not is_light_ion(nuclide_name):
+                dRdx_heavy += dRdx_nucleus_mg
 
-        dRdx_by_nucleus["total"] = dRdx_total
+        dRdx_by_nucleus[TOTAL_ALL_FRAGMENTS] = dRdx_total
+        dRdx_by_nucleus[TOTAL_NO_LIGHT_IONS] = dRdx_heavy
 
         if input_was_1d:
             dRdx_by_nucleus = {name: arr[0] for name, arr in dRdx_by_nucleus.items()}
@@ -2061,7 +2114,7 @@ class Paleodetector:
     def calculate_particle_signal_spectrum(
         self,  t_kyr_array, x_bins=None,
         energy_bins_gev=None, total_simulated_particles=1e4, 
-        species='mu-', nucleus="total",
+        species='mu-', nucleus=DEFAULT_TRACK_SUM,
     ):
         
         """Track-length rate from one cosmic-ray species at given times.
@@ -2076,8 +2129,9 @@ class Paleodetector:
                 Defaults to 1e4.
             species (str, optional): 'mu-', 'mu+', 'neutron' or
                 'secondary_neutron'. Defaults to 'mu-'.
-            nucleus (str, optional): 'total', 'all' (dict of all fragments) or a
-                fragment key. Defaults to "total".
+            nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He, see
+                LIGHT_ION_MAX_Z), 'total' (all fragments), 'all' (dict of every fragment and both sums) or a
+                fragment key. Defaults to 'total_no_light_ions'.
 
         Returns:
             np.ndarray or dict: dR/dx [tracks per mg per kyr per nm], shape (T, n_x).
@@ -2096,18 +2150,18 @@ class Paleodetector:
 
         dRdx_at_depth = self._convert_recoil_to_track_spectrum(recoil_data, x_bins, energy_bins_gev, species)
 
-        if nucleus == "total":
-            return dRdx_at_depth["total"]
-        elif nucleus == "all":
+        if nucleus == "all":
             return dRdx_at_depth
-        else:
-            return dRdx_at_depth[nucleus]
+        if nucleus not in dRdx_at_depth:
+            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, 'all' or a fragment of "
+                             f"{species} ({sorted(k for k in dRdx_at_depth if k not in TRACK_SUMS)}).")
+        return dRdx_at_depth[nucleus]
 
 
     def integrate_particle_signal_spectrum(
         self, x_bins=None, energy_bins_gev=None,
         exposure_window_kyr=None, flux_history=None, steps=None, total_simulated_particles=1e4, 
-        x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus="total", e_range=None,
+        x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus=DEFAULT_TRACK_SUM, e_range=None,
     ):
         """Track counts from one cosmic-ray species over an exposure window.
 
@@ -2133,7 +2187,8 @@ class Paleodetector:
                 TRACK_LENGTH_BINS_NM.
             species (str, optional): 'mu-', 'mu+', 'neutron' or
                 'secondary_neutron'. Defaults to 'mu-'.
-            nucleus (str, optional): 'total' or a fragment key. Defaults to "total".
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
+                calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
             e_range (tuple[float, float], optional): (E_min, E_max) [GeV]: use only the Geant4 files whose bins
                 lie inside it (see _energy_edges). Ignored if energy_bins_gev is given. Defaults to None (all).
 
@@ -2178,7 +2233,7 @@ class Paleodetector:
     def integrate_all_particles(
         self,  x_bins=None, e_range=None,
         exposure_window_kyr=None, flux_history=None,steps=None, 
-        total_simulated_particles=1e4, species_list=None, nucleus="total"
+        total_simulated_particles=1e4, species_list=None, nucleus=DEFAULT_TRACK_SUM
     ):
         """Track counts from several cosmic-ray species, computed in parallel.
 
@@ -2197,7 +2252,8 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species_list (tuple[str], optional): Species to compute. Defaults to None (available_species()).
-            nucleus (str, optional): 'total' or a fragment key. Defaults to "total".
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
+                calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
 
         Returns:
             tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each
