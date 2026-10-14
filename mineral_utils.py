@@ -9,7 +9,7 @@ from mendeleev import element
 from tqdm import tqdm
 from multiprocessing import Pool
 
-from flux_history import FluxHistory
+from flux_history import FluxHistory, MCEQ_SPECIES
 
 # --- Physical Constants ---
 PROTON_MASS_MEV = 938.3
@@ -87,15 +87,16 @@ LENGTH_MIN_LOG_NM = 1.5
 LENGTH_MAX_LOG_NM = 5.5
 TRACK_LENGTH_BINS_NM = np.logspace(LENGTH_MIN_LOG_NM, LENGTH_MAX_LOG_NM, LENGTH_N_BINS)
 
-_GEANT4_ENERGY_BINS_GEV_FULL = np.logspace(-3, 4, 120)
-
-GEANT4_MAX_SIMULATED_ENERGY_GEV = 196.84194472866113
-
 _ENERGY_EDGE_RTOL = 1e-9
 
-DEFAULT_ENERGY_BINS_GEV = _GEANT4_ENERGY_BINS_GEV_FULL[
-    _GEANT4_ENERGY_BINS_GEV_FULL <= GEANT4_MAX_SIMULATED_ENERGY_GEV * (1 + _ENERGY_EDGE_RTOL)
-]
+# Species whose recoil calculation is implemented. Any MCEQ_SPECIES folder found in Data/Geant4_data/<mineral> is
+# listed at creation; only these (and 'secondary_neutron', from the neutron runs) can be computed for now.
+COMPUTABLE_SPECIES = ('mu-', 'mu+', 'neutron')
+# Species without runs of their own: secondary_neutron takes its recoils (and energy grid) from the mineral's neutron
+# runs; the neutrons themselves are produced, in the window above the sample, by SECONDARY_NEUTRON_SOURCES (StdRock).
+DERIVED_SPECIES = {'secondary_neutron': 'neutron'}
+SECONDARY_NEUTRON_SOURCES = ('mu-', 'mu+', 'neutron')
+IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E) is reported as a gap
 
 DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 200)
 
@@ -116,6 +117,12 @@ NEUTRON_P_NODES = STOPPING_P_NODES[STOPPING_P_NODES <= NEUTRON_TAIL_P]
 
 SECONDARY_WINDOW_SURVIVAL = 1e-3
 SECONDARY_WINDOW_BINS = 50
+
+# Time grid of the exposure integrals: on top of the uniform grid, the times at which the overburden reaches
+# DEPTH_GRID_POINTS values equally spaced in log(depth), so that fast burial is resolved where the rates change
+# (atmospheric neutrons fade over ~1.6 m.w.e., muons over tens of m.w.e.).
+DEPTH_GRID_POINTS = 200
+DEPTH_GRID_MIN_MWE = 0.01
 
 _G4_OUTPUT_FILE_RE = re.compile(r"^outNuclei_(\d+\.\d+)\.txt$")
 
@@ -254,34 +261,29 @@ def set_integration_x_bins_nm(integration_x_bins_nm):
     return
 
 
-def set_default_energy_bins_gev(geant4_energy_bins_gev_full=None, geant4_max_simulated_energy_gev=None):
-    """Sets the module-wide primary-energy grid and its upper limit.
+def _geant4_energy_edges(data_dir):
+    """Primary-energy bins of a Geant4 run directory, from its file names.
 
-    DEFAULT_ENERGY_BINS_GEV is rebuilt as the grid points up to
-    geant4_max_simulated_energy_gev (inclusive, within a relative tolerance).
-    Functions whose energy_bins_gev argument is None use it at call time.
+    Each outNuclei_<E>.txt is the response at the lower edge E of a bin; a bin ends at the next file energy and the
+    last one at one more step of the same logarithmic size as the last step (the convention of the run grids).
 
     Args:
-        geant4_energy_bins_gev_full (np.ndarray, optional): Full grid of simulated
-            primary energies [GeV]. Must match the energies of the Geant4 output
-            files exactly. Defaults to None (unchanged).
-        geant4_max_simulated_energy_gev (float, optional): Upper edge of the last
-            energy bin [GeV]. Defaults to None (unchanged).
+        data_dir (str): Directory containing outNuclei_<E>.txt files.
+
+    Returns:
+        dict or None: 'edges' (bin edges [GeV], n_files + 1 values), 'n_files', 'gaps' (list of (E_low, E_high)
+        steps larger than IRREGULAR_STEP_FACTOR times the median step in log(E), so one missing file on a
+        logarithmic grid, a doubled step, is reported); None if fewer than 2 files.
     """
-    global _GEANT4_ENERGY_BINS_GEV_FULL
-    global GEANT4_MAX_SIMULATED_ENERGY_GEV
-    global DEFAULT_ENERGY_BINS_GEV
-
-    if geant4_energy_bins_gev_full is not None:
-        _GEANT4_ENERGY_BINS_GEV_FULL = geant4_energy_bins_gev_full
-    if geant4_max_simulated_energy_gev is not None:
-        GEANT4_MAX_SIMULATED_ENERGY_GEV = geant4_max_simulated_energy_gev
-
-    DEFAULT_ENERGY_BINS_GEV = _GEANT4_ENERGY_BINS_GEV_FULL[
-        _GEANT4_ENERGY_BINS_GEV_FULL <= GEANT4_MAX_SIMULATED_ENERGY_GEV * (1 + _ENERGY_EDGE_RTOL)
-    ]
-
-    return
+    energies = np.array([e for e, _ in _list_geant4_energy_files(data_dir)])
+    if energies.size < 2:
+        return None
+    ratios = energies[1:] / energies[:-1]
+    edges = np.append(energies, energies[-1] * ratios[-1])
+    log_steps = np.log(ratios)
+    big = log_steps > IRREGULAR_STEP_FACTOR * np.median(log_steps)
+    gaps = [(energies[i], energies[i + 1]) for i in np.where(big)[0]]
+    return {'edges': edges, 'n_files': energies.size, 'gaps': gaps}
 
 
 def _resolve_x_bins(x_bins):
@@ -294,18 +296,6 @@ def _resolve_x_bins(x_bins):
         np.ndarray: Bin edges [nm].
     """
     return DEFAULT_INTEGRATION_X_BINS_NM if x_bins is None else np.asarray(x_bins, dtype=float)
-
-
-def _resolve_energy_bins(energy_bins_gev):
-    """Returns the given energy bins, or the current default if None.
-
-    Args:
-        energy_bins_gev (array_like or None): Bin edges [GeV].
-
-    Returns:
-        np.ndarray: Bin edges [GeV].
-    """
-    return DEFAULT_ENERGY_BINS_GEV if energy_bins_gev is None else np.asarray(energy_bins_gev, dtype=float)
 
 
 def log_interp1d(xx, yy, kind='linear'):
@@ -541,11 +531,14 @@ class Paleodetector:
         self._geometry_cache = {}
         self._depth_tables = {}
 
-        for species in ["mu-", "mu+", "neutron"]:
-            self._load_depth_interpolators(species=species)
-        
-        if self.verbose>0:
-            print(f"Initialized Paleodetector: {self.name}")
+        self.energy_bins = self._scan_geant4_species()
+
+        for species in COMPUTABLE_SPECIES:
+            if species in self.energy_bins:
+                self._load_depth_interpolators(species=species)
+
+        if self.verbose > 0:
+            self._print_available_species()
 
 
     def set_flux_history(self, FluxHistory):
@@ -555,6 +548,151 @@ class Paleodetector:
             FluxHistory (FluxHistory): New flux history.
         """
         self.flux_history = FluxHistory
+
+
+    def _scan_geant4_species(self):
+        """Finds the Geant4 runs of the mineral: one folder per MCEQ_SPECIES entry in Data/Geant4_data/<name>.
+
+        Returns:
+            dict: species -> primary-energy bin edges [GeV] built from the file names (_geant4_energy_edges).
+            Species with fewer than 2 files are left out (with a warning).
+        """
+        self._geant4_runs = {}
+        mineral_dir = os.path.join(self.data_path, "Geant4_data", self.name)
+        for species in MCEQ_SPECIES:
+            info = _geant4_energy_edges(os.path.join(mineral_dir, species))
+            if info is None:
+                if self.verbose > 0 and _list_geant4_energy_files(os.path.join(mineral_dir, species)):
+                    print(f"Warning: {self.name}/{species}: a single Geant4 file, at least 2 are needed; ignored.")
+                continue
+            self._geant4_runs[species] = info
+        return {species: info['edges'] for species, info in self._geant4_runs.items()}
+
+
+    def _print_available_species(self):
+        """Prints the species found by _scan_geant4_species, with their energy range."""
+        if not self._geant4_runs:
+            print(f"Created paleo-detector {self.name}: no Geant4 runs found in "
+                  f"{os.path.join(self.data_path, 'Geant4_data', self.name)} (only fission is available).")
+            return
+        lines = [f"Created paleo-detector {self.name}, species available for computation:"]
+        for species, info in self._geant4_runs.items():
+            e = info['edges']
+            note = "" if species in COMPUTABLE_SPECIES else "  (runs found, calculation not implemented yet)"
+            lines.append(f"  {species:<10} energy from {e[0]:.4g} to {e[-2]:.4g} GeV in {info['n_files']} steps{note}")
+            for lo, hi in info['gaps']:
+                lines.append(f"  {'':<10} warning: no file between {lo:.4g} and {hi:.4g} GeV "
+                             f"(the {lo:.4g} GeV run is used for the whole step)")
+        if 'neutron' in self._geant4_runs:
+            lines.append(f"  {'secondary_neutron':<10} neutrons produced by {', '.join(SECONDARY_NEUTRON_SOURCES)} "
+                         f"above the sample (StdRock runs), recoils from the neutron runs")
+        print("\n".join(lines))
+
+
+    def available_species(self):
+        """Species that integrate_all_particles can compute with the Geant4 runs present.
+
+        Returns:
+            list[str]: Computable species with runs, plus the derived ones whose source runs are present.
+        """
+        out = [s for s in COMPUTABLE_SPECIES if s in self.energy_bins]
+        out += [d for d, src in DERIVED_SPECIES.items() if src in self.energy_bins]
+        return out
+
+
+    def _energy_edges(self, species, e_range=None):
+        """Primary-energy bin edges of a species, optionally restricted to a range.
+
+        Args:
+            species (str): Species ('mu-', 'mu+', 'neutron', 'secondary_neutron', ...).
+            e_range (tuple[float, float], optional): (E_min, E_max) [GeV]. The bins lying entirely inside it are
+                kept. Defaults to None (all the files of the species).
+
+        Returns:
+            np.ndarray: Bin edges [GeV].
+
+        Raises:
+            ValueError: If the species has no runs, or e_range is outside the available range or contains no bin.
+        """
+        source = DERIVED_SPECIES.get(species, species)
+        if source not in self.energy_bins:
+            raise ValueError(f"No Geant4 runs of '{source}' for {self.name}; available: {list(self.energy_bins)}.")
+        edges = self.energy_bins[source]
+        if e_range is None:
+            return edges
+        lo, hi = (float(v) for v in e_range)
+        tol = 1 + _ENERGY_EDGE_RTOL
+        if not lo < hi:
+            raise ValueError(f"{species}: e_range {e_range} must be (E_min, E_max) with E_min < E_max.")
+        if lo * tol < edges[0] or hi > edges[-1] * tol:
+            raise ValueError(f"{species}: e_range ({lo:g}, {hi:g}) GeV is outside the available range "
+                             f"({edges[0]:.4g}, {edges[-1]:.4g}) GeV.")
+        inside = np.where((edges[:-1] * tol >= lo) & (edges[1:] <= hi * tol))[0]
+        if inside.size == 0:
+            raise ValueError(f"{species}: e_range ({lo:g}, {hi:g}) GeV contains no complete energy bin.")
+        return edges[inside[0]:inside[-1] + 2]
+
+
+    def _time_grid_kyr(self, window_kyr, steps=None):
+        """Time points of an exposure integral, placed where the integrand changes.
+
+        The rates depend on time only through the overburden and the flux history, so the grid is built from them
+        and then bounded to the window:
+          * every time the overburden crosses one of DEPTH_GRID_POINTS depths equally spaced in log between its
+            minimum and maximum over the window (burial, erosion, or both; exact on the interpolator nodes);
+          * for every flux event, its start (with a point just before it) and the time nodes of its template, on
+            which the flux is interpolated;
+          * the start and end of every geomagnetic excursion, each with a point just before it (the flux jumps there);
+          * the window ends, plus `steps` uniform points if given.
+        With a constant overburden and a steady flux the integrand is constant and the two ends suffice.
+
+        Args:
+            window_kyr (list[float]): [start, end] in local time [kyr].
+            steps (int, optional): Extra uniform points. Defaults to None (none).
+
+        Returns:
+            np.ndarray: Sorted, unique time points [kyr] within the window.
+        """
+        t0, t1 = float(window_kyr[0]), float(window_kyr[1])
+        eps = 1e-6 * max(t1 - t0, 1.0)
+        points = [np.array([t0, t1])]
+        if steps:
+            points.append(np.linspace(t0, t1, int(steps)))
+
+        # overburden: crossings of log-spaced depths; piecewise linear between the interpolator nodes
+        nodes = np.asarray(getattr(self._overburden_interpolator, 'x', [t0, t1]), dtype=float)
+        t_nodes = np.concatenate([[t0], nodes[(nodes > t0) & (nodes < t1)], [t1]])
+        depth = np.asarray(self._overburden_interpolator(t_nodes), dtype=float)
+        d_lo, d_hi = max(depth.min(), DEPTH_GRID_MIN_MWE), depth.max()
+        if d_hi > d_lo * (1.0 + 1e-6):
+            targets = np.geomspace(d_lo, d_hi, DEPTH_GRID_POINTS)
+            da, db, ta, tb = depth[:-1], depth[1:], t_nodes[:-1], t_nodes[1:]
+            moving = da != db
+            da, db, ta, tb = da[moving], db[moving], ta[moving], tb[moving]
+            frac = (targets[:, None] - da[None, :]) / (db - da)[None, :]
+            hit = (frac >= 0.0) & (frac <= 1.0)
+            points.append((ta[None, :] + frac * (tb - ta)[None, :])[hit])
+
+        # flux history, converted from its timeline (0 = present) to local time
+        if self.flux_history is not None:
+            to_local = self.total_age_kyr
+            for event in self.flux_history.events:
+                start = event["start_time_kyr"] + to_local
+                points.append(np.array([start - eps, start]))
+                t_since = getattr(event["template"], "t_since_kyr", None)
+                if t_since is not None:
+                    points.append(start + np.asarray(t_since, dtype=float) * 1e-3)   # template times are in yr
+            for exc in self.flux_history.excursions:
+                for edge in (exc["start_time_kyr"], exc["end_time_kyr"]):
+                    points.append(np.array([edge - eps, edge]) + to_local)
+
+        t = np.unique(np.concatenate(points))
+        return t[(t >= t0) & (t <= t1)]
+
+
+    def _resolve_energy_bins(self, energy_bins_gev, species):
+        """The given energy bins, or all the bins of the species if None."""
+        return self._energy_edges(species) if energy_bins_gev is None else np.asarray(energy_bins_gev, dtype=float)
 
 
     def _interpolate_overburden_history(self, overburden_history=None):
@@ -569,8 +707,8 @@ class Paleodetector:
                 overburden [m.w.e.], or a dict with the optional keys
                 'initial_depth' [m], 'initial_density_g_cm3',
                 'start_time_continuous_kyr', 'end_time_continuous_kyr',
-                'rate_continuous' [m/kyr], 'density_continuous_g_cm3',
-                'time_discrete_kyr', 'overburden_discrete' [m],
+                'rate_continuous' [m/kyr, negative for erosion], 'density_continuous_g_cm3',
+                'time_discrete_kyr', 'overburden_discrete' [m, negative for removal],
                 'density_discrete_g_cm3'. Defaults to None (0 m.w.e.).
 
         Returns:
@@ -608,6 +746,12 @@ class Paleodetector:
         for t, o, d in zip(time_discrete, overburden_discrete, density_discrete_g_cm3):
             mask = (times >= t)
             overburdens[mask] += d * o
+
+        if np.any(overburdens < 0.0):
+            if self.verbose > 0:
+                print(f"Warning: the overburden history erodes below the surface (down to {overburdens.min():.3g} "
+                      "m.w.e.); it is set to 0 there.")
+            overburdens = np.maximum(overburdens, 0.0)
 
         if self.verbose>0:
             print("Interpolating overburden history...")
@@ -723,7 +867,7 @@ class Paleodetector:
         Args:
             background_type (str): 'fission_n' (spontaneous fission) or 'alpha_n'.
             energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
 
@@ -734,7 +878,7 @@ class Paleodetector:
         Raises:
             ValueError: If background_type is unknown.
         """
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
         
         if background_type == 'fission_n':
@@ -815,7 +959,7 @@ class Paleodetector:
             x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
                 None (DEFAULT_INTEGRATION_X_BINS_NM).
             energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             background_types (tuple[str], optional): Sources to include.
                 Defaults to ('fission_n', 'alpha_n').
             total_simulated_particles (float, optional): Primaries per Geant4 run.
@@ -825,7 +969,7 @@ class Paleodetector:
             np.ndarray: dR/dx summed over sources [tracks per mg per kyr per nm].
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
 
         x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
@@ -857,7 +1001,7 @@ class Paleodetector:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm].
                 Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
             energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             background_types (tuple[str], optional): Sources to include.
                 Defaults to ('fission_n', 'alpha_n').
             total_simulated_particles (float, optional): Primaries per Geant4 run.
@@ -870,7 +1014,7 @@ class Paleodetector:
             accumulated over total_age_kyr.
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
         x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
         x_mids_grid = x_grid[:-1] + np.diff(x_grid) / 2.0
@@ -1376,7 +1520,7 @@ class Paleodetector:
 
     def _secondary_neutron_yield(self, t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
                                  total_simulated_particles=1e4,
-                                 species_list=('mu-', 'mu+', 'neutron'), n_energy_sub=50):
+                                 species_list=SECONDARY_NEUTRON_SOURCES, n_energy_sub=50):
         """Secondary neutrons born in a window above the sample, per direction.
 
         For each time t and direction c, the path to the sample has slant depth
@@ -1406,7 +1550,7 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4
                 run. Defaults to 1e4.
             species_list (tuple[str], optional): Primary species producing
-                neutrons. Defaults to ('mu-', 'mu+', 'neutron').
+                neutrons. Defaults to SECONDARY_NEUTRON_SOURCES.
             n_energy_sub (int, optional): Points per energy cell for the flux
                 integration. Defaults to 50.
 
@@ -1535,7 +1679,7 @@ class Paleodetector:
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species (str, optional): 'mu-', 'mu+' or 'neutron'. Defaults to 'mu-'.
@@ -1548,7 +1692,7 @@ class Paleodetector:
         Raises:
             ValueError: If flux_history or the depth tables are not initialised.
         """
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
         if self.flux_history is None:
             raise ValueError(
@@ -1708,7 +1852,7 @@ class Paleodetector:
 
     def _process_secondary_geant4_data(
         self, t_kyr_array, energy_bins_gev=None,
-        total_simulated_particles=1e4, secondary_neutrons_species=('mu-', 'mu+', 'neutron'),
+        total_simulated_particles=1e4, secondary_neutrons_species=SECONDARY_NEUTRON_SOURCES,
     ):
         """Recoil spectra in the sample slab from secondary neutrons.
 
@@ -1730,16 +1874,16 @@ class Paleodetector:
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             energy_bins_gev (np.ndarray, optional): Energy cell edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4
                 run. Defaults to 1e4.
             secondary_neutrons_species (tuple[str], optional): Primary species
-                producing neutrons. Defaults to ('mu-', 'mu+', 'neutron').
+                producing neutrons. Defaults to SECONDARY_NEUTRON_SOURCES.
 
         Returns:
             dict: Same structure as _process_geant4_data.
         """
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'secondary_neutron')
         rho = self.config['density_g_cm3']
 
         target_volume_cm3 = 1.e-3 / rho
@@ -1841,7 +1985,7 @@ class Paleodetector:
             x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
                 None (DEFAULT_INTEGRATION_X_BINS_NM).
             energy_bins_gev (np.ndarray, optional): Energy bin edges [GeV], used to
-                list the fragments. Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                list the fragments. Defaults to None (all the Geant4 files of the species).
             species (str, optional): Species of the Geant4 runs ('mu-', 'mu+',
                 'neutron' or 'secondary_neutron'). Defaults to 'mu-'.
 
@@ -1850,7 +1994,7 @@ class Paleodetector:
             shape (T, n_x), or (n_x,) if the input was 1-D.
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
         er_bins = recoil_data['Er_bins']
         er_mid_mev = er_bins[:-1] + np.diff(er_bins) / 2.0
@@ -1927,7 +2071,7 @@ class Paleodetector:
             x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
                 None (DEFAULT_INTEGRATION_X_BINS_NM).
             energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species (str, optional): 'mu-', 'mu+', 'neutron' or
@@ -1939,7 +2083,7 @@ class Paleodetector:
             np.ndarray or dict: dR/dx [tracks per mg per kyr per nm], shape (T, n_x).
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
         if species == 'secondary_neutron':
             recoil_data = self._process_secondary_geant4_data(
@@ -1963,7 +2107,7 @@ class Paleodetector:
     def integrate_particle_signal_spectrum(
         self, x_bins=None, energy_bins_gev=None,
         exposure_window_kyr=None, flux_history=None, steps=None, total_simulated_particles=1e4, 
-        x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus="total"
+        x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus="total", e_range=None,
     ):
         """Track counts from one cosmic-ray species over an exposure window.
 
@@ -1975,14 +2119,14 @@ class Paleodetector:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm].
                 Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
             energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+                Defaults to None (all the Geant4 files of the species).
             exposure_window_kyr (float or list[float], optional): Window in local
                 time [kyr]; a single value w means [0, w]. Defaults to None
                 ([0, total_age_kyr]).
             flux_history (FluxHistory, optional): Replaces the current flux history.
                 Defaults to None (current one, or a baseline history if none).
-            steps (int, optional): Number of time points (at least 4). Defaults to
-                None (number of flux events + window length in kyr).
+            steps (int, optional): Extra uniform time points added to the adaptive grid (_time_grid_kyr).
+                Defaults to None (adaptive grid only).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to
@@ -1990,12 +2134,15 @@ class Paleodetector:
             species (str, optional): 'mu-', 'mu+', 'neutron' or
                 'secondary_neutron'. Defaults to 'mu-'.
             nucleus (str, optional): 'total' or a fragment key. Defaults to "total".
+            e_range (tuple[float, float], optional): (E_min, E_max) [GeV]: use only the Geant4 files whose bins
+                lie inside it (see _energy_edges). Ignored if energy_bins_gev is given. Defaults to None (all).
 
         Returns:
             np.ndarray: Tracks per mg in each bin of x_bins.
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        energy_bins_gev = (self._energy_edges(species, e_range) if energy_bins_gev is None
+                           else np.asarray(energy_bins_gev, dtype=float))
 
         if flux_history is not None:
             self.flux_history = flux_history
@@ -2009,14 +2156,7 @@ class Paleodetector:
         if isinstance(exposure_window_kyr, (int, float)):
             exposure_window_kyr = [0, exposure_window_kyr]
 
-        if not steps:
-            steps = len(self.flux_history.events) + int(
-                (exposure_window_kyr[1] - exposure_window_kyr[0])
-            )
-
-        steps = max(steps, 4)
-
-        t_kyr_array = np.linspace(exposure_window_kyr[0], exposure_window_kyr[1], steps)
+        t_kyr_array = self._time_grid_kyr(exposure_window_kyr, steps)
 
         dRdx_array = self.calculate_particle_signal_spectrum(
             t_kyr_array, x_bins=x_grid, energy_bins_gev=energy_bins_gev,
@@ -2036,17 +2176,18 @@ class Paleodetector:
 
 
     def integrate_all_particles(
-        self,  x_bins=None, energy_bins_gev=None,
+        self,  x_bins=None, e_range=None,
         exposure_window_kyr=None, flux_history=None,steps=None, 
-        total_simulated_particles=1e4, species_list=('mu-', 'mu+', 'neutron', 'secondary_neutron'), nucleus="total"
+        total_simulated_particles=1e4, species_list=None, nucleus="total"
     ):
         """Track counts from several cosmic-ray species, computed in parallel.
 
         Args:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm].
                 Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
-            energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (DEFAULT_ENERGY_BINS_GEV).
+            e_range (dict, optional): {species: (E_min, E_max) [GeV]} restricting the Geant4 files used for those
+                species (the bins lying entirely inside the range); species not in it use all their files. Raises
+                if a range is outside the available one. Defaults to None (all files for every species).
             exposure_window_kyr (float or list[float], optional): See
                 integrate_particle_signal_spectrum. Defaults to None.
             flux_history (FluxHistory, optional): See
@@ -2055,24 +2196,32 @@ class Paleodetector:
                 Defaults to None.
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
-            species_list (tuple[str], optional): Species to compute. Defaults to
-                ('mu-', 'mu+', 'neutron', 'secondary_neutron').
+            species_list (tuple[str], optional): Species to compute. Defaults to None (available_species()).
             nucleus (str, optional): 'total' or a fragment key. Defaults to "total".
 
         Returns:
             tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each
             species plus 'total'.
+
+        Raises:
+            ValueError: If a species has no runs, or e_range names a species not computed or an invalid range.
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = _resolve_energy_bins(energy_bins_gev)
+        species_list = self.available_species() if species_list is None else list(species_list)
+        e_range = dict(e_range or {})
+        unknown = set(e_range) - set(species_list)
+        if unknown:
+            raise ValueError(f"e_range given for species not computed: {sorted(unknown)} "
+                             f"(computed: {species_list}).")
+        edges = {s: self._energy_edges(s, e_range.get(s)) for s in species_list}   # validates before the pool
 
         shared_kwargs = dict(
-            x_bins=x_bins, energy_bins_gev=energy_bins_gev, 
+            x_bins=x_bins,
             exposure_window_kyr=exposure_window_kyr, flux_history=flux_history, steps=steps, 
             total_simulated_particles=total_simulated_particles, nucleus=nucleus
         )
 
-        tasks = [(self, dict(shared_kwargs, species=s)) for s in species_list]
+        tasks = [(self, dict(shared_kwargs, species=s, energy_bins_gev=edges[s])) for s in species_list]
 
         with Pool(processes=min(len(species_list), os.cpu_count() or 1)) as pool:
             results = list(tqdm(pool.imap(_species_worker, tasks), total=len(tasks)))
