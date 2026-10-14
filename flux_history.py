@@ -526,9 +526,9 @@ MCEQ_SPECIES = {
     'neutron': ('n0',),
     'proton': ('p+',),
     'nu_mu': ('total_numu',),
-    'nu_mu_bar': ('total_antinumu',),
+    'anti_nu_mu': ('total_antinumu',),
     'nu_e': ('total_nue',),
-    'nu_e_bar': ('total_antinue',),
+    'anti_nu_e': ('total_antinue',),
 }
 
 
@@ -626,7 +626,7 @@ LOW_E_SPLICE = {
 # 13 and 40 MeV and a peak ~3x the flux at 0.2 GeV; this form gives ~E^0.7 and ~2x for a slope of -1 at 0.2 GeV.
 # Indicative only (no separate decay-at-rest Michel peak, no geomagnetic effects); use FLUKA for accurate fluxes.
 NEUTRINO_LOW_E = {
-    'species': ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar'),
+    'species': ('nu_mu', 'anti_nu_mu', 'nu_e', 'anti_nu_e'),
     'e_match_gev': 0.2,      # just above the bottom of the MCEq grid
     'fit_dex': 0.15,         # half-width of the window where the MCEq slope is measured [decades]
     'e_peak_gev': 0.04,      # peak of dN/dE (FLUKA: ~40 MeV)
