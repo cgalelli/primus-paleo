@@ -41,23 +41,30 @@ _LIGHT_ION_ELEMENTS = {"H", "He"}   # elements with Z <= LIGHT_ION_MAX_Z
 
 
 def is_light_ion(fragment):
-    """True for hydrogen and helium fragments (proton, deuteron, triton, alpha, He3, ...).
+    """Tells whether a fragment is a hydrogen or helium ion, i.e. a track that is not counted by default.
+
+    Purpose: the default track sum 'total_no_light_ions' (TOTAL_NO_LIGHT_IONS) leaves out H and He fragments
+    (p, d, t, 3He, alpha, ...), whose sparse ionisation does not leave an etchable damage core.
+    _convert_recoil_to_track_spectrum calls this for every fragment to build that sum. The test is on the element,
+    so it works for both the named Geant4 particles ("proton", "alpha") and ion names ("He3", "H2").
 
     Args:
         fragment (str): Fragment key (see normalize_fragment_name).
 
     Returns:
-        bool: Whether the fragment has Z <= LIGHT_ION_MAX_Z.
+        bool: True if the fragment has Z <= LIGHT_ION_MAX_Z.
     """
     symbol = _LIGHT_ION_SYMBOLS.get(fragment, fragment)
     return ''.join(filter(str.isalpha, symbol)) in _LIGHT_ION_ELEMENTS
 
 
 def normalize_fragment_name(name):
-    """Maps a Geant4 particle name to the fragment key used in the analysis.
+    """Maps a Geant4 particle name to the fragment key used throughout the analysis.
 
-    Excited ions are merged into their ground state; named light ions and the
-    neutron are kept; every other particle is discarded.
+    Purpose: the outNuclei_<E>.txt files list every recorded particle by its Geant4 name. Recoil spectra are
+    accumulated per nucleus, so excited states of the same nucleus must be merged ("Ne21[28.465]" and "Ne21" are
+    the same track), the named light ions and the neutron kept, and everything else (gammas, pions, antiparticles)
+    dropped. The key is also what selects the range table DEDX_Z<z>_A<a>.txt of the nucleus.
 
     Examples:
         "Ne21[28.465]" -> "Ne21"
@@ -81,11 +88,11 @@ def normalize_fragment_name(name):
 
 
 def normalize_fragment_names(names):
-    """Vectorised version of normalize_fragment_name.
+    """Vectorised normalize_fragment_name, for a whole column of a Geant4 output file.
 
-    Each distinct name is mapped once, so the cost does not grow with the number
-    of rows. Discarded particles become "", which never matches a fragment key and
-    is therefore dropped downstream.
+    Purpose: the output files have up to millions of rows but only a few hundred distinct names, so each distinct
+    name is mapped once and the result broadcast back; the cost does not grow with the number of rows. Discarded
+    particles become "", which never matches a fragment key and is therefore dropped downstream.
 
     Args:
         names (array_like): Particle names, any shape.
@@ -114,12 +121,16 @@ TRACK_LENGTH_BINS_NM = np.logspace(LENGTH_MIN_LOG_NM, LENGTH_MAX_LOG_NM, LENGTH_
 _ENERGY_EDGE_RTOL = 1e-9
 
 # Species whose recoil calculation is implemented. Any MCEQ_SPECIES folder found in Data/Geant4_data/<mineral> is
-# listed at creation; only these (and 'secondary_neutron', from the neutron runs) can be computed for now.
-COMPUTABLE_SPECIES = ('mu-', 'mu+', 'neutron')
-# Species without runs of their own: secondary_neutron takes its recoils (and energy grid) from the mineral's neutron
-# runs; the neutrons themselves are produced, in the window above the sample, by SECONDARY_NEUTRON_SOURCES (StdRock).
-DERIVED_SPECIES = {'secondary_neutron': 'neutron'}
-SECONDARY_NEUTRON_SOURCES = ('mu-', 'mu+', 'neutron')
+# listed at creation; only these (and the secondary species below) can be computed for now. Muons use the stopping
+# depths of StdRock/mu-; the hadrons (neutron, proton) the interaction depths of StdRock/<species>.
+COMPUTABLE_SPECIES = ('mu-', 'mu+', 'neutron', 'proton')
+MUON_SPECIES = ('mu-', 'mu+')
+# Secondary species: particles of type DERIVED_SPECIES[s] produced in the window above the sample by the primaries in
+# SECONDARY_SOURCES (StdRock runs), plus their own later generations; their recoils (and energy grid) come from the
+# mineral runs of that particle. Cross-generations between products (neutrons from secondary protons and vice versa)
+# are not followed.
+DERIVED_SPECIES = {'secondary_neutron': 'neutron', 'secondary_proton': 'proton'}
+SECONDARY_SOURCES = ('mu-', 'mu+', 'neutron', 'proton')
 IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E) is reported as a gap
 
 DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 200)
@@ -142,24 +153,36 @@ NEUTRON_P_NODES = STOPPING_P_NODES[STOPPING_P_NODES <= NEUTRON_TAIL_P]
 SECONDARY_WINDOW_SURVIVAL = 1e-3
 SECONDARY_WINDOW_BINS = 50
 
-# Time grid of the exposure integrals: on top of the uniform grid, the times at which the overburden reaches
-# DEPTH_GRID_POINTS values equally spaced in log(depth), so that fast burial is resolved where the rates change
-# (atmospheric neutrons fade over ~1.6 m.w.e., muons over tens of m.w.e.).
-DEPTH_GRID_POINTS = 200
-DEPTH_GRID_MIN_MWE = 0.01
+# Master time grid of the detector (_master_time_grid), shared by every time integral and by annealing. It starts
+# from a uniform backbone plus the known breakpoints of the overburden and flux histories, and is refined by
+# bisection wherever a probe function is not integrated to TIME_GRID_RTOL (relative to its integral between
+# consecutive breakpoints) by the trapezoid rule. Probes:
+# the overburden itself, its attenuation exp(-X / L) for the lengths below (atmospheric neutrons, shallow and deep
+# muons) and the flux history at a few species and energies.
+TIME_GRID_BACKBONE = 100
+TIME_GRID_RTOL = 1e-5
+TIME_GRID_MAX_POINTS = 5000
+TIME_GRID_MAX_PASSES = 20
+TIME_GRID_ATTENUATION_MWE = (1.6, 30.0, 300.0)
+TIME_GRID_FLUX_PROBES = (('mu-', 1.0), ('mu-', 100.0), ('neutron', 0.1))
 
 _G4_OUTPUT_FILE_RE = re.compile(r"^outNuclei_(\d+\.\d+)\.txt$")
 
 
 def _list_geant4_energy_files(data_dir):
-    """Lists the Geant4 output files of a run directory.
+    """Lists the Geant4 output files of a run directory, with the primary energy read from each file name.
+
+    Purpose: every Geant4 run directory (Data/Geant4_data/<mineral>/<species> and Data/Geant4_data/StdRock/<species>)
+    holds one outNuclei_<E>.txt per simulated primary energy E [GeV]. This is the single place where those files
+    are found; it is used to build the energy grids (_geant4_energy_edges), to tell whether a species has runs at
+    all, and to pick the file of a given energy (_load_stdrock_rows).
 
     Args:
         data_dir (str): Directory containing outNuclei_<E>.txt files.
 
     Returns:
-        list[tuple[float, str]]: (primary energy [GeV], file path), sorted by
-        energy. Empty if the directory does not exist.
+        list[tuple[float, str]]: (primary energy [GeV], file path), sorted by energy. Empty if the directory does
+        not exist or has no such files.
     """
     if not os.path.isdir(data_dir):
         return []
@@ -172,18 +195,21 @@ def _list_geant4_energy_files(data_dir):
 
 
 def _loglog_interp_rows(x, xp, fp_rows):
-    """Interpolates tabulated rows linearly in log-log space.
+    """Interpolates a table of rows, one row per tabulated energy, linearly in log-log space.
 
-    Each column of fp_rows is interpolated independently. Values outside the
-    table are extrapolated linearly in log-log from the end segments.
+    Purpose: the StdRock depth tables are built only at the simulated energies (one row of depth quantiles, or one
+    exponential-tail length, per energy), but the flux is integrated on fine energy grids in between. Depth scales
+    are close to power laws of the energy, so interpolating log(value) against log(energy) is accurate between
+    runs and gives a sensible extrapolation beyond the first and last one. Used by _depth_quantiles and
+    _hadron_tail_lambdas. Each column (e.g. each quantile) is interpolated independently.
 
     Args:
-        x (array_like): Points to evaluate, shape (n,). Must be > 0.
-        xp (array_like): Tabulated abscissae, increasing, shape (m,). Must be > 0.
+        x (array_like): Energies to evaluate, shape (n,). Must be > 0.
+        xp (array_like): Tabulated energies, increasing, shape (m,). Must be > 0.
         fp_rows (array_like): Tabulated values, shape (m, k) or (m,). Must be > 0.
 
     Returns:
-        np.ndarray: Interpolated values, shape (n, k).
+        np.ndarray: Interpolated values, shape (n, k); extrapolated linearly in log-log from the end segments.
     """
     lx = np.log(np.atleast_1d(np.asarray(x, dtype=float)))
     lxp = np.log(np.asarray(xp, dtype=float))
@@ -198,25 +224,33 @@ def _loglog_interp_rows(x, xp, fp_rows):
 
 
 def _piecewise_cdf_and_integral(z, q, p, tail_lambda=None):
-    """CDF and its complement integral for a quantile-node depth distribution.
+    """Cumulative distribution F(z) of a depth, and its integral G(z), from a quantile table.
 
-    The distribution of a depth R is described by quantile nodes q at
-    probabilities p (p[0] = 0), with F piecewise linear between nodes. If p ends
-    at 1, F = 1 beyond the last node. If p ends below 1, an exponential tail is
-    attached: F(z) = 1 - (1 - p[-1]) * exp(-(z - q[-1]) / tail_lambda).
+    Purpose: this is how a StdRock depth distribution is evaluated. For each simulated energy the code stores the
+    depths R at which a particle stops (muons) or interacts (hadrons) as quantile nodes q at probabilities p
+    (_build_depth_table); this function turns those nodes back into a distribution:
+      * F(z) = P(R <= z), linear between the nodes. F(z_max) - F(z_min) is the probability that the stop or the
+        interaction falls inside a slab [z_min, z_max]: the capture probability of a mu- in the sample, or the
+        interaction probability of a hadron (_slab_probability).
+      * G(z) = integral_0^z (1 - F) = E[min(R, z)], the mean path length travelled within the first z m.w.e.
+        For muons, which interact all along their path until they stop, the expected path inside a slab is
+        G(z_max) - G(z_min), and dividing by G(inf) = E[R] gives the fraction of their interactions that happen
+        there (_muon_depth_probabilities). For secondary particles born at different distances above the sample,
+        H(z) = z - G(z) gives the probability averaged over a production bin (_process_secondary_geant4_data).
+    If p ends below 1 (hadrons: the last nodes are poorly sampled), an exponential tail is attached beyond the last
+    node, F(z) = 1 - (1 - p[-1]) exp(-(z - q[-1]) / tail_lambda), so that deep slabs still get a probability.
 
     Args:
         z (array_like): Depths [m.w.e.], any shape.
         q (np.ndarray): Quantile nodes [m.w.e.], non-decreasing, shape (n,).
-        p (np.ndarray): Probabilities of the nodes, shape (n,).
-        tail_lambda (float, optional): Length of the exponential tail [m.w.e.].
-            Required when p[-1] < 1. Defaults to None (no tail).
+        p (np.ndarray): Probabilities of the nodes, shape (n,), p[0] = 0.
+        tail_lambda (float, optional): Length of the exponential tail [m.w.e.]. Required when p[-1] < 1.
+            Defaults to None (no tail: F = 1 beyond the last node).
 
     Returns:
         tuple[np.ndarray, np.ndarray]:
             F: P(R <= z), same shape as z.
-            G: integral from 0 to z of (1 - F(t)) dt = E[min(R, z)], same shape as z.
-            G(inf) is the mean E[R].
+            G: integral from 0 to z of (1 - F(t)) dt = E[min(R, z)], same shape as z. G(inf) is the mean E[R].
     """
     z = np.asarray(z, dtype=float)
     dq = np.diff(q)
@@ -248,16 +282,21 @@ def _piecewise_cdf_and_integral(z, q, p, tail_lambda=None):
 
 
 def _slab_probability(q_rows, p, z_min_grid, z_max_grid, tail_lambdas=None):
-    """Probability that the depth falls inside a slab, for a set of energies.
+    """Probability that the stop or interaction depth falls inside a slab, for every energy of a grid at once.
+
+    Purpose: the sample is a slab [overburden, overburden + thickness] along each slanted path (both divided by
+    cos(zenith)). For a hadron entering the ground, the chance of interacting in the sample is
+    F(z_max) - F(z_min) of its StdRock depth distribution at that energy (_piecewise_cdf_and_integral). This
+    evaluates it over the whole (time, zenith, energy) grid of _process_geant4_data, row by row of the depth table.
 
     Args:
         q_rows (np.ndarray): Quantile nodes per energy, shape (n_E, n_nodes).
         p (np.ndarray): Probabilities of the nodes, shape (n_nodes,).
-        z_min_grid (np.ndarray): Slab top [m.w.e.], shape (..., n_E); the last axis
-            runs over the energies of q_rows.
-        z_max_grid (np.ndarray): Slab bottom [m.w.e.], same shape as z_min_grid.
-        tail_lambdas (np.ndarray, optional): Exponential-tail length per energy
-            [m.w.e.], shape (n_E,). Defaults to None (no tail).
+        z_min_grid (np.ndarray): Slab top along the path [m.w.e.], shape (..., n_E); the last axis runs over the
+            energies of q_rows.
+        z_max_grid (np.ndarray): Slab bottom along the path [m.w.e.], same shape as z_min_grid.
+        tail_lambdas (np.ndarray, optional): Exponential-tail length per energy [m.w.e.], shape (n_E,).
+            Defaults to None (no tail).
 
     Returns:
         np.ndarray: P(z_min < R <= z_max), same shape as z_min_grid.
@@ -272,10 +311,13 @@ def _slab_probability(q_rows, p, z_min_grid, z_max_grid, tail_lambdas=None):
 
 
 def _rebin_density(density, grid_edges, out_edges):
-    """Counts in out_edges from a density given per bin of a fine grid (constant inside each fine bin).
+    """Counts in coarse output bins from a density defined on a fine grid.
 
-    The cumulative count is exact at the fine-grid edges and linear between them, so the total is conserved and
-    no numerical quadrature is needed; counts outside the fine grid are zero.
+    Purpose: track-length spectra are computed on the fine logarithmic grid TRACK_LENGTH_BINS_NM (so that short
+    tracks are resolved) as densities per nm, but returned on the user's x_bins (e.g. 200 linear bins). Taking the
+    density constant inside each fine bin, the cumulative count is exact at the fine edges and linear in between,
+    so the total is conserved and no numerical quadrature is needed. Used by the fission and radiogenic-neutron
+    integrals; counts outside the fine grid are zero.
 
     Args:
         density (np.ndarray): Density in each fine bin [per unit length], len(grid_edges) - 1 values.
@@ -290,10 +332,122 @@ def _rebin_density(density, grid_edges, out_edges):
     return np.diff(np.interp(np.asarray(out_edges, dtype=float), grid_edges, cumulative))
 
 
-def set_integration_x_bins_nm(integration_x_bins_nm):
-    """Sets the module-wide default track-length binning.
+# --- Track annealing laws -------------------------------------------------------------------------------------
+K_B_EV = 8.617333262e-5
+SECONDS_PER_KYR = 1e3 * 365.25 * 86400.0
+_ANNEALING_GEOTHERM_DEFAULTS = {'T_surface_C': 15.0, 'gradient_C_per_km': 25.0, 'rock_density_g_cm3': 2.16}
+_R_FRESH = 1.0 - 1e-4            # r above this counts as a fresh (unannealed) track
 
-    Functions whose x_bins argument is None use this binning at call time.
+
+def _annealing_law(params):
+    """Isothermal annealing law r_iso(t, T) and its inverse t_iso(r, T), with t in kyr and T in K.
+
+    Purpose: laboratory annealing laws give the reduced length r of a track held at a constant temperature T for a
+    time t. The sample's temperature changes with its burial, so _annealing_from_law follows each track step by
+    step with the equivalent-time method, which needs both directions: r_iso to advance a step, and t_iso to turn
+    the current r into the time the law would need to reach it at the new temperature. Both are analytic for the
+    laws below.
+
+    Laws ('law' key of params):
+      'fanning_curvilinear' (Ketcham et al. 1999, 2007, fission tracks in apatite):
+          g(r) = C0 + C1 * (ln t - C2) / (ln(1/T) - C3),   g(r) = (((1 - r^beta) / beta)^alpha - 1) / alpha
+          (g(r) = ln((1 - r^beta) / beta) for alpha = 0). Keys: C0, C1, C2, C3, alpha, beta and time_unit_s, the
+          seconds per unit of t in the published fit (e.g. 1 for seconds, 3600 for hours). No defaults: take the
+          constants and the time unit from the paper.
+      'first_order': r = exp(-k(T) t), k(T) = A exp(-Ea / (k_B T)). Keys: A_per_kyr, Ea_eV.
+
+    Args:
+        params (dict): Law name and constants.
+
+    Returns:
+        tuple[callable, callable]: (r_iso, t_iso), vectorised.
+
+    Raises:
+        ValueError: If the law is unknown or a constant is missing.
+    """
+    law = params.get('law')
+    need = {'fanning_curvilinear': ('C0', 'C1', 'C2', 'C3', 'alpha', 'beta', 'time_unit_s'),
+            'first_order': ('A_per_kyr', 'Ea_eV')}
+    if law not in need:
+        raise ValueError(f"annealing 'law' must be one of {list(need)}, got {law!r}.")
+    missing = [k for k in need[law] if k not in params]
+    if missing:
+        raise ValueError(f"annealing law '{law}' needs {missing}.")
+
+    if law == 'first_order':
+        A, Ea = float(params['A_per_kyr']), float(params['Ea_eV'])
+        rate = lambda T: A * np.exp(-Ea / (K_B_EV * T))
+        r_iso = lambda t, T: np.exp(-rate(T) * t)
+        t_iso = lambda r, T: -np.log(np.clip(r, 1e-300, 1.0)) / rate(T)
+        return r_iso, t_iso
+
+    C0, C1, C2, C3 = (float(params[k]) for k in ('C0', 'C1', 'C2', 'C3'))
+    alpha, beta = float(params['alpha']), float(params['beta'])
+    kyr_to_unit = SECONDS_PER_KYR / float(params['time_unit_s'])
+
+    def g_of_r(r):
+        u = (1.0 - np.clip(r, 0.0, _R_FRESH) ** beta) / beta
+        return np.log(u) if alpha == 0 else (u ** alpha - 1.0) / alpha
+
+    def r_of_g(g):
+        u = np.exp(g) if alpha == 0 else np.power(np.clip(alpha * g + 1.0, 0.0, None), 1.0 / alpha)
+        base = 1.0 - beta * u
+        return np.where(base > 0, np.power(np.clip(base, 1e-300, None), 1.0 / beta), 0.0).clip(0.0, 1.0)
+
+    def r_iso(t, T):
+        ln_t = np.log(np.clip(np.asarray(t, dtype=float) * kyr_to_unit, 1e-300, None))
+        return r_of_g(C0 + C1 * (ln_t - C2) / (np.log(1.0 / T) - C3))
+
+    def t_iso(r, T):
+        return np.exp(C2 + (g_of_r(r) - C0) * (np.log(1.0 / T) - C3) / C1) / kyr_to_unit
+
+    return r_iso, t_iso
+
+
+def _shorten_tracks(density, grid_edges, r, r_min=0.0):
+    """Shortens every track of a length spectrum by a factor r: the core of the annealing option.
+
+    Purpose: annealing makes a latent track formed at time t shorter by today (reduced length r(t), see
+    _annealing_ratio). The spectra are computed time by time, so each time slice (row) is shortened by its own r
+    before the time integral. With proportional shortening a track of length x0 becomes r x0, so the cumulative
+    count at length x after shortening is the original cumulative count at x / r; this is exact for a density
+    constant inside each bin and conserves the number of tracks. Rows with r < r_min (segmented tracks, no longer
+    etchable) are removed.
+
+    Args:
+        density (np.ndarray): Densities per bin of grid_edges [per unit length], shape (T, n_x) or (n_x,).
+        grid_edges (np.ndarray): Bin edges, n_x + 1 values.
+        r (array_like): Shortening factor per row, shape (T,) (or scalar for a 1-D density), 0 < r <= 1.
+        r_min (float, optional): Rows with r below this are set to 0. Defaults to 0.
+
+    Returns:
+        np.ndarray: Shortened densities, same shape as density.
+    """
+    density = np.asarray(density, dtype=float)
+    grid_edges = np.asarray(grid_edges, dtype=float)
+    rows = np.atleast_2d(density)
+    r = np.broadcast_to(np.asarray(r, dtype=float), (rows.shape[0],))
+    if np.any(r <= 0) or np.any(r > 1 + 1e-12):
+        raise ValueError("annealing must give 0 < r <= 1.")
+    widths = np.diff(grid_edges)
+    cum = np.concatenate([np.zeros((rows.shape[0], 1)), np.cumsum(rows * widths, axis=1)], axis=1)
+    out = np.zeros_like(rows)
+    for k in range(rows.shape[0]):
+        if r[k] < r_min:
+            continue
+        if r[k] >= 1.0:
+            out[k] = rows[k]
+            continue
+        out[k] = np.diff(np.interp(grid_edges / r[k], grid_edges, cum[k])) / widths
+    return out.reshape(density.shape)
+
+
+def set_integration_x_bins_nm(integration_x_bins_nm):
+    """Sets the module-wide default output track-length binning.
+
+    Purpose: every integrate_* function returns counts on x_bins; when x_bins is None they use this default, read
+    at call time (_resolve_x_bins). Changing it once (e.g. to the bins of a microscopy descriptor) avoids passing
+    x_bins to every call. It does not change the fine internal grid TRACK_LENGTH_BINS_NM.
 
     Args:
         integration_x_bins_nm (np.ndarray): Bin edges [nm].
@@ -305,10 +459,14 @@ def set_integration_x_bins_nm(integration_x_bins_nm):
 
 
 def _geant4_energy_edges(data_dir):
-    """Primary-energy bins of a Geant4 run directory, from its file names.
+    """Primary-energy bins of a Geant4 run directory, built from its file names.
 
-    Each outNuclei_<E>.txt is the response at the lower edge E of a bin; a bin ends at the next file energy and the
-    last one at one more step of the same logarithmic size as the last step (the convention of the run grids).
+    Purpose: the code integrates the cosmic-ray flux over energy bins and weights each bin by the response of one
+    Geant4 run. Each outNuclei_<E>.txt is taken as the response at the lower edge E of its bin; a bin ends at the
+    next file energy and the last one at one more step of the same logarithmic size as the last step (the
+    convention of the run grids). Built per species at creation (_scan_geant4_species), so every species uses all
+    and only the energies actually simulated. Irregular steps are reported because the run below a gap then
+    stands for the whole gap.
 
     Args:
         data_dir (str): Directory containing outNuclei_<E>.txt files.
@@ -330,7 +488,10 @@ def _geant4_energy_edges(data_dir):
 
 
 def _resolve_x_bins(x_bins):
-    """Returns the given track-length bins, or the current default if None.
+    """The given output track-length bins, or the module default (set_integration_x_bins_nm) if None.
+
+    Purpose: one place for the x_bins default, read at call time so that set_integration_x_bins_nm takes effect
+    without reloading the module.
 
     Args:
         x_bins (array_like or None): Bin edges [nm].
@@ -342,13 +503,16 @@ def _resolve_x_bins(x_bins):
 
 
 def log_interp1d(xx, yy, kind='linear'):
-    """Builds an interpolator that works in log-log space.
+    """Builds an interpolator that is linear in log-log space.
+
+    Purpose: utility for quantities close to power laws (spectra, stopping powers, flux shapes) given at a few
+    points, e.g. in notebooks; interpolating log(y) against log(x) keeps the power-law shape between points and
+    extrapolates it beyond them. Not used by the Paleodetector class itself.
 
     Args:
         xx (np.ndarray): x-coordinates of the data points (> 0).
         yy (np.ndarray): y-coordinates of the data points (> 0).
-        kind (str, optional): Interpolation kind passed to scipy's interp1d.
-            Defaults to 'linear'.
+        kind (str, optional): Interpolation kind passed to scipy's interp1d. Defaults to 'linear'.
 
     Returns:
         callable: f(x) = 10**interp(log10(x)), extrapolating beyond the data.
@@ -546,7 +710,8 @@ class Paleodetector:
                 timeline runs from 0 (present) to negative values (past): local time
                 0 (start of exposure) corresponds to -total_age_kyr there, and local
                 time total_age_kyr (present) to 0. If None, a baseline-only history is
-                built the first time it is needed. Defaults to None.
+                used. To change it later use set_flux_history (the only other way to
+                set it). Defaults to None.
             data_path_prefix (str, optional): Root of the data directory.
                 Defaults to "Data".
         """
@@ -564,8 +729,10 @@ class Paleodetector:
 
         self._overburden_interpolator = self._interpolate_overburden_history(overburden_history)
 
-
-        self.flux_history = flux_history
+        self.flux_history = None
+        self._time_grid_cache = None
+        self._annealing_cache = {}
+        self.set_flux_history(flux_history)
 
         self._nuclear_data_cache = {}
         self._neutron_bkg_cache = {}
@@ -578,19 +745,39 @@ class Paleodetector:
 
         for species in COMPUTABLE_SPECIES:
             if species in self.energy_bins:
-                self._load_depth_interpolators(species=species)
+                try:
+                    self._load_depth_interpolators(species=species)
+                except (FileNotFoundError, ValueError) as err:
+                    if self.verbose > 0:
+                        print(f"Warning: {species} cannot be computed, no usable StdRock depth table ({err}).")
 
         if self.verbose > 0:
             self._print_available_species()
 
 
-    def set_flux_history(self, FluxHistory):
-        """Replaces the cosmic-ray flux history.
+    def set_flux_history(self, flux_history):
+        """Sets the cosmic-ray flux history (the only way to change it after creation) and rebuilds the time grid.
+
+        Called by __init__ and whenever the flux history changes. The master time grid depends on the overburden
+        (fixed at creation) and on the flux history, so it is rebuilt here, at once, and its size printed; the
+        annealing cache, which lives on that grid, is cleared.
 
         Args:
-            FluxHistory (FluxHistory): New flux history.
+            flux_history (FluxHistory or None): New flux history; None means a baseline-only history.
         """
-        self.flux_history = FluxHistory
+        if flux_history is None:
+            flux_history = FluxHistory(
+                baseline={"kind": "Baseline"}, template_dir=os.path.join(self.data_path, "flux_data")
+            )
+        self.flux_history = flux_history
+        self._time_grid_cache = None
+        self._annealing_cache = {}
+        grid = self._master_time_grid()
+        if self.verbose > 0:
+            info = self._time_grid_info
+            print(f"Time grid: {grid.size} nodes over 0-{self.total_age_kyr:g} kyr ({info['start']} uniform and "
+                  f"breakpoint nodes, {info['refined']} added where the overburden or flux change; "
+                  f"{len(self.flux_history.events)} flux events, {len(self.flux_history.excursions)} excursions)")
 
 
     def _scan_geant4_species(self):
@@ -621,14 +808,18 @@ class Paleodetector:
         lines = [f"Created paleo-detector {self.name}, species available for computation:"]
         for species, info in self._geant4_runs.items():
             e = info['edges']
-            note = "" if species in COMPUTABLE_SPECIES else "  (runs found, calculation not implemented yet)"
+            note = ("" if species in self._depth_interpolators else
+                    "  (no StdRock depth table: not computable)" if species in COMPUTABLE_SPECIES else
+                    "  (runs found, calculation not implemented yet)")
             lines.append(f"  {species:<10} energy from {e[0]:.4g} to {e[-2]:.4g} GeV in {info['n_files']} steps{note}")
             for lo, hi in info['gaps']:
                 lines.append(f"  {'':<10} warning: no file between {lo:.4g} and {hi:.4g} GeV "
                              f"(the {lo:.4g} GeV run is used for the whole step)")
-        if 'neutron' in self._geant4_runs:
-            lines.append(f"  {'secondary_neutron':<10} neutrons produced by {', '.join(SECONDARY_NEUTRON_SOURCES)} "
-                         f"above the sample (StdRock runs), recoils from the neutron runs")
+        for derived, product in DERIVED_SPECIES.items():
+            if derived in self.available_species():
+                sources = [src for src in SECONDARY_SOURCES if self._stdrock_dir(src) is not None]
+                lines.append(f"  {derived:<10} {product}s produced by {', '.join(sources)} above the sample "
+                             f"(StdRock runs), recoils from the {product} runs")
         print("\n".join(lines))
 
 
@@ -636,10 +827,11 @@ class Paleodetector:
         """Species that integrate_all_particles can compute with the Geant4 runs present.
 
         Returns:
-            list[str]: Computable species with runs, plus the derived ones whose source runs are present.
+            list[str]: Computable species with mineral runs and a StdRock depth table, plus the secondary species
+            whose product is among them.
         """
-        out = [s for s in COMPUTABLE_SPECIES if s in self.energy_bins]
-        out += [d for d, src in DERIVED_SPECIES.items() if src in self.energy_bins]
+        out = [s for s in COMPUTABLE_SPECIES if s in self.energy_bins and s in self._depth_interpolators]
+        out += [d for d, src in DERIVED_SPECIES.items() if src in out]
         return out
 
 
@@ -676,61 +868,203 @@ class Paleodetector:
         return edges[inside[0]:inside[-1] + 2]
 
 
-    def _time_grid_kyr(self, window_kyr, steps=None):
-        """Time points of an exposure integral, placed where the integrand changes.
+    def _flux_breakpoints(self, nodes=True):
+        """Times [kyr, local] where the flux history changes abruptly (event starts and excursion edges, each with
+        a point just before) and, if nodes, the template time nodes on which an event's flux is interpolated."""
+        if self.flux_history is None:
+            return np.zeros(0)
+        eps = 1e-9 * self.total_age_kyr
+        to_local = self.total_age_kyr
+        points = []
+        for event in self.flux_history.events:
+            start = event["start_time_kyr"] + to_local
+            points.append([start - eps, start])
+            t_since = getattr(event["template"], "t_since_kyr", None)
+            if nodes and t_since is not None:
+                points.append(start + np.asarray(t_since, dtype=float) * 1e-3)   # template times are in yr
+        for exc in self.flux_history.excursions:
+            for edge in (exc["start_time_kyr"], exc["end_time_kyr"]):
+                points.append([edge + to_local - eps, edge + to_local])
+        return np.concatenate([np.asarray(q, dtype=float).ravel() for q in points]) if points else np.zeros(0)
 
-        The rates depend on time only through the overburden and the flux history, so the grid is built from them
-        and then bounded to the window:
-          * every time the overburden crosses one of DEPTH_GRID_POINTS depths equally spaced in log between its
-            minimum and maximum over the window (burial, erosion, or both; exact on the interpolator nodes);
-          * for every flux event, its start (with a point just before it) and the time nodes of its template, on
-            which the flux is interpolated;
-          * the start and end of every geomagnetic excursion, each with a point just before it (the flux jumps there);
-          * the window ends, plus `steps` uniform points if given.
-        With a constant overburden and a steady flux the integrand is constant and the two ends suffice.
 
-        Args:
-            window_kyr (list[float]): [start, end] in local time [kyr].
-            steps (int, optional): Extra uniform points. Defaults to None (none).
+    def _grid_probes(self, t_kyr):
+        """Probe functions of time used to refine the master grid, shape (n_probes, len(t_kyr))."""
+        depth = np.asarray(self._overburden_interpolator(t_kyr), dtype=float)
+        probes = [depth] + [np.exp(-depth / lam) for lam in TIME_GRID_ATTENUATION_MWE]
+        if self.flux_history is not None:
+            t_flux = self._flux_time_kyr(t_kyr)
+            for species, energy in TIME_GRID_FLUX_PROBES:
+                probes.append(np.asarray(self.flux_history.flux(species, np.full(t_kyr.shape, energy), t_flux),
+                                         dtype=float))
+        return np.array(probes)
+
+
+    def _master_time_grid(self):
+        """The detector's time grid over [0, total_age_kyr] [kyr, local], built adaptively and cached.
+
+        Built by set_flux_history (at creation and on every change of the flux history); later calls return the
+        cached grid.
+
+        Start: TIME_GRID_BACKBONE uniform points, the breakpoints of the overburden history (phase limits,
+        discrete deposits) and of the flux history (_flux_breakpoints). Refinement: every interval whose
+        trapezoid error on any probe (_grid_probes), estimated at its midpoint, exceeds TIME_GRID_RTOL times that
+        probe's integral over the segment between the abrupt breakpoints around it is split in two (down to
+        1e-8 of the age, so that a genuine jump is not refined forever); repeated until no interval needs it, TIME_GRID_MAX_PASSES,
+        or TIME_GRID_MAX_POINTS. Steps in either history are therefore resolved where they matter for the rates,
+        and nowhere else. Rebuilt after set_flux_history.
 
         Returns:
-            np.ndarray: Sorted, unique time points [kyr] within the window.
+            np.ndarray: Sorted time points [kyr].
         """
-        t0, t1 = float(window_kyr[0]), float(window_kyr[1])
-        eps = 1e-6 * max(t1 - t0, 1.0)
-        points = [np.array([t0, t1])]
-        if steps:
-            points.append(np.linspace(t0, t1, int(steps)))
+        if self._time_grid_cache is not None:
+            return self._time_grid_cache
+        t_now = float(self.total_age_kyr)
+        t = np.concatenate([np.linspace(0.0, t_now, TIME_GRID_BACKBONE), self._overburden_breakpoints,
+                            self._flux_breakpoints()])
+        t = np.unique(t[(t >= 0.0) & (t <= t_now)])
+        n_start = t.size        
+        seg_edges = np.unique(np.concatenate([[0.0, t_now], self._overburden_breakpoints,
+                                              self._flux_breakpoints(nodes=False)]))
+        min_dt = 1e-6 * t_now                                   # steps (jumps) are not refined below this
+        p_t = self._grid_probes(t)
+        for _ in range(TIME_GRID_MAX_PASSES):
+            mid = 0.5 * (t[1:] + t[:-1])
+            dt = np.diff(t)
+            p_mid = self._grid_probes(mid)
+            trap = 0.5 * np.abs(p_t[:, 1:] + p_t[:, :-1]) * dt                       # (probes, intervals)
+            seg = np.clip(np.searchsorted(seg_edges, mid) - 1, 0, seg_edges.size - 2)
+            seg_total = np.zeros((trap.shape[0], seg_edges.size - 1))
+            np.add.at(seg_total.T, seg, trap.T)
+            err = np.abs(p_mid - 0.5 * (p_t[:, 1:] + p_t[:, :-1])) * dt
+            split = np.any(err > TIME_GRID_RTOL * np.maximum(seg_total[:, seg], 1e-300), axis=0) & (dt > min_dt)
+            if not split.any() or t.size + split.sum() > TIME_GRID_MAX_POINTS:
+                if split.any() and self.verbose > 0:
+                    print(f"Warning: time grid stopped at {t.size} points (TIME_GRID_MAX_POINTS).")
+                break
+            t = np.concatenate([t, mid[split]])
+            p_t = np.concatenate([p_t, p_mid[:, split]], axis=1)
+            order = np.argsort(t)
+            t, p_t = t[order], p_t[:, order]
+        self._time_grid_cache = t
+        self._time_grid_info = {'start': n_start, 'refined': t.size - n_start}
+        return t
 
-        # overburden: crossings of log-spaced depths; piecewise linear between the interpolator nodes
-        nodes = np.asarray(getattr(self._overburden_interpolator, 'x', [t0, t1]), dtype=float)
-        t_nodes = np.concatenate([[t0], nodes[(nodes > t0) & (nodes < t1)], [t1]])
-        depth = np.asarray(self._overburden_interpolator(t_nodes), dtype=float)
-        d_lo, d_hi = max(depth.min(), DEPTH_GRID_MIN_MWE), depth.max()
-        if d_hi > d_lo * (1.0 + 1e-6):
-            targets = np.geomspace(d_lo, d_hi, DEPTH_GRID_POINTS)
-            da, db, ta, tb = depth[:-1], depth[1:], t_nodes[:-1], t_nodes[1:]
-            moving = da != db
-            da, db, ta, tb = da[moving], db[moving], ta[moving], tb[moving]
-            frac = (targets[:, None] - da[None, :]) / (db - da)[None, :]
-            hit = (frac >= 0.0) & (frac <= 1.0)
-            points.append((ta[None, :] + frac * (tb - ta)[None, :])[hit])
 
-        # flux history, converted from its timeline (0 = present) to local time
-        if self.flux_history is not None:
-            to_local = self.total_age_kyr
-            for event in self.flux_history.events:
-                start = event["start_time_kyr"] + to_local
-                points.append(np.array([start - eps, start]))
-                t_since = getattr(event["template"], "t_since_kyr", None)
-                if t_since is not None:
-                    points.append(start + np.asarray(t_since, dtype=float) * 1e-3)   # template times are in yr
-            for exc in self.flux_history.excursions:
-                for edge in (exc["start_time_kyr"], exc["end_time_kyr"]):
-                    points.append(np.array([edge - eps, edge]) + to_local)
+    def _window_grid(self, window_kyr):
+        """The master grid restricted to an exposure window, with the window ends added [kyr]."""
+        t0, t1 = window_kyr
+        grid = self._master_time_grid()
+        return np.unique(np.concatenate([[t0, t1], grid[(grid > t0) & (grid < t1)]]))
 
-        t = np.unique(np.concatenate(points))
-        return t[(t >= t0) & (t <= t1)]
+
+    def _annealing_ratio(self, t_kyr, annealing):
+        """Reduced length r today of tracks formed at the given local times.
+
+        Args:
+            t_kyr (array_like): Formation times [kyr].
+            annealing (float or dict): A number (same r for all formation times), or a dict: {'law': 'table',
+                't_kyr': [...], 'r': [...]} (r at the given formation times, linear in between, constant outside),
+                or a law and a geotherm (see _annealing_law, _annealing_from_law), computed once on the master
+                grid and cached until the flux history changes; other times are computed directly.
+
+        Returns:
+            np.ndarray: r, shape (len(t_kyr),).
+        """
+        t_kyr = np.atleast_1d(np.asarray(t_kyr, dtype=float))
+        if not isinstance(annealing, dict):
+            return np.full(t_kyr.shape, float(annealing))
+        if annealing.get('law') == 'table':
+            nodes, r = np.asarray(annealing['t_kyr'], dtype=float), np.asarray(annealing['r'], dtype=float)
+            order = np.argsort(nodes)
+            return np.interp(t_kyr, nodes[order], r[order])
+        key = repr(sorted(annealing.items()))
+        if key not in self._annealing_cache:
+            grid = self._master_time_grid()
+            self._annealing_cache[key] = (grid, self._annealing_from_law(grid, annealing))
+        grid, r_grid = self._annealing_cache[key]
+        idx = np.clip(np.searchsorted(grid, t_kyr), 0, grid.size - 1)
+        on_grid = grid[idx] == t_kyr
+        r = np.empty(t_kyr.shape)
+        r[on_grid] = r_grid[idx[on_grid]]
+        if not on_grid.all():                     # e.g. window ends: followed exactly, not interpolated
+            r[~on_grid] = self._annealing_from_law(t_kyr[~on_grid], annealing)
+        return r
+
+
+    def _temperature_K(self, t_kyr, T_surface_C, gradient_C_per_km, rock_density_g_cm3):
+        """Sample temperature [K] at local times: depth [m] = overburden [m.w.e.] / rock density, linear geotherm."""
+        depth_m = np.asarray(self._overburden_interpolator(np.asarray(t_kyr, dtype=float))) / rock_density_g_cm3
+        return 273.15 + T_surface_C + gradient_C_per_km * depth_m / 1000.0
+
+
+    def _annealing_from_law(self, t_form_kyr, params):
+        """r today of tracks formed at t_form_kyr, from an isothermal law and the temperature history.
+
+        Temperature: from the overburden history and a linear geotherm (params T_surface_C, gradient_C_per_km,
+        rock_density_g_cm3; defaults 15 C, 25 C/km, 2.16 g/cm^3; a single density converts m.w.e. to metres).
+        Each track is followed from its formation to the present (total_age_kyr), whatever exposure window it was
+        formed in, with the equivalent-time method: at every step of the history, its current r is turned into
+        the time the law needs to reach it at the step's temperature, the step is added and the law gives the new
+        r. The history grid is the master time grid (_master_time_grid) plus the formation times.
+
+        Args:
+            t_form_kyr (np.ndarray): Formation times [kyr].
+            params (dict): Law and constants (see _annealing_law) and the geotherm keys above.
+
+        Returns:
+            np.ndarray: r, shape (len(t_form_kyr),).
+        """
+        p = {**_ANNEALING_GEOTHERM_DEFAULTS, **params}
+        r_iso, t_iso = _annealing_law(p)
+        t_now = float(self.total_age_kyr)
+        t_form = np.clip(np.asarray(t_form_kyr, dtype=float), 0.0, t_now)
+        edges = np.union1d(self._master_time_grid(), t_form)
+        T_mid = self._temperature_K(0.5 * (edges[1:] + edges[:-1]), p['T_surface_C'], p['gradient_C_per_km'],
+                                    p['rock_density_g_cm3'])
+        dt = np.diff(edges)
+        first_step = np.searchsorted(edges, t_form)          # step that starts at each formation time
+        r = np.ones(t_form.shape)
+        for j in range(dt.size):                             # tracks formed before step j anneal through it
+            active = first_step <= j
+            if not np.any(active):
+                continue
+            r_now = r[active]
+            t_eq = np.where(r_now >= _R_FRESH, 0.0, t_iso(r_now, T_mid[j]))
+            r[active] = np.minimum(r_now, r_iso(t_eq + dt[j], T_mid[j]))
+        return r
+
+
+    def _age_integrated(self, x_grid, density, annealing=None, annealing_r_min=0.0):
+        """Tracks accumulated over the sample age from a source constant in time (fission, radiogenic neutrons).
+
+        Without annealing this is density * total_age_kyr. Otherwise the tracks formed at each time of the master
+        grid are shortened by their r (see _annealing_ratio) and the result is integrated over the age.
+
+        Args:
+            x_grid (np.ndarray): Track-length bin edges [nm].
+            density (np.ndarray): Rate per bin of x_grid [tracks per kyr per nm], shape (len(x_grid) - 1,).
+            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
+
+        Returns:
+            np.ndarray: Accumulated density [tracks per nm], shape (len(x_grid) - 1,).
+        """
+        density = np.asarray(density, dtype=float)
+        if annealing is None:
+            return density * self.total_age_kyr
+        t = self._master_time_grid()
+        rows = np.broadcast_to(density, (t.size, density.size))
+        rows = _shorten_tracks(rows, x_grid, self._annealing_ratio(t, annealing), annealing_r_min)
+        return np.trapezoid(rows, t, axis=0)
+
+
+    def _exposure_window(self, exposure_window_kyr):
+        """[start, end] of an exposure window [kyr]: None means the whole age, a number w means [0, w]."""
+        if exposure_window_kyr is None:
+            exposure_window_kyr = self.total_age_kyr
+        if isinstance(exposure_window_kyr, (int, float)):
+            exposure_window_kyr = [0, exposure_window_kyr]
+        return [float(exposure_window_kyr[0]), float(exposure_window_kyr[1])]
 
 
     def _resolve_energy_bins(self, energy_bins_gev, species):
@@ -757,6 +1091,7 @@ class Paleodetector:
         Returns:
             scipy.interpolate.interp1d: Local time [kyr] -> overburden [m.w.e.].
         """
+        self._overburden_breakpoints = np.array([0.0, float(self.total_age_kyr)])
         if isinstance(overburden_history, (int, float)):
             const = float(overburden_history)
             return interp1d([0.0, self.total_age_kyr], [const, const],
@@ -777,7 +1112,13 @@ class Paleodetector:
         overburden_discrete = np.atleast_1d(overburden_history["overburden_discrete"]) if "overburden_discrete" in overburden_history else [0.0]
         density_discrete_g_cm3 = np.atleast_1d(overburden_history["density_discrete_g_cm3"]) if "density_discrete_g_cm3" in overburden_history else [1.0]
 
-        times = np.linspace(0, self.total_age_kyr, 10000)
+        eps = 1e-9 * self.total_age_kyr
+        breaks = [0.0, self.total_age_kyr, *start_time_continuous_kyr, *end_time_continuous_kyr]
+        steps_at = [t for t, o in zip(time_discrete, overburden_discrete) if o != 0.0]
+        breaks += list(steps_at) + [t - eps for t in steps_at]
+        breaks = np.clip(np.asarray(breaks, dtype=float), 0.0, self.total_age_kyr)
+        self._overburden_breakpoints = np.unique(breaks)
+        times = np.union1d(np.linspace(0, self.total_age_kyr, 10000), self._overburden_breakpoints)
         overburdens = np.zeros_like(times) + initial_depth * initial_density_g_cm3
 
         for start, end, rate, density in zip(start_time_continuous_kyr, end_time_continuous_kyr, rate_continuous, density_continuous_g_cm3):
@@ -923,8 +1264,6 @@ class Paleodetector:
         """
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
-        if self.verbose>0:
-            print(f"Calculating radiogenic neutron contribution from {background_type}")
         
         if background_type == 'fission_n':
             flux_interpolator = self.radiogenic_spectrum
@@ -1025,6 +1364,7 @@ class Paleodetector:
         found = False
 
         for background_type in background_types:
+            print(f"Processing background neutron tracks from {background_type}")
 
             recoil_data = self._process_background_neutron_geant4_data(background_type, energy_bins_gev, total_simulated_particles)
 
@@ -1047,6 +1387,8 @@ class Paleodetector:
         total_simulated_particles=1e4, 
         x_grid=TRACK_LENGTH_BINS_NM, 
         nucleus=DEFAULT_TRACK_SUM,
+        annealing=None,
+        annealing_r_min=0.0,
         ):
         """Track counts from radiogenic neutrons over the sample age.
 
@@ -1063,12 +1405,23 @@ class Paleodetector:
                 calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
             nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
                 Defaults to 'total_no_light_ions'.
+            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
+                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
+                (proportional shortening, as in fission-track annealing models). A number (same r for every
+                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
+                times, linear in between, constant outside), or a law with a geotherm, e.g.
+                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
+                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
+                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
+                track is followed from its formation to the present through the temperature given by the
+                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
+            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
+                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
 
         Returns:
             tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
-            accumulated over total_age_kyr.
+            accumulated over total_age_kyr (after annealing, if given).
         """
-
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
@@ -1080,7 +1433,7 @@ class Paleodetector:
             nucleus=nucleus,
             )
 
-        sum_drdx *= self.total_age_kyr
+        sum_drdx = self._age_integrated(x_grid, sum_drdx, annealing, annealing_r_min)
 
         total_tracks_g = _rebin_density(sum_drdx, x_grid, x_bins)
 
@@ -1184,7 +1537,8 @@ class Paleodetector:
         return dRdx
 
     
-    def integrate_fission_spectrum(self, x_bins=None, x_grid=TRACK_LENGTH_BINS_NM):
+    def integrate_fission_spectrum(self, x_bins=None, x_grid=TRACK_LENGTH_BINS_NM, annealing=None,
+                                  annealing_r_min=0.0):
         """Track counts from spontaneous fission over the sample age.
 
         Args:
@@ -1192,16 +1546,26 @@ class Paleodetector:
                 Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
             x_grid (np.ndarray, optional): Fine track-length grid used for the
                 calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
-                Defaults to 'total_no_light_ions'.
+            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
+                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
+                (proportional shortening, as in fission-track annealing models). A number (same r for every
+                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
+                times, linear in between, constant outside), or a law with a geotherm, e.g.
+                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
+                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
+                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
+                track is followed from its formation to the present through the temperature given by the
+                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
+            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
+                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
 
         Returns:
             tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
-            accumulated over total_age_kyr.
+            accumulated over total_age_kyr (after annealing, if given).
         """
         x_bins = _resolve_x_bins(x_bins)
 
-        drdx = self.calculate_fission_spectrum(x_grid) * self.total_age_kyr
+        drdx = self._age_integrated(x_grid, self.calculate_fission_spectrum(x_grid), annealing, annealing_r_min)
 
         total_tracks_g = _rebin_density(drdx, x_grid, x_bins)
 
@@ -1265,17 +1629,19 @@ class Paleodetector:
         F(z_max) - F(z_min), and the normal-interaction probability, with interaction
         density proportional to P(R > z): (G(z_max) - G(z_min)) / E[R].
 
-        Neutrons use the empirical distribution of the interaction depths up to the
-        NEUTRON_TAIL_P quantile, with an exponential tail beyond it; the probability
-        of an interaction in a slab is F(z_max) - F(z_min).
+        Hadrons (neutron, proton: StdRock/<species>) use the empirical distribution of the
+        interaction depths up to the NEUTRON_TAIL_P quantile, with an exponential tail
+        beyond it; the probability of an interaction in a slab is F(z_max) - F(z_min).
+        For protons the interactions stop where the proton stops, which the empirical
+        distribution contains.
 
         Every outNuclei_<E>.txt in the StdRock directory is used, so a denser energy
         grid is picked up automatically.
 
         Args:
-            species (str, optional): 'mu-', 'mu+' or 'neutron'. Defaults to 'mu-'.
+            species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
         """
-        tab_species = 'mu-' if species in ('mu-', 'mu+') else 'neutron'
+        tab_species = 'mu-' if species in MUON_SPECIES else species
         if tab_species not in self._depth_tables:
             self._depth_tables[tab_species] = self._build_depth_table(tab_species)
 
@@ -1291,11 +1657,11 @@ class Paleodetector:
 
         Args:
             tab_species (str): 'mu-' (stopping depths, rows with remaining primary
-                energy 0) or 'neutron' (all interaction depths).
+                energy 0) or a hadron, 'neutron' or 'proton' (all interaction depths).
 
         Returns:
             dict: 'energies' [GeV], 'p' (node probabilities), 'q' (quantile nodes
-            [m.w.e.], shape (n_energies, n_nodes)) and, for neutrons, 'tail_lambda'
+            [m.w.e.], shape (n_energies, n_nodes)) and, for hadrons, 'tail_lambda'
             (exponential-tail length per energy [m.w.e.]).
 
         Raises:
@@ -1324,7 +1690,7 @@ class Paleodetector:
                              names=['z_mm', 'rem_e'], dtype=float)
             depth_mwe = np.clip((z_ref_m - df['z_mm'].values * 1e-3) * rho, 0.0, None)
 
-            # muons: stopping depths; neutrons: all interaction depths
+            # muons: stopping depths; hadrons: all interaction depths
             sample = depth_mwe[df['rem_e'].values == 0.0] if is_muon else depth_mwe
             if sample.size < MIN_DEPTH_SAMPLES:
                 skipped.append(e0)
@@ -1366,7 +1732,7 @@ class Paleodetector:
 
         Args:
             energies_gev (array_like): Energies [GeV], shape (n,).
-            tab_species (str, optional): 'mu-' (stopping depths) or 'neutron'
+            tab_species (str, optional): 'mu-' (stopping depths), 'neutron' or 'proton'
                 (interaction depths). Defaults to 'mu-'.
 
         Returns:
@@ -1404,34 +1770,36 @@ class Paleodetector:
         return prob_tail, prob_peak
 
 
-    def _neutron_depth_probability(self, e_vals, z_min_grid, z_max_grid):
-        """Probability that a neutron interacts in a slab.
+    def _hadron_depth_probability(self, e_vals, z_min_grid, z_max_grid, tab_species='neutron'):
+        """Probability that a hadron interacts in a slab.
 
         Args:
-            e_vals (np.ndarray): Neutron energies [GeV], shape (n_E,), along the last
+            e_vals (np.ndarray): Hadron energies [GeV], shape (n_E,), along the last
                 axis of the z grids.
             z_min_grid (np.ndarray): Slab top along the path [m.w.e.], shape (..., n_E).
             z_max_grid (np.ndarray): Slab bottom along the path [m.w.e.], same shape.
+            tab_species (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
             np.ndarray: F(z_max) - F(z_min), same shape as z_min_grid.
         """
-        table = self._depth_tables['neutron']
-        q_rows = self._depth_quantiles(e_vals, 'neutron')
-        tail_lambdas = self._neutron_tail_lambdas(e_vals)
+        table = self._depth_tables[tab_species]
+        q_rows = self._depth_quantiles(e_vals, tab_species)
+        tail_lambdas = self._hadron_tail_lambdas(e_vals, tab_species)
         return _slab_probability(q_rows, table['p'], z_min_grid, z_max_grid, tail_lambdas)
 
 
-    def _neutron_tail_lambdas(self, energies_gev):
-        """Exponential-tail length of the neutron depth distribution.
+    def _hadron_tail_lambdas(self, energies_gev, tab_species='neutron'):
+        """Exponential-tail length of a hadron depth distribution.
 
         Args:
             energies_gev (array_like): Energies [GeV], shape (n,).
+            tab_species (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
             np.ndarray: Tail length [m.w.e.], shape (n,), log-log interpolated.
         """
-        table = self._depth_tables['neutron']
+        table = self._depth_tables[tab_species]
         return _loglog_interp_rows(energies_gev, table['energies'], table['tail_lambda'])[:, 0]
 
 
@@ -1451,18 +1819,20 @@ class Paleodetector:
         return t_kyr - self.total_age_kyr
 
     
-    def _secondary_window_mwe(self):
-        """Width of the secondary-neutron production window above the sample.
+    def _secondary_window_mwe(self, product='neutron'):
+        """Width of the secondary production window above the sample.
 
-        The depth beyond which a neutron survives with probability below
-        SECONDARY_WINDOW_SURVIVAL, from the StdRock neutron table (empirical
-        nodes up to NEUTRON_TAIL_P, exponential tail beyond), maximised over
-        the tabulated energies.
+        The depth beyond which a product particle survives with probability below
+        SECONDARY_WINDOW_SURVIVAL, from its StdRock table (empirical nodes up to
+        NEUTRON_TAIL_P, exponential tail beyond), maximised over the tabulated energies.
+
+        Args:
+            product (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
             float: Window width along the path [m.w.e.].
         """
-        table = self._depth_tables['neutron']
+        table = self._depth_tables[product]
         survive_last = 1.0 - table['p'][-1]
         depth = table['q'][:, -1] + table['tail_lambda'] * np.log(
             survive_last / SECONDARY_WINDOW_SURVIVAL
@@ -1470,64 +1840,96 @@ class Paleodetector:
         return float(np.max(depth))
 
 
-    def _load_stdrock_neutron_rows(self, species, energy_bins_gev, total_simulated_particles=1e4):
-        """Neutrons produced by the primaries of the StdRock runs.
+    def _stdrock_dir(self, species):
+        """StdRock run directory of a primary species, or None if there is none.
 
-        Reads the neutron rows of StdRock/<species> at the lower edge E_i of each
-        energy cell. Depths are absolute (from the surface, where the primary
-        enters) and already include the transport of the primary through the
-        rock. For mu+, StdRock/mu+ is used if present; otherwise the mu- runs
-        without the stopping step (no capture neutrons) stand in for it.
+        mu+ falls back on the mu- runs when StdRock/mu+ does not exist (see _load_stdrock_rows).
 
         Args:
-            species (str): Primary species ('mu-', 'mu+' or 'neutron').
-            energy_bins_gev (np.ndarray): Energy cell edges [GeV], shape (M,),
-                used for the primary and for the produced neutrons.
-            total_simulated_particles (float, optional): Primaries per Geant4
-                run. Defaults to 1e4.
+            species (str): Primary species.
 
         Returns:
-            dict: 'depth_mwe' (sorted production depths), 'cell' (energy cell of
-            the produced neutron), 'primary_cell' (energy cell of the primary),
-            'weight' (1 / primaries per run), 'target_mwe' (StdRock target
-            length [m.w.e.]) and 'missing' (primary energies without a file).
+            tuple[str, bool] or None: (directory, drop_stopping), drop_stopping being True for the mu+ fallback.
         """
-        tab_species = species
-        drop_stopping = False
-        if species == 'mu+' and not os.path.isdir(
-            os.path.join(self.data_path, "Geant4_data", "StdRock/mu+")
-        ):
-            tab_species, drop_stopping = 'mu-', True
+        root = os.path.join(self.data_path, "Geant4_data", "StdRock")
+        if _list_geant4_energy_files(os.path.join(root, species)):
+            return os.path.join(root, species), False
+        if species == 'mu+' and _list_geant4_energy_files(os.path.join(root, 'mu-')):
+            return os.path.join(root, 'mu-'), True
+        return None
 
-        data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock/{tab_species}")
+
+    def _load_stdrock_rows(self, species, product, product_bins_gev, total_simulated_particles=1e4,
+                           primary_bins_gev=None):
+        """Particles of type `product` produced by the primaries of the StdRock runs.
+
+        Depths are absolute (from the surface, where the primary enters) and already include the transport of the
+        primary through the rock. For mu+, StdRock/mu+ is used if present; otherwise the mu- runs without the
+        stopping step (no capture products) stand in for it.
+
+        The primary energy cells are those of `primary_bins_gev`; each cell uses the StdRock file at the largest
+        energy not above its lower edge, so the StdRock grid need not match. By default the cells are the StdRock
+        files' own grid (_geant4_energy_edges), which keeps every simulated primary energy.
+
+        Args:
+            species (str): Primary species ('mu-', 'mu+', 'neutron', 'proton').
+            product (str): Produced particle to collect ('neutron' or 'proton').
+            product_bins_gev (np.ndarray): Energy cell edges of the products [GeV].
+            total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
+            primary_bins_gev (np.ndarray, optional): Energy cell edges of the primaries [GeV]. Defaults to None
+                (the StdRock grid of the species).
+
+        Returns:
+            dict: 'depth_mwe' (sorted production depths), 'cell' (product energy cell), 'primary_cell',
+            'primary_bins' (primary cell edges [GeV]), 'weight' (1 / primaries per run), 'target_mwe' (StdRock
+            target length [m.w.e.]) and 'missing' (primary cells below the first StdRock file).
+        """
+        found = self._stdrock_dir(species)
+        if found is None:
+            raise FileNotFoundError(f"No StdRock runs for {species}.")
+        data_dir, drop_stopping = found
+        files = _list_geant4_energy_files(data_dir)
+        file_e = np.array([e for e, _ in files])
+        if primary_bins_gev is None:
+            info = _geant4_energy_edges(data_dir)
+            primary_bins_gev = info['edges'] if info is not None else np.array([file_e[0], file_e[0] * 1.1])
+        primary_bins_gev = np.asarray(primary_bins_gev, dtype=float)
+        product_bins_gev = np.asarray(product_bins_gev, dtype=float)
+
         geo = self._geant4_geometry(data_dir)
         rho = geo["density_g_cm3"] if geo["density_g_cm3"] is not None else 2.65
         z_ref_m = geo["depth_reference_z_m"]
 
-        n_e = len(energy_bins_gev) - 1
-        depth_list, cell_list, prim_list, missing = [], [], [], []
-        for i in range(n_e):
-            filepath = os.path.join(data_dir, f"outNuclei_{energy_bins_gev[i]:.6f}.txt")
-            if not os.path.exists(filepath):
-                missing.append(energy_bins_gev[i])
+        n_p, n_e = len(primary_bins_gev) - 1, len(product_bins_gev) - 1
+        which = np.searchsorted(file_e, primary_bins_gev[:-1] * (1 + _ENERGY_EDGE_RTOL), side='right') - 1
+        cache, depth_list, cell_list, prim_list, missing = {}, [], [], [], []
+        for i in range(n_p):
+            if which[i] < 0:
+                missing.append(primary_bins_gev[i])
                 continue
-            if os.path.getsize(filepath) == 0:
+            filepath = files[which[i]][1]
+            if filepath not in cache:
+                cache[filepath] = None
+                if os.path.getsize(filepath) > 0:
+                    df = pd.read_csv(
+                        filepath, sep=r'\s+', header=None, usecols=[0, 2, 3, 5],
+                        names=['name', 'rec_e', 'z_mm', 'rem_e'],
+                        dtype={'name': 'category', 'rec_e': 'float64', 'z_mm': 'float64', 'rem_e': 'float64'},
+                        engine='c',
+                    )
+                    keep = (df['name'] == product).to_numpy()
+                    if drop_stopping:
+                        keep = keep & (df['rem_e'].to_numpy() != 0.0)
+                    depth = np.clip((z_ref_m - df['z_mm'].values[keep] * 1e-3) * rho, 0.0, None)
+                    cell = np.searchsorted(product_bins_gev, df['rec_e'].values[keep] * 1e-3, side='right') - 1
+                    inside = (cell >= 0) & (cell < n_e)
+                    cache[filepath] = (depth[inside], cell[inside])
+            if cache[filepath] is None:
                 continue
-            df = pd.read_csv(
-                filepath, sep=r'\s+', header=None, usecols=[0, 2, 3, 5],
-                names=['name', 'rec_e', 'z_mm', 'rem_e'],
-                dtype={'name': 'category', 'rec_e': 'float64', 'z_mm': 'float64', 'rem_e': 'float64'},
-                engine='c',
-            )
-            keep = (df['name'] == 'neutron').to_numpy()
-            if drop_stopping:
-                keep = keep & (df['rem_e'].to_numpy() != 0.0)
-            depth = np.clip((z_ref_m - df['z_mm'].values[keep] * 1e-3) * rho, 0.0, None)
-            cell = np.searchsorted(energy_bins_gev, df['rec_e'].values[keep] * 1e-3, side='right') - 1
-            inside = (cell >= 0) & (cell < n_e)
-            depth_list.append(depth[inside])
-            cell_list.append(cell[inside])
-            prim_list.append(np.full(inside.sum(), i))
+            depth, cell = cache[filepath]
+            depth_list.append(depth)
+            cell_list.append(cell)
+            prim_list.append(np.full(depth.size, i))
 
         depth = np.concatenate(depth_list) if depth_list else np.zeros(0)
         cell = np.concatenate(cell_list) if cell_list else np.zeros(0, dtype=int)
@@ -1535,30 +1937,30 @@ class Paleodetector:
         order = np.argsort(depth, kind='stable')
         return {
             'depth_mwe': depth[order], 'cell': cell[order], 'primary_cell': prim[order],
-            'weight': 1.0 / total_simulated_particles,
+            'primary_bins': primary_bins_gev, 'weight': 1.0 / total_simulated_particles,
             'target_mwe': geo["target_length_m"] * rho, 'missing': missing,
         }
 
 
-    def _stdrock_neutron_offset_matrix(self, energy_bins_gev, delta_mwe, n_offsets,
-                                       total_simulated_particles=1e4):
-        """Neutrons produced by a neutron, by distance travelled and energy.
+    def _stdrock_offset_matrix(self, product, energy_bins_gev, delta_mwe, n_offsets,
+                               total_simulated_particles=1e4):
+        """Particles of type `product` produced by a `product` primary, by distance travelled and energy.
 
-        From the StdRock neutron runs: C[l, d, m] is the number of neutrons with
-        energy in cell m produced between d * delta and (d + 1) * delta after
-        the entry point, per neutron in energy cell l.
+        From the StdRock/<product> runs: C[l, d, m] is the number of products with energy in cell m produced
+        between d * delta and (d + 1) * delta after the entry point, per primary in energy cell l.
 
         Args:
+            product (str): 'neutron' or 'proton'.
             energy_bins_gev (np.ndarray): Energy cell edges [GeV], shape (M,).
             delta_mwe (float): Offset bin width [m.w.e.].
             n_offsets (int): Number of offset bins.
-            total_simulated_particles (float, optional): Primaries per Geant4
-                run. Defaults to 1e4.
+            total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
 
         Returns:
             np.ndarray: C, shape (M - 1, n_offsets, M - 1).
         """
-        rows = self._load_stdrock_neutron_rows('neutron', energy_bins_gev, total_simulated_particles)
+        rows = self._load_stdrock_rows(product, product, energy_bins_gev, total_simulated_particles,
+                                       primary_bins_gev=energy_bins_gev)
         n_e = len(energy_bins_gev) - 1
         d = np.floor(rows['depth_mwe'] / delta_mwe).astype(int)
         ok = d < n_offsets
@@ -1567,76 +1969,77 @@ class Paleodetector:
         return C.reshape(n_e, n_offsets, n_e) * rows['weight']
 
 
-    def _secondary_neutron_yield(self, t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
-                                 total_simulated_particles=1e4,
-                                 species_list=SECONDARY_NEUTRON_SOURCES, n_energy_sub=50):
-        """Secondary neutrons born in a window above the sample, per direction.
+    def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
+                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES, n_energy_sub=50,
+                         product='neutron'):
+        """Secondary particles (neutrons or protons) born in a window above the sample, per direction.
 
-        For each time t and direction c, the path to the sample has slant depth
-        S = X(t) / c. The window [S - W, S] along the path is split into
-        SECONDARY_WINDOW_BINS bins of width delta = W / SECONDARY_WINDOW_BINS.
+        For each time t and direction c, the path to the sample has slant depth S = X(t) / c. The window
+        [S - W, S] along the path (W from _secondary_window_mwe(product)) is split into SECONDARY_WINDOW_BINS bins
+        of width delta = W / SECONDARY_WINDOW_BINS.
 
-        Source: neutrons produced in the window by the primaries, from the
-        StdRock runs at their actual slant depth (so the transport of the
-        primary down to the window is included), weighted by the primary
-        intensity integrated over each energy cell:
+        Source: products made in the window by the primaries, from the StdRock runs at their actual slant depth
+        (so the transport of the primary down to the window is included), weighted by the primary intensity
+        integrated over each energy cell of the primary's StdRock grid:
 
-            A_b,m = sum_s sum_i Phi_s,i(t) * (StdRock/<species> neutrons of cell m in bin b per primary of cell i)
+            A_b,m = sum_s sum_i Phi_s,i(t) * (StdRock/<s> products of cell m in bin b per primary of cell i)
 
-        Generations inside the window use the StdRock neutron runs (offset
-        matrix C_n). Neutrons are born uniformly within their bin, so a
-        production at offset bin d is shared between bins b' + d and b' + d + 1:
+        Generations inside the window use the StdRock/<product> runs (offset matrix C). Products are born uniformly
+        within their bin, so a production at offset bin d is shared between bins b' + d and b' + d + 1:
 
-            Y_b (I - C_n[0] / 2) = A_b + sum_{b' < b} Y_b' (C_n[b - b' - 1] + C_n[b - b']) / 2
+            Y_b (I - C[0] / 2) = A_b + sum_{b' < b} Y_b' (C[b - b' - 1] + C[b - b']) / 2
 
-        Secondary neutrons are assumed to keep the direction of the primary.
+        Secondaries are assumed to keep the direction of the primary. Sources without StdRock runs are skipped.
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             depth_mwe_array (np.ndarray): Overburden [m.w.e.], shape (T,).
             c_vals (np.ndarray): cos(zenith) grid, shape (N_C,).
-            energy_bins_gev (np.ndarray): Energy cell edges [GeV], shape (M,).
-            total_simulated_particles (float, optional): Primaries per Geant4
-                run. Defaults to 1e4.
-            species_list (tuple[str], optional): Primary species producing
-                neutrons. Defaults to SECONDARY_NEUTRON_SOURCES.
-            n_energy_sub (int, optional): Points per energy cell for the flux
-                integration. Defaults to 50.
+            energy_bins_gev (np.ndarray): Energy cell edges of the products [GeV], shape (M,).
+            total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
+            species_list (tuple[str], optional): Primary species producing the secondaries.
+                Defaults to SECONDARY_SOURCES.
+            n_energy_sub (int, optional): Points per energy cell for the flux integration. Defaults to 50.
+            product (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
             tuple[np.ndarray, float]:
-                Y: neutrons born in each window bin and energy cell
+                Y: products born in each window bin and energy cell
                     [cm^-2 s^-1 sr^-1], shape (T, N_C, SECONDARY_WINDOW_BINS, M - 1).
                 delta: window bin width along the path [m.w.e.].
         """
         energy_bins_gev = np.asarray(energy_bins_gev, dtype=float)
         n_t, n_c, n_e = len(t_kyr_array), len(c_vals), len(energy_bins_gev) - 1
         n_b = SECONDARY_WINDOW_BINS
-        window = self._secondary_window_mwe()
+        window = self._secondary_window_mwe(product)
         delta = window / n_b
 
-        # primary intensity integrated over each energy cell [cm^-2 s^-1 sr^-1]
         t_kyr_flux_array = self._flux_time_kyr(np.asarray(t_kyr_array, dtype=float))
         sub = np.linspace(0.0, 1.0, n_energy_sub)
-        e_lo, e_hi = energy_bins_gev[:-1], energy_bins_gev[1:]
-        e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * sub[None, :]
-        step = (e_hi - e_lo) / (n_energy_sub - 1)
-
         slant = depth_mwe_array[:, None] / c_vals[None, :]               # (T, N_C) path to the sample
         window_top = slant - window
 
         A = np.zeros((n_t, n_c, n_b, n_e))
         for species in species_list:
-            rows = self._load_stdrock_neutron_rows(species, energy_bins_gev, total_simulated_particles)
+            if self._stdrock_dir(species) is None:
+                if self.verbose > 1:
+                    print(f"No StdRock runs for {species}: no secondary {product}s from it.")
+                continue
+            rows = self._load_stdrock_rows(species, product, energy_bins_gev, total_simulated_particles)
             if rows['missing'] and self.verbose > 0:
                 print(f"Warning: StdRock/{species}: no file for {len(rows['missing'])} primary "
-                      f"energies (e.g. {rows['missing'][:3]} GeV); their neutrons are missing.")
+                      f"energies (e.g. {rows['missing'][:3]} GeV); their {product}s are missing.")
             beyond = slant > TRUNCATION_FRACTION * rows['target_mwe']
             if self.verbose > 0 and np.any(beyond[:, -1]):
                 print(f"Warning: vertical overburden beyond the StdRock/{species} target "
-                      f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondary neutrons "
+                      f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondary {product}s "
                       "from that species are missing there; use a longer StdRock target.")
 
+            # primary intensity integrated over each primary energy cell [cm^-2 s^-1 sr^-1]
+            pb = rows['primary_bins']
+            e_lo, e_hi = pb[:-1], pb[1:]
+            e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * sub[None, :]
+            step = (e_hi - e_lo) / (n_energy_sub - 1)
             phi = self.flux_history.get_map(species, t_kyr_flux_array, e_sub)[2].reshape(
                 n_t, *e_sub.shape
             )
@@ -1657,17 +2060,15 @@ class Paleodetector:
                     ).reshape(n_b, n_e)
 
         # generations inside the window
-        C_n = self._stdrock_neutron_offset_matrix(
-            energy_bins_gev, delta, n_b + 1, total_simulated_particles
-        )
-        half_same_bin = 0.5 * C_n[:, 0, :]
+        C = self._stdrock_offset_matrix(product, energy_bins_gev, delta, n_b + 1, total_simulated_particles)
+        half_same_bin = 0.5 * C[:, 0, :]
         if np.max(np.abs(np.linalg.eigvals(half_same_bin))) < 1.0:
             same_bin_inv = np.linalg.inv(np.eye(n_e) - half_same_bin)
         else:
             if self.verbose > 0:
-                print("Warning: same-bin neutron multiplication >= 1; ignoring it.")
+                print(f"Warning: same-bin {product} multiplication >= 1; ignoring it.")
             same_bin_inv = np.eye(n_e)
-        transfer = [None] + [0.5 * (C_n[:, k - 1, :] + C_n[:, k, :]) for k in range(1, n_b + 1)]
+        transfer = [None] + [0.5 * (C[:, k - 1, :] + C[:, k, :]) for k in range(1, n_b + 1)]
 
         A = A.reshape(n_t * n_c, n_b, n_e)
         Y = np.zeros_like(A)
@@ -1685,7 +2086,7 @@ class Paleodetector:
 
         Args:
             energy_names_gev (array_like): Energies [GeV] of the files to scan.
-            species (str, optional): 'mu-', 'mu+' or 'neutron'. Defaults to 'mu-'.
+            species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
 
         Returns:
             list[str]: Sorted fragment keys (see normalize_fragment_name).
@@ -1731,7 +2132,7 @@ class Paleodetector:
                 Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
-            species (str, optional): 'mu-', 'mu+' or 'neutron'. Defaults to 'mu-'.
+            species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
 
         Returns:
             dict: 't_kyr' (T,), 'depth_mwe' (T,), 'Er_bins' (recoil energy edges
@@ -1745,8 +2146,7 @@ class Paleodetector:
 
         if self.flux_history is None:
             raise ValueError(
-                "flux_history not initialized. Call integrate_particle_signal_spectrum "
-                "(or integrate_all_particles) first, or use set_flux_history()."
+                "flux_history not initialized: use set_flux_history() or an integrate_* function."
             )
         if not self._depth_interpolators.get(species):
             raise ValueError(f"Depth interpolators not initialized for species {species}.")
@@ -1807,8 +2207,8 @@ class Paleodetector:
                     )
                     weight_peak_total_t += weight_peak_t
             else:
-                prob_attenuation_grid = self._neutron_depth_probability(
-                    e_vals, z_min_grid, z_max_grid
+                prob_attenuation_grid = self._hadron_depth_probability(
+                    e_vals, z_min_grid, z_max_grid, self._depth_interpolators[species]['table']
                 )
                 integrand = flux_grid_gev_cm2_s_sr * prob_attenuation_grid
                 weight_elastic_t = np.trapezoid(
@@ -1901,23 +2301,23 @@ class Paleodetector:
 
     def _process_secondary_geant4_data(
         self, t_kyr_array, energy_bins_gev=None,
-        total_simulated_particles=1e4, secondary_neutrons_species=SECONDARY_NEUTRON_SOURCES,
+        total_simulated_particles=1e4, secondary_sources=SECONDARY_SOURCES, product='neutron',
     ):
-        """Recoil spectra in the sample slab from secondary neutrons.
+        """Recoil spectra in the sample slab from secondary neutrons or protons.
 
-        Neutrons born in the window above the sample (see
-        _secondary_neutron_yield) travel along the primary's direction to the
-        slab. For a neutron born uniformly in window bin b, at distance
+        Products born in the window above the sample (see _secondary_yield)
+        travel along the primary's direction to the slab. For a product born
+        uniformly in window bin b, at distance
         d in [d0, d0 + delta] from the slab top, the probability of interacting
         in the slab (path tau = t_slab / c) is averaged over the bin exactly:
 
             P_b = [H(d0 + delta + tau) - H(d0 + tau) - H(d0 + delta) + H(d0)] / delta,
 
-        with H(z) = integral_0^z F_n = z - G(z). Then
+        with H(z) = integral_0^z F = z - G(z), F being the product's StdRock depth CDF. Then
 
             w_m(t) = int dc sum_b Y[t, c, b, m] P_b(E_m, c),
 
-        and the recoils per neutron of the mineral run at the lower edge E_m of
+        and the recoils per product of the mineral run at the lower edge E_m of
         each cell are applied with the normalisation of _process_geant4_data.
 
         Args:
@@ -1926,39 +2326,40 @@ class Paleodetector:
                 Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4
                 run. Defaults to 1e4.
-            secondary_neutrons_species (tuple[str], optional): Primary species
-                producing neutrons. Defaults to SECONDARY_NEUTRON_SOURCES.
+            secondary_sources (tuple[str], optional): Primary species producing
+                the secondaries. Defaults to SECONDARY_SOURCES.
+            product (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
             dict: Same structure as _process_geant4_data.
         """
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'secondary_neutron')
+        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, product)
         rho = self.config['density_g_cm3']
 
         target_volume_cm3 = 1.e-3 / rho
         target_thickness_cm = np.power(target_volume_cm3, 1/3)
         target_thickness_mwe = target_thickness_cm * 0.01 * rho
 
-        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], species='neutron')
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, "neutron")
+        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], species=product)
+        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
 
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
         n_t = len(t_kyr_array)
         depth_mwe_array = np.atleast_1d(self._overburden_interpolator(t_kyr_array))
 
         c_vals = np.linspace(0.01, 1.0, 50)
-        Y, delta = self._secondary_neutron_yield(
+        Y, delta = self._secondary_yield(
             t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
-            total_simulated_particles, secondary_neutrons_species,
+            total_simulated_particles, secondary_sources, product=product,
         )
         n_b = Y.shape[2]
         n_e = len(energy_bins_gev) - 1
 
         # bin-averaged slab probability, shape (N_C, n_b, M-1)
         e_cells = energy_bins_gev[:-1]
-        table = self._depth_tables['neutron']
-        q_rows = self._depth_quantiles(e_cells, 'neutron')
-        tails = self._neutron_tail_lambdas(e_cells)
+        table = self._depth_tables[product]
+        q_rows = self._depth_quantiles(e_cells, product)
+        tails = self._hadron_tail_lambdas(e_cells, product)
         d0 = (n_b - 1 - np.arange(n_b)) * delta                       # distance from bin bottom to slab
         tau = target_thickness_mwe / c_vals                              # slab path
         z_d0 = np.broadcast_to(d0[None, :], (len(c_vals), n_b))
@@ -1966,7 +2367,7 @@ class Paleodetector:
         prob = np.empty((len(c_vals), n_b, n_e))
         for m in range(n_e):
             def H(z):
-                """Integral of the neutron depth CDF from 0 to z [m.w.e.]."""
+                """Integral of the product's depth CDF from 0 to z [m.w.e.]."""
                 _, G = _piecewise_cdf_and_integral(z, q_rows[m], table['p'], tails[m])
                 return z - G
             prob[:, :, m] = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau)
@@ -2036,7 +2437,7 @@ class Paleodetector:
             energy_bins_gev (np.ndarray, optional): Energy bin edges [GeV], used to
                 list the fragments. Defaults to None (all the Geant4 files of the species).
             species (str, optional): Species of the Geant4 runs ('mu-', 'mu+',
-                'neutron' or 'secondary_neutron'). Defaults to 'mu-'.
+                'neutron', 'proton', 'secondary_neutron' or 'secondary_proton'). Defaults to 'mu-'.
 
         Returns:
             dict: dR/dx per fragment and 'total' [tracks per mg per kyr per nm],
@@ -2048,7 +2449,7 @@ class Paleodetector:
         er_bins = recoil_data['Er_bins']
         er_mid_mev = er_bins[:-1] + np.diff(er_bins) / 2.0
 
-        tab_species = 'neutron' if species == 'secondary_neutron' else species
+        tab_species = DERIVED_SPECIES.get(species, species)
         all_fragments = self._get_all_fragments(energy_bins_gev[:-1], tab_species)
 
         x_mid_nm = x_bins[:-1] + np.diff(x_bins) / 2.0
@@ -2127,8 +2528,8 @@ class Paleodetector:
                 Defaults to None (all the Geant4 files of the species).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
-            species (str, optional): 'mu-', 'mu+', 'neutron' or
-                'secondary_neutron'. Defaults to 'mu-'.
+            species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
+                'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'.
             nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He, see
                 LIGHT_ION_MAX_Z), 'total' (all fragments), 'all' (dict of every fragment and both sums) or a
                 fragment key. Defaults to 'total_no_light_ions'.
@@ -2139,9 +2540,9 @@ class Paleodetector:
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
-        if species == 'secondary_neutron':
+        if species in DERIVED_SPECIES:
             recoil_data = self._process_secondary_geant4_data(
-                t_kyr_array, energy_bins_gev, total_simulated_particles,
+                t_kyr_array, energy_bins_gev, total_simulated_particles, product=DERIVED_SPECIES[species],
             )
         else:
             recoil_data = self._process_geant4_data(
@@ -2160,8 +2561,9 @@ class Paleodetector:
 
     def integrate_particle_signal_spectrum(
         self, x_bins=None, energy_bins_gev=None,
-        exposure_window_kyr=None, flux_history=None, steps=None, total_simulated_particles=1e4, 
+        exposure_window_kyr=None, total_simulated_particles=1e4, 
         x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus=DEFAULT_TRACK_SUM, e_range=None,
+        annealing=None, annealing_r_min=0.0,
     ):
         """Track counts from one cosmic-ray species over an exposure window.
 
@@ -2177,47 +2579,46 @@ class Paleodetector:
             exposure_window_kyr (float or list[float], optional): Window in local
                 time [kyr]; a single value w means [0, w]. Defaults to None
                 ([0, total_age_kyr]).
-            flux_history (FluxHistory, optional): Replaces the current flux history.
-                Defaults to None (current one, or a baseline history if none).
-            steps (int, optional): Extra uniform time points added to the adaptive grid (_time_grid_kyr).
-                Defaults to None (adaptive grid only).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to
                 TRACK_LENGTH_BINS_NM.
-            species (str, optional): 'mu-', 'mu+', 'neutron' or
-                'secondary_neutron'. Defaults to 'mu-'.
+            species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
+                'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'.
             nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
                 calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
             e_range (tuple[float, float], optional): (E_min, E_max) [GeV]: use only the Geant4 files whose bins
                 lie inside it (see _energy_edges). Ignored if energy_bins_gev is given. Defaults to None (all).
+            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
+                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
+                (proportional shortening, as in fission-track annealing models). A number (same r for every
+                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
+                times, linear in between, constant outside), or a law with a geotherm, e.g.
+                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
+                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
+                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
+                track is followed from its formation to the present through the temperature given by the
+                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
+            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
+                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
 
         Returns:
-            np.ndarray: Tracks per mg in each bin of x_bins.
+            np.ndarray: Tracks per mg in each bin of x_bins (after annealing, if given).
         """
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = (self._energy_edges(species, e_range) if energy_bins_gev is None
                            else np.asarray(energy_bins_gev, dtype=float))
 
-        if flux_history is not None:
-            self.flux_history = flux_history
-        elif self.flux_history is None:
-            self.flux_history = FluxHistory(
-                baseline={"kind": "Baseline"}, template_dir=os.path.join(self.data_path, "flux_data")
-            )
-
-        if exposure_window_kyr is None:
-            exposure_window_kyr = self.total_age_kyr
-        if isinstance(exposure_window_kyr, (int, float)):
-            exposure_window_kyr = [0, exposure_window_kyr]
-
-        t_kyr_array = self._time_grid_kyr(exposure_window_kyr, steps)
+        t_kyr_array = self._window_grid(self._exposure_window(exposure_window_kyr))
 
         dRdx_array = self.calculate_particle_signal_spectrum(
             t_kyr_array, x_bins=x_grid, energy_bins_gev=energy_bins_gev,
             total_simulated_particles=total_simulated_particles,
             species=species, nucleus=nucleus
         )
+        if annealing is not None:
+            r = self._annealing_ratio(t_kyr_array, annealing)
+            dRdx_array = _shorten_tracks(dRdx_array, x_grid, r, annealing_r_min)
 
         total_drdx_g = np.trapezoid(dRdx_array, t_kyr_array, axis=0)
 
@@ -2232,8 +2633,9 @@ class Paleodetector:
 
     def integrate_all_particles(
         self,  x_bins=None, e_range=None,
-        exposure_window_kyr=None, flux_history=None,steps=None, 
-        total_simulated_particles=1e4, species_list=None, nucleus=DEFAULT_TRACK_SUM
+        exposure_window_kyr=None, 
+        total_simulated_particles=1e4, species_list=None, nucleus=DEFAULT_TRACK_SUM,
+        annealing=None, annealing_r_min=0.0, flux_history=None
     ):
         """Track counts from several cosmic-ray species, computed in parallel.
 
@@ -2245,15 +2647,24 @@ class Paleodetector:
                 if a range is outside the available one. Defaults to None (all files for every species).
             exposure_window_kyr (float or list[float], optional): See
                 integrate_particle_signal_spectrum. Defaults to None.
-            flux_history (FluxHistory, optional): See
-                integrate_particle_signal_spectrum. Defaults to None.
-            steps (int, optional): See integrate_particle_signal_spectrum.
-                Defaults to None.
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species_list (tuple[str], optional): Species to compute. Defaults to None (available_species()).
             nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
                 calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
+            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
+                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
+                (proportional shortening, as in fission-track annealing models). A number (same r for every
+                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
+                times, linear in between, constant outside), or a law with a geotherm, e.g.
+                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
+                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
+                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
+                track is followed from its formation to the present through the temperature given by the
+                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
+            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
+                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
+            flux_history (FluxHistory, optional): Flux history to set for the integration. Defaults to None
 
         Returns:
             tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each
@@ -2262,6 +2673,8 @@ class Paleodetector:
         Raises:
             ValueError: If a species has no runs, or e_range names a species not computed or an invalid range.
         """
+        self.set_flux_history(flux_history)
+
         x_bins = _resolve_x_bins(x_bins)
         species_list = self.available_species() if species_list is None else list(species_list)
         e_range = dict(e_range or {})
@@ -2269,12 +2682,17 @@ class Paleodetector:
         if unknown:
             raise ValueError(f"e_range given for species not computed: {sorted(unknown)} "
                              f"(computed: {species_list}).")
-        edges = {s: self._energy_edges(s, e_range.get(s)) for s in species_list}   # validates before the pool
+        edges = {s: self._energy_edges(s, e_range.get(s)) for s in species_list}
+
+        # caches shared by every species, built before the workers start so that they inherit them
+        if isinstance(annealing, dict):
+            self._annealing_ratio(self._master_time_grid(), annealing)
 
         shared_kwargs = dict(
             x_bins=x_bins,
-            exposure_window_kyr=exposure_window_kyr, flux_history=flux_history, steps=steps, 
-            total_simulated_particles=total_simulated_particles, nucleus=nucleus
+            exposure_window_kyr=exposure_window_kyr,
+            total_simulated_particles=total_simulated_particles, nucleus=nucleus,
+            annealing=annealing, annealing_r_min=annealing_r_min,
         )
 
         tasks = [(self, dict(shared_kwargs, species=s, energy_bins_gev=edges[s])) for s in species_list]
