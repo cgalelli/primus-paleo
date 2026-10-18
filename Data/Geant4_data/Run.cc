@@ -9,6 +9,7 @@
 #include "EventAction.hh"
 #include "StackingAction.hh"
 #include "SteppingAction.hh"
+#include "G4DataPaths.hh"
 
 // --- Headers required for dE/dx extraction ---
 #include "G4EmCalculator.hh"
@@ -63,6 +64,9 @@ void ExportStoppingPowerTable(const G4String& mineralName, int Z, int A, const G
 
 
 int main(int argc, char** argv) {
+
+   SetDefaultG4DataPaths();
+
     if (argc < 2) {
         G4cout << "Usage for simulation: " << argv[0] << " <macro_file>" << G4endl;
         G4cout << "Usage for dedx export: " << argv[0] << " --export-dedx <mineral> <Z> <A> <outDir> [materials.mac]" << G4endl;

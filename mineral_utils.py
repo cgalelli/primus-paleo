@@ -133,6 +133,22 @@ DERIVED_SPECIES = {'secondary_neutron': 'neutron', 'secondary_proton': 'proton'}
 SECONDARY_SOURCES = ('mu-', 'mu+', 'neutron', 'proton')
 IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E) is reported as a gap
 
+# Atmospheric neutrinos (integrate_atmospheric_neutrinos). Folders Data/Geant4_data/<mineral>/<species>, named as the
+# MCEQ_SPECIES keys (Geant4 gun names: nu_mu, anti_nu_mu, nu_e, anti_nu_e), with biased cross-sections.
+NEUTRINO_SPECIES = ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar')
+# Particles produced by the neutrinos (written by the neutrino runs) that are followed to their own recoils, with the
+# mineral runs of the same particle; the neutrons and protons they produce in turn are followed too (generations).
+NEUTRINO_PRODUCTS = ('mu-', 'mu+', 'neutron', 'proton')
+NEUTRINO_SECONDARY_PREFIX = 'nu_secondary_'
+# The flux templates give the flux crossing a horizontal plane from above, Phi = integral I cos(theta) dOmega over the
+# upper hemisphere (= pi I for an isotropic intensity I). Neutrinos reach a buried sample from every direction, through
+# the Earth too, and the interaction rate per unit volume is integral I dOmega over 4 pi = 4 pi I = 4 Phi. Exact for an
+# isotropic, up-down symmetric flux; it ignores the oscillation of up-going nu_mu (a few tens of % below ~10 GeV) and
+# the horizontal enhancement of the flux above a few GeV.
+NEUTRINO_SOLID_ANGLE_FACTOR = 4.0
+NEUTRINO_MAX_INTERACTION_FRACTION = 0.1   # biased interactions per primary above this are reported (linear regime)
+NEUTRINO_MAX_GENERATIONS = 50             # cap on the product generations if the series does not converge
+
 DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 200)
 
 
@@ -809,6 +825,7 @@ class Paleodetector:
         for species, info in self._geant4_runs.items():
             e = info['edges']
             note = ("" if species in self._depth_interpolators else
+                    "  (integrate_atmospheric_neutrinos)" if species in NEUTRINO_SPECIES else
                     "  (no StdRock depth table: not computable)" if species in COMPUTABLE_SPECIES else
                     "  (runs found, calculation not implemented yet)")
             lines.append(f"  {species:<10} energy from {e[0]:.4g} to {e[-2]:.4g} GeV in {info['n_files']} steps{note}")
@@ -1584,7 +1601,8 @@ class Paleodetector:
 
         Returns:
             dict: 'depth_reference_z_m' (z of the target top face [m]),
-            'target_length_m' [m] and 'density_g_cm3' (None if unknown).
+            'target_length_m' [m], 'density_g_cm3' (None if unknown) and 'neutrino_bias' (neutrino runs only: the
+            cross-section bias factor, a number or {"<E0 as %.6f>": factor}; None if not written).
         """
         if data_dir in self._geometry_cache:
             return self._geometry_cache[data_dir]
@@ -1593,6 +1611,7 @@ class Paleodetector:
             "depth_reference_z_m": 100.,
             "target_length_m": 2.0 * 100.,
             "density_g_cm3": 2.65,
+            "neutrino_bias": None,
         }
         meta_path = os.path.join(data_dir, "geometry.json")
         if os.path.exists(meta_path):
@@ -1602,6 +1621,7 @@ class Paleodetector:
             geo["target_length_m"] = float(meta.get("target_length_m", 2.0 * geo["depth_reference_z_m"]))
             if meta.get("density_g_cm3") is not None:
                 geo["density_g_cm3"] = float(meta["density_g_cm3"])
+            geo["neutrino_bias"] = meta.get("neutrino_bias")
 
         self._geometry_cache[data_dir] = geo
         return geo
@@ -2422,7 +2442,8 @@ class Paleodetector:
         }
 
 
-    def _convert_recoil_to_track_spectrum(self, recoil_data, x_bins=None, energy_bins_gev=None, species='mu-'):
+    def _convert_recoil_to_track_spectrum(self, recoil_data, x_bins=None, energy_bins_gev=None, species='mu-',
+                                          fragments=None):
         """Converts recoil-energy spectra into track-length spectra.
 
         For each fragment, dR/dx = dR/dEr(E(x)) * dE/dx(x), where E(x) inverts the
@@ -2438,19 +2459,24 @@ class Paleodetector:
                 list the fragments. Defaults to None (all the Geant4 files of the species).
             species (str, optional): Species of the Geant4 runs ('mu-', 'mu+',
                 'neutron', 'proton', 'secondary_neutron' or 'secondary_proton'). Defaults to 'mu-'.
+            fragments (list[str], optional): Fragments to convert. Defaults to None (those found in the Geant4 files
+                of the species; energy_bins_gev and species are then used only for this).
 
         Returns:
             dict: dR/dx per fragment and 'total' [tracks per mg per kyr per nm],
             shape (T, n_x), or (n_x,) if the input was 1-D.
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
         er_bins = recoil_data['Er_bins']
         er_mid_mev = er_bins[:-1] + np.diff(er_bins) / 2.0
 
-        tab_species = DERIVED_SPECIES.get(species, species)
-        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], tab_species)
+        if fragments is None:
+            energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
+            tab_species = DERIVED_SPECIES.get(species, species)
+            all_fragments = self._get_all_fragments(energy_bins_gev[:-1], tab_species)
+        else:
+            all_fragments = sorted(fragments)
 
         x_mid_nm = x_bins[:-1] + np.diff(x_bins) / 2.0
 
@@ -2616,6 +2642,27 @@ class Paleodetector:
             total_simulated_particles=total_simulated_particles,
             species=species, nucleus=nucleus
         )
+        return self._integrate_rate_over_window(dRdx_array, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
+
+
+    def _integrate_rate_over_window(self, dRdx_array, t_kyr_array, x_bins, x_grid, annealing=None,
+                                    annealing_r_min=0.0):
+        """Tracks accumulated over a window from a time-dependent rate, rebinned to the output bins.
+
+        Shared by integrate_particle_signal_spectrum and integrate_atmospheric_neutrinos. The tracks formed at
+        each time are shortened by annealing (if given), the rate is integrated over time with the trapezoidal
+        rule, and the fine-grid spectrum is rebinned to x_bins through its cumulative distribution.
+
+        Args:
+            dRdx_array (np.ndarray): Rate [tracks per mg per kyr per nm] on x_grid, shape (T, len(x_grid) - 1).
+            t_kyr_array (np.ndarray): Times of the rows [kyr], shape (T,).
+            x_bins (np.ndarray): Output track-length bin edges [nm].
+            x_grid (np.ndarray): Fine track-length grid [nm].
+            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
+
+        Returns:
+            np.ndarray: Tracks per mg in each bin of x_bins.
+        """
         if annealing is not None:
             r = self._annealing_ratio(t_kyr_array, annealing)
             dRdx_array = _shorten_tracks(dRdx_array, x_grid, r, annealing_r_min)
@@ -2626,9 +2673,7 @@ class Paleodetector:
         cumulative_counts = np.concatenate(([0], np.cumsum(total_drdx_g * internal_bin_widths)))
         cdf_interp = interp1d(x_grid, cumulative_counts, kind='linear', bounds_error=False,
                             fill_value=(0, cumulative_counts[-1]))
-        total_tracks = cdf_interp(x_bins[1:]) - cdf_interp(x_bins[:-1])
-
-        return total_tracks
+        return cdf_interp(x_bins[1:]) - cdf_interp(x_bins[:-1])
 
 
     def integrate_all_particles(
@@ -2704,6 +2749,355 @@ class Paleodetector:
         total_tracks_by_species['total'] = sum(total_tracks_by_species.values())
 
         return x_bins, total_tracks_by_species
+
+
+    # ------------------------------------------------------------------------------------------------------------
+    # Atmospheric neutrinos
+    # ------------------------------------------------------------------------------------------------------------
+
+    def available_neutrino_species(self):
+        """Neutrino species with mineral runs, i.e. those integrate_atmospheric_neutrinos can compute.
+
+        Returns:
+            list[str]: Entries of NEUTRINO_SPECIES found by _scan_geant4_species.
+        """
+        return [s for s in NEUTRINO_SPECIES if s in self.energy_bins]
+
+
+    def _neutrino_bias(self, species, e0_gev, neutrino_bias=None):
+        """Cross-section bias factor of the neutrino run of `species` at primary energy e0_gev.
+
+        The neutrino runs are made with the neutrino cross-sections multiplied by this factor inside the target
+        (PhysicsList: SetNuNucleusBias / SetNuEleCcBias / SetNuEleNcBias, all equal), so their yields per primary are
+        divided by it.
+
+        Args:
+            species (str): Neutrino species (NEUTRINO_SPECIES).
+            e0_gev (float): Primary energy of the run [GeV] (lower edge of its energy cell, as in the file name).
+            neutrino_bias (float, dict, callable or None, optional): A number (every run), {species: number}, a
+                function f(species, e0_gev) -> number, or None: read from the run folder's geometry.json, key
+                "neutrino_bias", either a number or {"<E0 as %.6f>": number} (one per run). Defaults to None.
+
+        Returns:
+            float: Bias factor (> 0).
+
+        Raises:
+            ValueError: If no bias is found, or it is not positive.
+        """
+        if callable(neutrino_bias):
+            value = neutrino_bias(species, e0_gev)
+        elif isinstance(neutrino_bias, dict):
+            if species not in neutrino_bias:
+                raise ValueError(f"neutrino_bias has no entry for {species} (keys: {sorted(neutrino_bias)}).")
+            value = neutrino_bias[species]
+        elif neutrino_bias is not None:
+            value = neutrino_bias
+        else:
+            data_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
+            value = self._geant4_geometry(data_dir)["neutrino_bias"]
+            if isinstance(value, dict):
+                value = value.get(f"{e0_gev:.6f}")
+            if value is None:
+                raise ValueError(f"No bias for the {species} run at {e0_gev:g} GeV: pass neutrino_bias, or write "
+                                 f"\"neutrino_bias\" in {os.path.join(data_dir, 'geometry.json')}.")
+        value = float(value)
+        if not value > 0.0:
+            raise ValueError(f"Bias of the {species} run at {e0_gev:g} GeV must be > 0, got {value}.")
+        return value
+
+
+    def _flux_cell_integral(self, species, t_kyr_array, edges_gev, n_energy_sub=50):
+        """Flux of a species integrated over each energy cell, at local times.
+
+        Purpose: the Geant4 run at the lower edge of a cell stands for every primary in the cell, so each run is
+        weighted by the flux integrated over its cell (trapezoid on n_energy_sub linear points per cell).
+
+        Args:
+            species (str): Flux species (MCEQ_SPECIES key).
+            t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
+            edges_gev (np.ndarray): Cell edges [GeV], shape (M,).
+            n_energy_sub (int, optional): Points per cell. Defaults to 50.
+
+        Returns:
+            np.ndarray: Integrated flux [cm^-2 s^-1] (crossing a horizontal plane, see NEUTRINO_SOLID_ANGLE_FACTOR),
+            shape (T, M - 1).
+        """
+        t_flux = self._flux_time_kyr(np.atleast_1d(np.asarray(t_kyr_array, dtype=float)))
+        edges_gev = np.asarray(edges_gev, dtype=float)
+        e_lo, e_hi = edges_gev[:-1], edges_gev[1:]
+        e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * np.linspace(0.0, 1.0, n_energy_sub)[None, :]
+        phi = self.flux_history.get_map(species, t_flux, e_sub)[2].reshape(t_flux.size, *e_sub.shape)
+        step = (e_hi - e_lo) / (n_energy_sub - 1)
+        return (phi.sum(axis=-1) - 0.5 * (phi[..., 0] + phi[..., -1])) * step[None, :]
+
+
+    def _read_recoils_and_products(self, filepath, product_edges):
+        """Reads one mineral run file: recoils, produced particles by energy cell, and interaction vertices.
+
+        Purpose: a neutrino run gives both the recoils made by the neutrino and the particles it produces (muons,
+        neutrons, protons) that are followed separately; a product run (mu-, mu+, neutron, proton in the mineral)
+        gives the recoils of that particle and the next generation of neutrons and protons. Both are read here.
+
+        Columns used: 0 name, 2 kinetic energy of the recorded particle [MeV], 3 z of the vertex [mm], 4 primary
+        energy before the step [MeV]. A vertex is a distinct (z, primary energy) pair.
+
+        Args:
+            filepath (str): outNuclei_<E>.txt file (missing or empty: everything zero).
+            product_edges (dict): {product: energy cell edges [GeV]} of the particles to collect.
+
+        Returns:
+            dict: 'recoils' {fragment: counts per RECOIL_ENERGY_BINS_MEV bin} (neutrons and non-nuclei left out),
+            'products' {product: counts per cell}, 'below' and 'above' {product: counts outside the cells},
+            'n_vertices' (int).
+        """
+        out = {
+            'recoils': {},
+            'products': {p: np.zeros(len(e) - 1) for p, e in product_edges.items()},
+            'below': dict.fromkeys(product_edges, 0), 'above': dict.fromkeys(product_edges, 0),
+            'n_vertices': 0,
+        }
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return out
+        try:
+            df = pd.read_csv(filepath, sep=r'\s+', header=None, usecols=[0, 2, 3, 4],
+                             names=['name', 'rec_e', 'z_mm', 'pre_e'],
+                             dtype={'name': str, 'rec_e': float, 'z_mm': float, 'pre_e': float})
+        except pd.errors.EmptyDataError:
+            return out
+        raw = df['name'].values.astype(str)
+        names = normalize_fragment_names(raw)
+        rec = df['rec_e'].values
+        for frag in np.unique(names):
+            if frag in ('', 'neutron'):
+                continue
+            out['recoils'][frag] = np.histogram(rec[names == frag], bins=RECOIL_ENERGY_BINS_MEV)[0].astype(float)
+        for p, edges in product_edges.items():
+            cell = np.searchsorted(edges, rec[raw == p] * 1e-3, side='right') - 1
+            inside = (cell >= 0) & (cell < len(edges) - 1)
+            out['products'][p] = np.bincount(cell[inside], minlength=len(edges) - 1).astype(float)
+            out['below'][p] = int(np.sum(cell < 0))
+            out['above'][p] = int(np.sum(cell >= len(edges) - 1))
+        out['n_vertices'] = int(np.unique(np.stack([df['z_mm'].values, df['pre_e'].values], axis=1), axis=0).shape[0])
+        return out
+
+
+    def _neutrino_product_operator(self, product_edges, total_simulated_particles=1e4):
+        """Recoils and next generation of every produced particle, per particle, from its mineral runs.
+
+        Purpose: the particles produced by the neutrinos (and their own products) are followed with the mineral
+        runs of the same particle. For product p in energy cell m, the run of p at the cell's lower edge gives, per
+        primary, the recoils R[p][fragment][m] and the products of the next generation G[(p, m), (q, n)]. The
+        products are indexed on one flat axis: product p occupies offsets[p].
+
+        Args:
+            product_edges (dict): {product: energy cell edges [GeV]} (the mineral run grid of each product).
+            total_simulated_particles (float, optional): Primaries per product run. Defaults to 1e4.
+
+        Returns:
+            tuple[dict, dict, np.ndarray, dict]: offsets {product: slice}, R {product: {fragment: array (cells,
+            recoil bins)}}, G (K, K) with K the total number of cells, and outside {product: [below, above]} (next
+            generation particles outside the cells, per primary, summed over the runs).
+        """
+        offsets, k = {}, 0
+        for p, edges in product_edges.items():
+            offsets[p] = slice(k, k + len(edges) - 1)
+            k += len(edges) - 1
+        G = np.zeros((k, k))
+        R = {p: {} for p in product_edges}
+        outside = {p: [0.0, 0.0] for p in product_edges}
+        for p, edges in product_edges.items():
+            run_dir = os.path.join(self.data_path, "Geant4_data", self.name, p)
+            n_cells = len(edges) - 1
+            for m in range(n_cells):
+                run = self._read_recoils_and_products(os.path.join(run_dir, f"outNuclei_{edges[m]:.6f}.txt"),
+                                                      product_edges)
+                for frag, counts in run['recoils'].items():
+                    R[p].setdefault(frag, np.zeros((n_cells, counts.size)))[m] = counts / total_simulated_particles
+                for q in product_edges:
+                    G[offsets[p].start + m, offsets[q]] = run['products'][q] / total_simulated_particles
+                    outside[q][0] += run['below'][q] / total_simulated_particles
+                    outside[q][1] += run['above'][q] / total_simulated_particles
+        return offsets, R, G, outside
+
+
+    def integrate_atmospheric_neutrinos(
+        self, x_bins=None, e_range=None, exposure_window_kyr=None,
+        total_simulated_particles=1e4, neutrino_bias=None, species_list=None,
+        secondaries=True, product_simulated_particles=None, nucleus=DEFAULT_TRACK_SUM,
+        annealing=None, annealing_r_min=0.0, x_grid=TRACK_LENGTH_BINS_NM,
+        solid_angle_factor=NEUTRINO_SOLID_ANGLE_FACTOR, flux_history=None,
+    ):
+        """Track counts from atmospheric neutrinos: their own interactions in the sample and those of the
+        particles they produce in the surrounding rock.
+
+        Differences from integrate_all_particles:
+
+        * No overburden. Neutrinos are not attenuated by any realistic overburden, so the depth tables and the
+          overburden history play no role; the rate changes in time only through the flux history (and annealing).
+        * All directions. The sample sees neutrinos from the whole sphere, through the Earth too: the rate per unit
+          volume is solid_angle_factor times the template flux (see NEUTRINO_SOLID_ANGLE_FACTOR).
+        * Biased runs. The interaction probability per primary is uniform along the target (no depletion while the
+          biased probability is small), so a run of length L gives the recoils per neutrino per unit path:
+              recoils per primary / (bias * L).
+          Rate of a fragment per gram:  solid_angle_factor * sum_i Phi_i(t) * counts_i / (N * bias_i * L * rho),
+          with Phi_i the flux integrated over the energy cell of run i.
+
+        Secondaries ('nu_secondary_<product>', if secondaries=True). The muons, neutrons and protons written by the
+        neutrino runs are followed with the mineral runs of the same particle (energy cell lower edge, as in
+        _process_secondary_geant4_data), and the neutrons and protons those produce in turn too (all generations,
+        cross-generations included: products = S0 (I - G)^-1, see _neutrino_product_operator). The surrounding
+        rock is taken to be the mineral itself and much thicker than the products' ranges; then, for a source
+        uniform in space, every product makes all its recoils in rock like the sample and the recoil rate per gram
+        equals (products made per gram) x (recoils per product over its whole path) -- again no overburden or
+        geometry. This holds for neutrons and protons (ranges below ~1 m.w.e.) and for muons whose range is
+        smaller than the rock around the sample; within a muon range of the surface the down-going contribution
+        is overestimated (up to 2x), but there the cosmic-ray muons dominate by far. Recoils of products with
+        energies outside the product run grid are missing (reported).
+
+        Args:
+            x_bins (np.ndarray, optional): Output track-length bin edges [nm]. Defaults to None
+                (DEFAULT_INTEGRATION_X_BINS_NM).
+            e_range (dict, optional): {neutrino species: (E_min, E_max) [GeV]} restricting the runs used (see
+                _energy_edges). Defaults to None (all runs).
+            exposure_window_kyr (float or list[float], optional): See integrate_particle_signal_spectrum.
+                Defaults to None (whole age).
+            total_simulated_particles (float, optional): Primaries per neutrino run. Defaults to 1e4.
+            neutrino_bias (float, dict, callable or None, optional): Cross-section bias of the neutrino runs: a
+                number, {species: number}, f(species, E0_gev) -> number, or None to read "neutrino_bias" from each
+                run folder's geometry.json (see _neutrino_bias). Defaults to None.
+            species_list (tuple[str], optional): Neutrino species. Defaults to None (available_neutrino_species()).
+            secondaries (bool, optional): Also compute the products' recoils. Defaults to True.
+            product_simulated_particles (float, optional): Primaries per product run (mu-, mu+, neutron, proton in
+                the mineral). Defaults to None (total_simulated_particles).
+            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key. Defaults to
+                'total_no_light_ions'.
+            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
+            x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to TRACK_LENGTH_BINS_NM.
+            solid_angle_factor (float, optional): Rate per unit volume / template flux. Defaults to
+                NEUTRINO_SOLID_ANGLE_FACTOR (4: isotropic, from all directions).
+            flux_history (FluxHistory, optional): If given, set with set_flux_history before the integration;
+                None keeps the current one. Defaults to None.
+
+        Returns:
+            tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each neutrino species, each
+            'nu_secondary_<product>' (summed over the neutrino species) and 'total'.
+
+        Raises:
+            ValueError: If a species has no runs, e_range is invalid, or a run has no bias.
+        """
+        if flux_history is not None:
+            self.set_flux_history(flux_history)
+        x_bins = _resolve_x_bins(x_bins)
+        species_list = self.available_neutrino_species() if species_list is None else list(species_list)
+        bad = [s for s in species_list if s not in NEUTRINO_SPECIES]
+        if bad:
+            raise ValueError(f"Not neutrino species: {bad} (use {NEUTRINO_SPECIES}).")
+        if not species_list:
+            raise ValueError(f"No neutrino runs for {self.name} in "
+                             f"{os.path.join(self.data_path, 'Geant4_data', self.name)}/<{'|'.join(NEUTRINO_SPECIES)}>.")
+        e_range = dict(e_range or {})
+        unknown = set(e_range) - set(species_list)
+        if unknown:
+            raise ValueError(f"e_range given for species not computed: {sorted(unknown)} (computed: {species_list}).")
+        n_prod_sim = total_simulated_particles if product_simulated_particles is None else product_simulated_particles
+
+        rho = self.config['density_g_cm3']
+        t_kyr = self._window_grid(self._exposure_window(exposure_window_kyr))
+        n_t, n_r = t_kyr.size, len(RECOIL_ENERGY_BINS_MEV) - 1
+
+        products = [p for p in NEUTRINO_PRODUCTS if p in self.energy_bins] if secondaries else []
+        if secondaries and self.verbose > 0 and len(products) < len(NEUTRINO_PRODUCTS):
+            print(f"Warning: no mineral runs for {sorted(set(NEUTRINO_PRODUCTS) - set(products))}: "
+                  "the neutrino products of that type are not followed.")
+        product_edges = {p: self.energy_bins[p] for p in products}
+        n_cells_total = sum(len(e) - 1 for e in product_edges.values())
+
+        # --- neutrino runs: recoils of the neutrinos and first products ---
+        recoils = {}                                            # species -> {fragment: (T, n_r)} [per g per s]
+        S0 = np.zeros((n_t, n_cells_total))                     # first products [per g per s]
+        lost = {p: [0.0, 0.0] for p in products}                # products outside the cells [per g per s]
+        report = []
+        for s in species_list:
+            edges = self._energy_edges(s, e_range.get(s))
+            run_dir = os.path.join(self.data_path, "Geant4_data", self.name, s)
+            length_cm = self._geant4_geometry(run_dir)["target_length_m"] * 100.0
+            phi_cell = self._flux_cell_integral(s, t_kyr, edges)          # (T, n_cells)
+            if self.verbose > 0 and not np.any(phi_cell > 0):
+                print(f"Warning: the flux history has no {s} flux (templates built without neutrinos?): "
+                      f"{s} gives zero.")
+            spec, biases, fractions = {}, [], []
+            for i, e0 in enumerate(edges[:-1]):
+                bias = self._neutrino_bias(s, e0, neutrino_bias)
+                run = self._read_recoils_and_products(os.path.join(run_dir, f"outNuclei_{e0:.6f}.txt"), product_edges)
+                w = solid_angle_factor * phi_cell[:, i] / (total_simulated_particles * bias * length_cm * rho)
+                for frag, counts in run['recoils'].items():
+                    spec.setdefault(frag, np.zeros((n_t, n_r)))
+                    spec[frag] += np.outer(w, counts)
+                col = 0
+                for p in products:
+                    n_p = len(product_edges[p]) - 1
+                    S0[:, col:col + n_p] += np.outer(w, run['products'][p])
+                    lost[p][0] += float(np.mean(w)) * run['below'][p]
+                    lost[p][1] += float(np.mean(w)) * run['above'][p]
+                    col += n_p
+                biases.append(bias)
+                fractions.append(run['n_vertices'] / total_simulated_particles)
+            recoils[s] = spec
+            report.append((s, len(edges) - 1, min(biases), max(biases), max(fractions)))
+
+        if self.verbose > 0:
+            for s, n, b_lo, b_hi, f_max in report:
+                bias_txt = f"{b_lo:.3g}" if b_lo == b_hi else f"{b_lo:.3g}-{b_hi:.3g}"
+                print(f"Neutrinos {s}: {n} runs, bias {bias_txt}, biased interactions per primary up to {f_max:.3g}"
+                      + ("" if f_max <= NEUTRINO_MAX_INTERACTION_FRACTION else
+                         f"  (warning: above {NEUTRINO_MAX_INTERACTION_FRACTION}, the beam is depleted along the "
+                         "target and the rate is underestimated: lower the bias)"))
+
+        # --- products and their generations ---
+        if products:
+            offsets, R, G, outside = self._neutrino_product_operator(product_edges, n_prod_sim)
+            radius = np.max(np.abs(np.linalg.eigvals(G))) if G.size else 0.0
+            if radius < 1.0:
+                S = np.linalg.solve((np.eye(n_cells_total) - G).T, S0.T).T       # S0 (I - G)^-1
+            else:
+                if self.verbose > 0:
+                    print(f"Warning: product multiplication per generation >= 1 (spectral radius {radius:.3g}); "
+                          f"generations truncated at {NEUTRINO_MAX_GENERATIONS}.")
+                S, term = S0.copy(), S0.copy()
+                for _ in range(NEUTRINO_MAX_GENERATIONS):
+                    term = term @ G
+                    S += term
+            for p in products:
+                spec = {}
+                for frag, r_rows in R[p].items():
+                    spec[frag] = S[:, offsets[p]] @ r_rows
+                recoils[NEUTRINO_SECONDARY_PREFIX + p] = spec
+            if self.verbose > 0:
+                for p in products:
+                    made = float(np.mean(S0[:, offsets[p]].sum(axis=1)))
+                    below, above = lost[p]
+                    if made + below + above > 0 and (below + above) > 1e-3 * (made + below + above):
+                        print(f"Warning: {100 * (below + above) / (made + below + above):.2g}% of the {p}s made by "
+                              f"neutrinos lie outside the {p} runs ({below / (made + below + above):.2g} below "
+                              f"{product_edges[p][0]:.4g} GeV): their recoils are missing.")
+
+        # --- recoil rates -> tracks, integrated over the window ---
+        to_per_kyr_mev = 1.0 / (np.diff(RECOIL_ENERGY_BINS_MEV)[None, :] * KYR_PER_SECOND)
+        if isinstance(annealing, dict):
+            self._annealing_ratio(self._master_time_grid(), annealing)
+        results = {}
+        for key, spec in recoils.items():
+            recoil_data = {'Er_bins': RECOIL_ENERGY_BINS_MEV, 't_kyr': t_kyr,
+                           **{frag: arr * to_per_kyr_mev for frag, arr in spec.items()}}
+            dRdx = self._convert_recoil_to_track_spectrum(recoil_data, x_grid, fragments=list(spec))
+            if nucleus not in dRdx:
+                raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS} or a fragment of {key} "
+                                 f"({sorted(k for k in dRdx if k not in TRACK_SUMS)}).")
+            rate = np.broadcast_to(np.atleast_2d(dRdx[nucleus]), (n_t, len(x_grid) - 1))
+            results[key] = self._integrate_rate_over_window(rate, t_kyr, x_bins, x_grid, annealing, annealing_r_min)
+
+        results['total'] = sum(results.values())
+        return x_bins, results
 
 
 def _species_worker(self_and_args):
