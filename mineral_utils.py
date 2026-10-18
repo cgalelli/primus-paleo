@@ -126,9 +126,11 @@ _ENERGY_EDGE_RTOL = 1e-9
 COMPUTABLE_SPECIES = ('mu-', 'mu+', 'neutron', 'proton')
 MUON_SPECIES = ('mu-', 'mu+')
 # Secondary species: particles of type DERIVED_SPECIES[s] produced in the window above the sample by the primaries in
-# SECONDARY_SOURCES (StdRock runs), plus their own later generations; their recoils (and energy grid) come from the
-# mineral runs of that particle. Cross-generations between products (neutrons from secondary protons and vice versa)
-# are not followed.
+# SECONDARY_SOURCES (StdRock runs), plus all their later generations, cross-generations included (neutrons from
+# protons and protons from neutrons): the products are followed as one cascade (_secondary_yield). Their recoils (and
+# energy grid) come from the mineral runs of each product. Same generation policy as the neutrino products
+# (_neutrino_product_operator); muons are not produced by the hadron runs, so the chain is
+# (mu, n, p) -> secondary n, p -> tertiary n, p from both -> ...
 DERIVED_SPECIES = {'secondary_neutron': 'neutron', 'secondary_proton': 'proton'}
 SECONDARY_SOURCES = ('mu-', 'mu+', 'neutron', 'proton')
 IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E) is reported as a gap
@@ -503,6 +505,38 @@ def _geant4_energy_edges(data_dir):
     return {'edges': edges, 'n_files': energies.size, 'gaps': gaps}
 
 
+def _restrict_edges(edges, e_range, label):
+    """Keeps the energy bins lying entirely inside a range.
+
+    Purpose: e_range options (integrate_all_particles, integrate_atmospheric_neutrinos) select a part of a Geant4
+    run grid; this is the single place where that selection is made, for the mineral and the StdRock grids alike.
+
+    Args:
+        edges (np.ndarray): Bin edges [GeV].
+        e_range (tuple[float, float] or None): (E_min, E_max) [GeV]; None keeps every bin.
+        label (str): Name used in the error messages.
+
+    Returns:
+        np.ndarray: The kept bin edges [GeV].
+
+    Raises:
+        ValueError: If e_range is not increasing, is outside the grid, or contains no complete bin.
+    """
+    if e_range is None:
+        return edges
+    lo, hi = (float(v) for v in e_range)
+    tol = 1 + _ENERGY_EDGE_RTOL
+    if not lo < hi:
+        raise ValueError(f"{label}: e_range {e_range} must be (E_min, E_max) with E_min < E_max.")
+    if lo * tol < edges[0] or hi > edges[-1] * tol:
+        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV is outside the available range "
+                         f"({edges[0]:.4g}, {edges[-1]:.4g}) GeV.")
+    inside = np.where((edges[:-1] * tol >= lo) & (edges[1:] <= hi * tol))[0]
+    if inside.size == 0:
+        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV contains no complete energy bin.")
+    return edges[inside[0]:inside[-1] + 2]
+
+
 def _resolve_x_bins(x_bins):
     """The given output track-length bins, or the module default (set_integration_x_bins_nm) if None.
 
@@ -825,7 +859,10 @@ class Paleodetector:
         for species, info in self._geant4_runs.items():
             e = info['edges']
             note = ("" if species in self._depth_interpolators else
-                    "  (integrate_atmospheric_neutrinos)" if species in NEUTRINO_SPECIES else
+                    ("  (integrate_atmospheric_neutrinos; secondaries made in "
+                     + ("StdRock)" if _list_geant4_energy_files(os.path.join(self.data_path, "Geant4_data", "StdRock",
+                                                                             species)) else "the mineral: no StdRock runs)"))
+                    if species in NEUTRINO_SPECIES else
                     "  (no StdRock depth table: not computable)" if species in COMPUTABLE_SPECIES else
                     "  (runs found, calculation not implemented yet)")
             lines.append(f"  {species:<10} energy from {e[0]:.4g} to {e[-2]:.4g} GeV in {info['n_files']} steps{note}")
@@ -836,7 +873,7 @@ class Paleodetector:
             if derived in self.available_species():
                 sources = [src for src in SECONDARY_SOURCES if self._stdrock_dir(src) is not None]
                 lines.append(f"  {derived:<10} {product}s produced by {', '.join(sources)} above the sample "
-                             f"(StdRock runs), recoils from the {product} runs")
+                             f"(StdRock runs, all generations of the n + p cascade), recoils from the {product} runs")
         print("\n".join(lines))
 
 
@@ -869,20 +906,7 @@ class Paleodetector:
         source = DERIVED_SPECIES.get(species, species)
         if source not in self.energy_bins:
             raise ValueError(f"No Geant4 runs of '{source}' for {self.name}; available: {list(self.energy_bins)}.")
-        edges = self.energy_bins[source]
-        if e_range is None:
-            return edges
-        lo, hi = (float(v) for v in e_range)
-        tol = 1 + _ENERGY_EDGE_RTOL
-        if not lo < hi:
-            raise ValueError(f"{species}: e_range {e_range} must be (E_min, E_max) with E_min < E_max.")
-        if lo * tol < edges[0] or hi > edges[-1] * tol:
-            raise ValueError(f"{species}: e_range ({lo:g}, {hi:g}) GeV is outside the available range "
-                             f"({edges[0]:.4g}, {edges[-1]:.4g}) GeV.")
-        inside = np.where((edges[:-1] * tol >= lo) & (edges[1:] <= hi * tol))[0]
-        if inside.size == 0:
-            raise ValueError(f"{species}: e_range ({lo:g}, {hi:g}) GeV contains no complete energy bin.")
-        return edges[inside[0]:inside[-1] + 2]
+        return _restrict_edges(self.energy_bins[source], e_range, species)
 
 
     def _flux_breakpoints(self, nodes=True):
@@ -1962,76 +1986,92 @@ class Paleodetector:
         }
 
 
-    def _stdrock_offset_matrix(self, product, energy_bins_gev, delta_mwe, n_offsets,
+    def _stdrock_offset_matrix(self, source, product, source_bins_gev, product_bins_gev, delta_mwe, n_offsets,
                                total_simulated_particles=1e4):
-        """Particles of type `product` produced by a `product` primary, by distance travelled and energy.
+        """Particles of type `product` produced by a `source` primary, by distance travelled and energy.
 
-        From the StdRock/<product> runs: C[l, d, m] is the number of products with energy in cell m produced
-        between d * delta and (d + 1) * delta after the entry point, per primary in energy cell l.
+        One block of the generation matrix of the atmospheric secondary cascade (see _secondary_yield): from the
+        StdRock/<source> runs, C[l, d, m] is the number of products with energy in cell m (of product_bins_gev)
+        produced between d * delta and (d + 1) * delta after the entry point, per primary in energy cell l (of
+        source_bins_gev). source == product gives the same-type generations, source != product the
+        cross-generations (neutrons from protons and protons from neutrons).
 
         Args:
-            product (str): 'neutron' or 'proton'.
-            energy_bins_gev (np.ndarray): Energy cell edges [GeV], shape (M,).
+            source (str): Primary of the StdRock runs, 'neutron' or 'proton'.
+            product (str): Produced particle, 'neutron' or 'proton'.
+            source_bins_gev (np.ndarray): Energy cell edges of the source [GeV].
+            product_bins_gev (np.ndarray): Energy cell edges of the product [GeV].
             delta_mwe (float): Offset bin width [m.w.e.].
             n_offsets (int): Number of offset bins.
             total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
 
         Returns:
-            np.ndarray: C, shape (M - 1, n_offsets, M - 1).
+            np.ndarray: C, shape (len(source_bins_gev) - 1, n_offsets, len(product_bins_gev) - 1).
         """
-        rows = self._load_stdrock_rows(product, product, energy_bins_gev, total_simulated_particles,
-                                       primary_bins_gev=energy_bins_gev)
-        n_e = len(energy_bins_gev) - 1
+        rows = self._load_stdrock_rows(source, product, product_bins_gev, total_simulated_particles,
+                                       primary_bins_gev=source_bins_gev)
+        n_s, n_q = len(source_bins_gev) - 1, len(product_bins_gev) - 1
         d = np.floor(rows['depth_mwe'] / delta_mwe).astype(int)
         ok = d < n_offsets
-        flat = (rows['primary_cell'][ok] * n_offsets + d[ok]) * n_e + rows['cell'][ok]
-        C = np.bincount(flat, minlength=n_e * n_offsets * n_e).astype(float)
-        return C.reshape(n_e, n_offsets, n_e) * rows['weight']
+        flat = (rows['primary_cell'][ok] * n_offsets + d[ok]) * n_q + rows['cell'][ok]
+        C = np.bincount(flat, minlength=n_s * n_offsets * n_q).astype(float)
+        return C.reshape(n_s, n_offsets, n_q) * rows['weight']
 
 
-    def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
-                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES, n_energy_sub=50,
-                         product='neutron'):
-        """Secondary particles (neutrons or protons) born in a window above the sample, per direction.
+    def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
+                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES, n_energy_sub=50):
+        """Secondary neutrons and protons born in a window above the sample, per direction, as one cascade.
 
         For each time t and direction c, the path to the sample has slant depth S = X(t) / c. The window
-        [S - W, S] along the path (W from _secondary_window_mwe(product)) is split into SECONDARY_WINDOW_BINS bins
-        of width delta = W / SECONDARY_WINDOW_BINS.
+        [S - W, S] along the path (W: the largest _secondary_window_mwe of the products) is split into
+        SECONDARY_WINDOW_BINS bins of width delta = W / SECONDARY_WINDOW_BINS.
+
+        State: the products of every type on one flat axis, product q occupying offsets[q] (its energy cells).
 
         Source: products made in the window by the primaries, from the StdRock runs at their actual slant depth
         (so the transport of the primary down to the window is included), weighted by the primary intensity
         integrated over each energy cell of the primary's StdRock grid:
 
-            A_b,m = sum_s sum_i Phi_s,i(t) * (StdRock/<s> products of cell m in bin b per primary of cell i)
+            A_b,k = sum_s sum_i Phi_s,i(t) * (StdRock/<s> products of cell k in bin b per primary of cell i)
 
-        Generations inside the window use the StdRock/<product> runs (offset matrix C). Products are born uniformly
-        within their bin, so a production at offset bin d is shared between bins b' + d and b' + d + 1:
+        Generations inside the window: the StdRock/<p> runs of every product p give the products of every type
+        q it makes (_stdrock_offset_matrix blocks C[p -> q]), so neutrons from neutrons, protons from protons and
+        the cross-generations (neutrons from protons, protons from neutrons) are all followed, to any order.
+        Products are born uniformly within their bin, so a production at offset bin d is shared between bins
+        b' + d and b' + d + 1:
 
             Y_b (I - C[0] / 2) = A_b + sum_{b' < b} Y_b' (C[b - b' - 1] + C[b - b']) / 2
 
-        Secondaries are assumed to keep the direction of the primary. Sources without StdRock runs are skipped.
+        Secondaries are assumed to keep the direction of the primary. Sources without StdRock runs are skipped;
+        a product without StdRock runs makes no further generations (reported).
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             depth_mwe_array (np.ndarray): Overburden [m.w.e.], shape (T,).
             c_vals (np.ndarray): cos(zenith) grid, shape (N_C,).
-            energy_bins_gev (np.ndarray): Energy cell edges of the products [GeV], shape (M,).
+            product_bins_gev (dict): {product: energy cell edges [GeV]} of the products followed ('neutron',
+                'proton'; see _secondary_grids).
             total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
             species_list (tuple[str], optional): Primary species producing the secondaries.
                 Defaults to SECONDARY_SOURCES.
             n_energy_sub (int, optional): Points per energy cell for the flux integration. Defaults to 50.
-            product (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
 
         Returns:
-            tuple[np.ndarray, float]:
-                Y: products born in each window bin and energy cell
-                    [cm^-2 s^-1 sr^-1], shape (T, N_C, SECONDARY_WINDOW_BINS, M - 1).
+            tuple[np.ndarray, float, dict]:
+                Y: products born in each window bin and cell [cm^-2 s^-1 sr^-1], shape (T, N_C, SECONDARY_WINDOW_BINS, K).
                 delta: window bin width along the path [m.w.e.].
+                offsets: {product: slice of the last axis of Y}.
         """
-        energy_bins_gev = np.asarray(energy_bins_gev, dtype=float)
-        n_t, n_c, n_e = len(t_kyr_array), len(c_vals), len(energy_bins_gev) - 1
+        products = list(product_bins_gev)
+        product_bins_gev = {q: np.asarray(e, dtype=float) for q, e in product_bins_gev.items()}
+        offsets, n_k = {}, 0
+        for q in products:
+            offsets[q] = slice(n_k, n_k + len(product_bins_gev[q]) - 1)
+            n_k += len(product_bins_gev[q]) - 1
+
+        n_t, n_c = len(t_kyr_array), len(c_vals)
         n_b = SECONDARY_WINDOW_BINS
-        window = self._secondary_window_mwe(product)
+        window = max(self._secondary_window_mwe(q) for q in products)
         delta = window / n_b
 
         t_kyr_flux_array = self._flux_time_kyr(np.asarray(t_kyr_array, dtype=float))
@@ -2039,58 +2079,70 @@ class Paleodetector:
         slant = depth_mwe_array[:, None] / c_vals[None, :]               # (T, N_C) path to the sample
         window_top = slant - window
 
-        A = np.zeros((n_t, n_c, n_b, n_e))
+        A = np.zeros((n_t, n_c, n_b, n_k))
         for species in species_list:
             if self._stdrock_dir(species) is None:
                 if self.verbose > 1:
-                    print(f"No StdRock runs for {species}: no secondary {product}s from it.")
+                    print(f"No StdRock runs for {species}: no secondaries from it.")
                 continue
-            rows = self._load_stdrock_rows(species, product, energy_bins_gev, total_simulated_particles)
-            if rows['missing'] and self.verbose > 0:
-                print(f"Warning: StdRock/{species}: no file for {len(rows['missing'])} primary "
-                      f"energies (e.g. {rows['missing'][:3]} GeV); their {product}s are missing.")
-            beyond = slant > TRUNCATION_FRACTION * rows['target_mwe']
-            if self.verbose > 0 and np.any(beyond[:, -1]):
-                print(f"Warning: vertical overburden beyond the StdRock/{species} target "
-                      f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondary {product}s "
-                      "from that species are missing there; use a longer StdRock target.")
+            phi_cell = None
+            for q in products:
+                rows = self._load_stdrock_rows(species, q, product_bins_gev[q], total_simulated_particles)
+                if phi_cell is None:                     # same primary grid for every product of this species
+                    if rows['missing'] and self.verbose > 0:
+                        print(f"Warning: StdRock/{species}: no file for {len(rows['missing'])} primary "
+                              f"energies (e.g. {rows['missing'][:3]} GeV); their secondaries are missing.")
+                    beyond = slant > TRUNCATION_FRACTION * rows['target_mwe']
+                    if self.verbose > 0 and np.any(beyond[:, -1]):
+                        print(f"Warning: vertical overburden beyond the StdRock/{species} target "
+                              f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondaries "
+                              "from that species are missing there; use a longer StdRock target.")
+                    # primary intensity integrated over each primary energy cell [cm^-2 s^-1 sr^-1]
+                    pb = rows['primary_bins']
+                    e_lo, e_hi = pb[:-1], pb[1:]
+                    e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * sub[None, :]
+                    step = (e_hi - e_lo) / (n_energy_sub - 1)
+                    phi = self.flux_history.get_map(species, t_kyr_flux_array, e_sub)[2].reshape(
+                        n_t, *e_sub.shape
+                    )
+                    phi_cell = (phi.sum(axis=-1) - 0.5 * (phi[..., 0] + phi[..., -1])) * step[None, :]
 
-            # primary intensity integrated over each primary energy cell [cm^-2 s^-1 sr^-1]
-            pb = rows['primary_bins']
-            e_lo, e_hi = pb[:-1], pb[1:]
-            e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * sub[None, :]
-            step = (e_hi - e_lo) / (n_energy_sub - 1)
-            phi = self.flux_history.get_map(species, t_kyr_flux_array, e_sub)[2].reshape(
-                n_t, *e_sub.shape
-            )
-            phi_cell = (phi.sum(axis=-1) - 0.5 * (phi[..., 0] + phi[..., -1])) * step[None, :]
+                n_q = len(product_bins_gev[q]) - 1
+                depth = rows['depth_mwe']
+                lo_idx = np.searchsorted(depth, window_top, side='left')
+                hi_idx = np.searchsorted(depth, slant, side='left')
+                for t in range(n_t):
+                    for c in range(n_c):
+                        if beyond[t, c] or hi_idx[t, c] <= lo_idx[t, c]:
+                            continue
+                        sl = slice(lo_idx[t, c], hi_idx[t, c])
+                        b = np.minimum(((depth[sl] - window_top[t, c]) / delta).astype(int), n_b - 1)
+                        w = phi_cell[t, rows['primary_cell'][sl]] * rows['weight']
+                        A[t, c, :, offsets[q]] += np.bincount(
+                            b * n_q + rows['cell'][sl], weights=w, minlength=n_b * n_q
+                        ).reshape(n_b, n_q)
 
-            depth = rows['depth_mwe']
-            lo_idx = np.searchsorted(depth, window_top, side='left')
-            hi_idx = np.searchsorted(depth, slant, side='left')
-            for t in range(n_t):
-                for c in range(n_c):
-                    if beyond[t, c] or hi_idx[t, c] <= lo_idx[t, c]:
-                        continue
-                    sl = slice(lo_idx[t, c], hi_idx[t, c])
-                    b = np.minimum(((depth[sl] - window_top[t, c]) / delta).astype(int), n_b - 1)
-                    w = phi_cell[t, rows['primary_cell'][sl]] * rows['weight']
-                    A[t, c] += np.bincount(
-                        b * n_e + rows['cell'][sl], weights=w, minlength=n_b * n_e
-                    ).reshape(n_b, n_e)
-
-        # generations inside the window
-        C = self._stdrock_offset_matrix(product, energy_bins_gev, delta, n_b + 1, total_simulated_particles)
+        # generations inside the window: every product type from every product type
+        C = np.zeros((n_k, n_b + 1, n_k))
+        for p in products:
+            if self._stdrock_dir(p) is None:
+                if self.verbose > 0:
+                    print(f"Warning: no StdRock/{p} runs: the secondaries made by {p}s are not followed.")
+                continue
+            for q in products:
+                C[offsets[p], :, offsets[q]] = self._stdrock_offset_matrix(
+                    p, q, product_bins_gev[p], product_bins_gev[q], delta, n_b + 1, total_simulated_particles
+                )
         half_same_bin = 0.5 * C[:, 0, :]
         if np.max(np.abs(np.linalg.eigvals(half_same_bin))) < 1.0:
-            same_bin_inv = np.linalg.inv(np.eye(n_e) - half_same_bin)
+            same_bin_inv = np.linalg.inv(np.eye(n_k) - half_same_bin)
         else:
             if self.verbose > 0:
-                print(f"Warning: same-bin {product} multiplication >= 1; ignoring it.")
-            same_bin_inv = np.eye(n_e)
+                print("Warning: same-bin secondary multiplication >= 1; ignoring it.")
+            same_bin_inv = np.eye(n_k)
         transfer = [None] + [0.5 * (C[:, k - 1, :] + C[:, k, :]) for k in range(1, n_b + 1)]
 
-        A = A.reshape(n_t * n_c, n_b, n_e)
+        A = A.reshape(n_t * n_c, n_b, n_k)
         Y = np.zeros_like(A)
         for b in range(n_b):
             y = A[:, b, :].copy()
@@ -2098,7 +2150,7 @@ class Paleodetector:
                 y += Y[:, bp, :] @ transfer[b - bp]
             Y[:, b, :] = y @ same_bin_inv
 
-        return Y.reshape(n_t, n_c, n_b, n_e), delta
+        return Y.reshape(n_t, n_c, n_b, n_k), delta, offsets
 
 
     def _get_all_fragments(self, energy_names_gev, species='mu-'):
@@ -2319,127 +2371,180 @@ class Paleodetector:
         }
 
 
-    def _process_secondary_geant4_data(
-        self, t_kyr_array, energy_bins_gev=None,
-        total_simulated_particles=1e4, secondary_sources=SECONDARY_SOURCES, product='neutron',
-    ):
-        """Recoil spectra in the sample slab from secondary neutrons or protons.
+    def _secondary_products(self):
+        """Products of the atmospheric secondary cascade that can be followed: the DERIVED_SPECIES products with
+        mineral runs and a StdRock depth table (i.e. whose secondary species is in available_species())."""
+        return [DERIVED_SPECIES[d] for d in self.available_species() if d in DERIVED_SPECIES]
 
-        Products born in the window above the sample (see _secondary_yield)
-        travel along the primary's direction to the slab. For a product born
-        uniformly in window bin b, at distance
-        d in [d0, d0 + delta] from the slab top, the probability of interacting
-        in the slab (path tau = t_slab / c) is averaged over the bin exactly:
+
+    def _secondary_grids(self, requested=None):
+        """Cascade energy grids of the secondary products, and the energy window each requested product reports.
+
+        The cascade always contains every followable product (cross-generations) on its full mineral run grid, so
+        that restricting the energies reported for one secondary species does not change the cascade, and hence
+        the other species. A request that is a contiguous part of the full grid (as given by e_range, see
+        _energy_edges) only sets the reporting window; any other set of edges replaces that product's grid.
+
+        Args:
+            requested (dict, optional): {product: energy cell edges [GeV] or None}. Defaults to None.
+
+        Returns:
+            tuple[dict, dict]: {product: cascade cell edges [GeV]} and {product: (E_lo, E_hi) [GeV]} for the
+            products whose reported cells are restricted.
+
+        Raises:
+            ValueError: If a requested product cannot be followed (no mineral runs or no StdRock depth table).
+        """
+        products = self._secondary_products()
+        requested = {q: e for q, e in (requested or {}).items() if e is not None}
+        missing = [q for q in requested if q not in products]
+        if missing:
+            raise ValueError(f"Secondary {missing} cannot be computed for {self.name}: need mineral runs and a "
+                             f"StdRock depth table (followable: {products}).")
+        grids, windows = {}, {}
+        for q in products:
+            full = self._energy_edges(q)
+            if q not in requested:
+                grids[q] = full
+                continue
+            edges = np.asarray(requested[q], dtype=float)
+            on_grid = np.all(np.min(np.abs(full[None, :] / edges[:, None] - 1.0), axis=1) <= _ENERGY_EDGE_RTOL)
+            if on_grid:
+                grids[q] = full
+                windows[q] = (edges[0], edges[-1])
+            else:
+                grids[q] = edges
+        return grids, windows
+
+
+    def _process_secondary_geant4_data(
+        self, t_kyr_array, product_bins_gev=None,
+        total_simulated_particles=1e4, secondary_sources=SECONDARY_SOURCES, energy_windows=None,
+    ):
+        """Recoil spectra in the sample slab from the secondary neutrons and protons, all products at once.
+
+        Products born in the window above the sample (see _secondary_yield, which follows all generations and
+        cross-generations) travel along the primary's direction to the slab. For a product of type q born
+        uniformly in window bin b, at distance d in [d0, d0 + delta] from the slab top, the probability of
+        interacting in the slab (path tau = t_slab / c) is averaged over the bin exactly:
 
             P_b = [H(d0 + delta + tau) - H(d0 + tau) - H(d0 + delta) + H(d0)] / delta,
 
-        with H(z) = integral_0^z F = z - G(z), F being the product's StdRock depth CDF. Then
+        with H(z) = integral_0^z F = z - G(z), F being the StdRock depth CDF of q. Then
 
             w_m(t) = int dc sum_b Y[t, c, b, m] P_b(E_m, c),
 
-        and the recoils per product of the mineral run at the lower edge E_m of
-        each cell are applied with the normalisation of _process_geant4_data.
+        and the recoils per product of the mineral run of q at the lower edge E_m of each cell are applied with
+        the normalisation of _process_geant4_data.
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
-            energy_bins_gev (np.ndarray, optional): Energy cell edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            total_simulated_particles (float, optional): Primaries per Geant4
-                run. Defaults to 1e4.
-            secondary_sources (tuple[str], optional): Primary species producing
-                the secondaries. Defaults to SECONDARY_SOURCES.
-            product (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
+            product_bins_gev (dict, optional): {product: energy cell edges [GeV]} of the cascade. Defaults to
+                None (_secondary_grids(): every followable product on its full grid).
+            total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
+            secondary_sources (tuple[str], optional): Primary species producing the secondaries.
+                Defaults to SECONDARY_SOURCES.
+            energy_windows (dict, optional): {product: (E_lo, E_hi) [GeV]}: only the cells inside it give recoils
+                (the cascade is unchanged). Defaults to None (all cells).
 
         Returns:
-            dict: Same structure as _process_geant4_data.
+            dict: {product: recoil data, same structure as _process_geant4_data}.
         """
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, product)
+        if product_bins_gev is None:
+            product_bins_gev = self._secondary_grids()[0]
+        energy_windows = dict(energy_windows or {})
         rho = self.config['density_g_cm3']
 
         target_volume_cm3 = 1.e-3 / rho
         target_thickness_cm = np.power(target_volume_cm3, 1/3)
         target_thickness_mwe = target_thickness_cm * 0.01 * rho
 
-        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], species=product)
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
-
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
         n_t = len(t_kyr_array)
         depth_mwe_array = np.atleast_1d(self._overburden_interpolator(t_kyr_array))
 
         c_vals = np.linspace(0.01, 1.0, 50)
-        Y, delta = self._secondary_yield(
-            t_kyr_array, depth_mwe_array, c_vals, energy_bins_gev,
-            total_simulated_particles, secondary_sources, product=product,
+        Y, delta, offsets = self._secondary_yield(
+            t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
+            total_simulated_particles, secondary_sources,
         )
         n_b = Y.shape[2]
-        n_e = len(energy_bins_gev) - 1
-
-        # bin-averaged slab probability, shape (N_C, n_b, M-1)
-        e_cells = energy_bins_gev[:-1]
-        table = self._depth_tables[product]
-        q_rows = self._depth_quantiles(e_cells, product)
-        tails = self._hadron_tail_lambdas(e_cells, product)
         d0 = (n_b - 1 - np.arange(n_b)) * delta                       # distance from bin bottom to slab
         tau = target_thickness_mwe / c_vals                              # slab path
         z_d0 = np.broadcast_to(d0[None, :], (len(c_vals), n_b))
         z_tau = np.broadcast_to(tau[:, None], (len(c_vals), n_b))
-        prob = np.empty((len(c_vals), n_b, n_e))
-        for m in range(n_e):
-            def H(z):
-                """Integral of the product's depth CDF from 0 to z [m.w.e.]."""
-                _, G = _piecewise_cdf_and_integral(z, q_rows[m], table['p'], tails[m])
-                return z - G
-            prob[:, :, m] = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau)
-                             - H(z_d0 + delta) + H(z_d0)) / delta
-
-        weight_t = np.trapezoid(np.einsum('tcbm,cbm->tcm', Y, prob), c_vals, axis=1)  # (T, M-1)
-
-        n_recoil_bins = len(RECOIL_ENERGY_BINS_MEV) - 1
-        fragment_spectra = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
-
-        for m in range(n_e):
-            filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_cells[m]:.6f}.txt")
-            if not os.path.exists(filepath):
-                continue
-            try:
-                df = pd.read_csv(
-                    filepath, sep=r'\s+', header=None, usecols=[0, 2],
-                    names=['name', 'rec_e'], dtype={'name': str, 'rec_e': float},
-                )
-                names = normalize_fragment_names(df['name'].values)
-                rec_energies = df['rec_e'].values
-            except pd.errors.EmptyDataError:
-                continue
-
-            valid_mask = np.isin(names, list(fragment_spectra.keys()))
-            valid_names = names[valid_mask]
-            valid_rec = rec_energies[valid_mask]
-
-            for frag in np.unique(valid_names):
-                frag_mask = (valid_names == frag)
-                counts, _ = np.histogram(valid_rec[frag_mask], bins=RECOIL_ENERGY_BINS_MEV)
-                fragment_spectra[frag] += np.outer(weight_t[:, m], counts)
 
         bin_widths_mev = np.diff(RECOIL_ENERGY_BINS_MEV)
         norm_factor = (
             bin_widths_mev * target_thickness_cm * rho
             * total_simulated_particles * KYR_PER_SECOND
         )
+        n_recoil_bins = len(RECOIL_ENERGY_BINS_MEV) - 1
 
-        normalized_spectra = {}
-        for name, spectrum in fragment_spectra.items():
-            normalized_spectra[name] = np.divide(
-                spectrum, norm_factor[None, :], out=np.zeros_like(spectrum),
-                where=norm_factor[None, :] != 0,
-            )
+        out = {}
+        for product, energy_bins_gev in product_bins_gev.items():
+            n_e = len(energy_bins_gev) - 1
+            e_cells = energy_bins_gev[:-1]
+            all_fragments = self._get_all_fragments(e_cells, species=product)
+            geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
 
-        return {
-            't_kyr': t_kyr_array,
-            'depth_mwe': depth_mwe_array,
-            'Er_bins': RECOIL_ENERGY_BINS_MEV,
-            **normalized_spectra,
-        }
+            # bin-averaged slab probability, shape (N_C, n_b, n_e)
+            table = self._depth_tables[product]
+            q_rows = self._depth_quantiles(e_cells, product)
+            tails = self._hadron_tail_lambdas(e_cells, product)
+            prob = np.empty((len(c_vals), n_b, n_e))
+            for m in range(n_e):
+                def H(z):
+                    """Integral of the product's depth CDF from 0 to z [m.w.e.]."""
+                    _, G = _piecewise_cdf_and_integral(z, q_rows[m], table['p'], tails[m])
+                    return z - G
+                prob[:, :, m] = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau)
+                                 - H(z_d0 + delta) + H(z_d0)) / delta
+
+            weight_t = np.trapezoid(np.einsum('tcbm,cbm->tcm', Y[..., offsets[product]], prob), c_vals, axis=1)
+            if product in energy_windows:
+                lo, hi = energy_windows[product]
+                tol = 1 + _ENERGY_EDGE_RTOL
+                outside = (energy_bins_gev[:-1] * tol < lo) | (energy_bins_gev[1:] > hi * tol)
+                weight_t[:, outside] = 0.0
+
+            fragment_spectra = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
+            for m in range(n_e):
+                filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_cells[m]:.6f}.txt")
+                if not os.path.exists(filepath):
+                    continue
+                try:
+                    df = pd.read_csv(
+                        filepath, sep=r'\s+', header=None, usecols=[0, 2],
+                        names=['name', 'rec_e'], dtype={'name': str, 'rec_e': float},
+                    )
+                    names = normalize_fragment_names(df['name'].values)
+                    rec_energies = df['rec_e'].values
+                except pd.errors.EmptyDataError:
+                    continue
+
+                valid_mask = np.isin(names, list(fragment_spectra.keys()))
+                valid_names = names[valid_mask]
+                valid_rec = rec_energies[valid_mask]
+
+                for frag in np.unique(valid_names):
+                    frag_mask = (valid_names == frag)
+                    counts, _ = np.histogram(valid_rec[frag_mask], bins=RECOIL_ENERGY_BINS_MEV)
+                    fragment_spectra[frag] += np.outer(weight_t[:, m], counts)
+
+            normalized_spectra = {}
+            for name, spectrum in fragment_spectra.items():
+                normalized_spectra[name] = np.divide(
+                    spectrum, norm_factor[None, :], out=np.zeros_like(spectrum),
+                    where=norm_factor[None, :] != 0,
+                )
+            out[product] = {
+                't_kyr': t_kyr_array,
+                'depth_mwe': depth_mwe_array,
+                'Er_bins': RECOIL_ENERGY_BINS_MEV,
+                **normalized_spectra,
+            }
+        return out
 
 
     def _convert_recoil_to_track_spectrum(self, recoil_data, x_bins=None, energy_bins_gev=None, species='mu-',
@@ -2538,6 +2643,31 @@ class Paleodetector:
         return dRdx_by_nucleus
 
 
+    @staticmethod
+    def _select_nucleus(dRdx_by_fragment, nucleus, label):
+        """Picks the requested track sum or fragment from the output of _convert_recoil_to_track_spectrum.
+
+        Shared by every integration path (primaries, atmospheric secondaries, neutrinos).
+
+        Args:
+            dRdx_by_fragment (dict): Output of _convert_recoil_to_track_spectrum.
+            nucleus (str): 'total_no_light_ions', 'total', 'all' (the whole dict) or a fragment key.
+            label (str): Species name, for the error message.
+
+        Returns:
+            np.ndarray or dict: The selected rate, or the dict for 'all'.
+
+        Raises:
+            ValueError: If nucleus is not in the dict.
+        """
+        if nucleus == "all":
+            return dRdx_by_fragment
+        if nucleus not in dRdx_by_fragment:
+            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, 'all' or a fragment of "
+                             f"{label} ({sorted(k for k in dRdx_by_fragment if k not in TRACK_SUMS)}).")
+        return dRdx_by_fragment[nucleus]
+
+
     def calculate_particle_signal_spectrum(
         self,  t_kyr_array, x_bins=None,
         energy_bins_gev=None, total_simulated_particles=1e4, 
@@ -2555,7 +2685,9 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
-                'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'.
+                'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'. For a secondary species the
+                whole neutron + proton cascade is computed (cross-generations need both); energy_bins_gev then
+                selects the cells of its own product that are reported (see _secondary_grids).
             nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He, see
                 LIGHT_ION_MAX_Z), 'total' (all fragments), 'all' (dict of every fragment and both sums) or a
                 fragment key. Defaults to 'total_no_light_ions'.
@@ -2564,25 +2696,22 @@ class Paleodetector:
             np.ndarray or dict: dR/dx [tracks per mg per kyr per nm], shape (T, n_x).
         """
         x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
 
         if species in DERIVED_SPECIES:
+            product = DERIVED_SPECIES[species]
+            bins, windows = self._secondary_grids({product: energy_bins_gev})
             recoil_data = self._process_secondary_geant4_data(
-                t_kyr_array, energy_bins_gev, total_simulated_particles, product=DERIVED_SPECIES[species],
-            )
+                t_kyr_array, bins, total_simulated_particles, energy_windows=windows,
+            )[product]
+            energy_bins_gev = bins[product]
         else:
+            energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
             recoil_data = self._process_geant4_data(
                 t_kyr_array, energy_bins_gev, total_simulated_particles, species,
             )
 
         dRdx_at_depth = self._convert_recoil_to_track_spectrum(recoil_data, x_bins, energy_bins_gev, species)
-
-        if nucleus == "all":
-            return dRdx_at_depth
-        if nucleus not in dRdx_at_depth:
-            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, 'all' or a fragment of "
-                             f"{species} ({sorted(k for k in dRdx_at_depth if k not in TRACK_SUMS)}).")
-        return dRdx_at_depth[nucleus]
+        return self._select_nucleus(dRdx_at_depth, nucleus, species)
 
 
     def integrate_particle_signal_spectrum(
@@ -2595,7 +2724,7 @@ class Paleodetector:
 
         The rate is computed on a time grid and integrated with the trapezoidal
         rule; the fine-grid spectrum is then rebinned to x_bins through its
-        cumulative distribution.
+        cumulative distribution (_integrate_rate_over_window).
 
         Args:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm].
@@ -2635,6 +2764,13 @@ class Paleodetector:
         energy_bins_gev = (self._energy_edges(species, e_range) if energy_bins_gev is None
                            else np.asarray(energy_bins_gev, dtype=float))
 
+        if species in DERIVED_SPECIES:
+            return self._integrate_secondary_species(
+                [species], {species: energy_bins_gev}, x_bins=x_bins, exposure_window_kyr=exposure_window_kyr,
+                total_simulated_particles=total_simulated_particles, x_grid=x_grid, nucleus=nucleus,
+                annealing=annealing, annealing_r_min=annealing_r_min,
+            )[species]
+
         t_kyr_array = self._window_grid(self._exposure_window(exposure_window_kyr))
 
         dRdx_array = self.calculate_particle_signal_spectrum(
@@ -2643,6 +2779,43 @@ class Paleodetector:
             species=species, nucleus=nucleus
         )
         return self._integrate_rate_over_window(dRdx_array, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
+
+
+    def _integrate_secondary_species(
+        self, secondary_species, energy_bins_gev=None, x_bins=None, exposure_window_kyr=None,
+        total_simulated_particles=1e4, x_grid=TRACK_LENGTH_BINS_NM, nucleus=DEFAULT_TRACK_SUM,
+        annealing=None, annealing_r_min=0.0,
+    ):
+        """Track counts of several atmospheric secondary species from one solve of the cascade.
+
+        The neutron + proton cascade (_secondary_yield) is computed once, with every followable product on its
+        full grid, and each requested secondary species takes its own product from it (restricted to its energy
+        range, if given, without changing the cascade: see _secondary_grids).
+
+        Args:
+            secondary_species (list[str]): Keys of DERIVED_SPECIES ('secondary_neutron', 'secondary_proton').
+            energy_bins_gev (dict, optional): {secondary species: energy cell edges [GeV]} of its product.
+                Defaults to None (full grids).
+            x_bins, exposure_window_kyr, total_simulated_particles, x_grid, nucleus, annealing, annealing_r_min:
+                See integrate_particle_signal_spectrum.
+
+        Returns:
+            dict: {secondary species: tracks per mg in each bin of x_bins}.
+        """
+        x_bins = _resolve_x_bins(x_bins)
+        energy_bins_gev = dict(energy_bins_gev or {})
+        bins, windows = self._secondary_grids({DERIVED_SPECIES[s]: energy_bins_gev.get(s) for s in secondary_species})
+        t_kyr_array = self._window_grid(self._exposure_window(exposure_window_kyr))
+        recoils = self._process_secondary_geant4_data(t_kyr_array, bins, total_simulated_particles,
+                                                      energy_windows=windows)
+        out = {}
+        for s in secondary_species:
+            product = DERIVED_SPECIES[s]
+            dRdx = self._select_nucleus(
+                self._convert_recoil_to_track_spectrum(recoils[product], x_grid, bins[product], s), nucleus, s
+            )
+            out[s] = self._integrate_rate_over_window(dRdx, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
+        return out
 
 
     def _integrate_rate_over_window(self, dRdx_array, t_kyr_array, x_bins, x_grid, annealing=None,
@@ -2740,12 +2913,19 @@ class Paleodetector:
             annealing=annealing, annealing_r_min=annealing_r_min,
         )
 
-        tasks = [(self, dict(shared_kwargs, species=s, energy_bins_gev=edges[s])) for s in species_list]
+        # one task per primary species; the secondary species share one task (one solve of the cascade)
+        primaries = [s for s in species_list if s not in DERIVED_SPECIES]
+        secondaries = [s for s in species_list if s in DERIVED_SPECIES]
+        tasks = [(self, dict(shared_kwargs, species=s, energy_bins_gev=edges[s])) for s in primaries]
+        if secondaries:
+            tasks.append((self, dict(shared_kwargs, secondary_species=secondaries,
+                                     energy_bins_gev={s: edges[s] for s in secondaries})))
 
-        with Pool(processes=min(len(species_list), os.cpu_count() or 1)) as pool:
+        with Pool(processes=min(len(tasks), os.cpu_count() or 1)) as pool:
             results = list(tqdm(pool.imap(_species_worker, tasks), total=len(tasks)))
 
-        total_tracks_by_species = dict(results)
+        computed = dict(pair for result in results for pair in result)
+        total_tracks_by_species = {s: computed[s] for s in species_list}
         total_tracks_by_species['total'] = sum(total_tracks_by_species.values())
 
         return x_bins, total_tracks_by_species
@@ -2764,7 +2944,7 @@ class Paleodetector:
         return [s for s in NEUTRINO_SPECIES if s in self.energy_bins]
 
 
-    def _neutrino_bias(self, species, e0_gev, neutrino_bias=None):
+    def _neutrino_bias(self, species, e0_gev, neutrino_bias=None, data_dir=None):
         """Cross-section bias factor of the neutrino run of `species` at primary energy e0_gev.
 
         The neutrino runs are made with the neutrino cross-sections multiplied by this factor inside the target
@@ -2777,6 +2957,7 @@ class Paleodetector:
             neutrino_bias (float, dict, callable or None, optional): A number (every run), {species: number}, a
                 function f(species, e0_gev) -> number, or None: read from the run folder's geometry.json, key
                 "neutrino_bias", either a number or {"<E0 as %.6f>": number} (one per run). Defaults to None.
+            data_dir (str, optional): Run folder. Defaults to None (the mineral runs of the species).
 
         Returns:
             float: Bias factor (> 0).
@@ -2793,7 +2974,8 @@ class Paleodetector:
         elif neutrino_bias is not None:
             value = neutrino_bias
         else:
-            data_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
+            if data_dir is None:
+                data_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
             value = self._geant4_geometry(data_dir)["neutrino_bias"]
             if isinstance(value, dict):
                 value = value.get(f"{e0_gev:.6f}")
@@ -2881,17 +3063,23 @@ class Paleodetector:
         return out
 
 
-    def _neutrino_product_operator(self, product_edges, total_simulated_particles=1e4):
-        """Recoils and next generation of every produced particle, per particle, from its mineral runs.
+    def _neutrino_product_operator(self, product_edges, total_simulated_particles=1e4, medium='mineral'):
+        """Recoils and next generation of every produced particle, per particle.
 
-        Purpose: the particles produced by the neutrinos (and their own products) are followed with the mineral
-        runs of the same particle. For product p in energy cell m, the run of p at the cell's lower edge gives, per
-        primary, the recoils R[p][fragment][m] and the products of the next generation G[(p, m), (q, n)]. The
-        products are indexed on one flat axis: product p occupies offsets[p].
+        Purpose: the particles produced by the neutrinos (and their own products) are followed with the runs of the
+        same particle. For product p in energy cell m (cell lower edge), per primary:
+          * R[p][fragment][m]: the recoils it makes over its whole path, from the mineral runs (the recoils counted
+            are those in the sample);
+          * G[(p, m), (q, n)]: the products of the next generation, from the runs in the medium where the cascade
+            develops: the mineral runs (medium 'mineral'), or the StdRock runs (medium 'StdRock': the rock around
+            the sample is generic crust; mu+ without StdRock runs uses the mu- runs without the captures, a product
+            without StdRock runs makes no further generation).
+        The products are indexed on one flat axis: product p occupies offsets[p].
 
         Args:
             product_edges (dict): {product: energy cell edges [GeV]} (the mineral run grid of each product).
             total_simulated_particles (float, optional): Primaries per product run. Defaults to 1e4.
+            medium (str, optional): 'mineral' or 'StdRock'. Defaults to 'mineral'.
 
         Returns:
             tuple[dict, dict, np.ndarray, dict]: offsets {product: slice}, R {product: {fragment: array (cells,
@@ -2913,11 +3101,77 @@ class Paleodetector:
                                                       product_edges)
                 for frag, counts in run['recoils'].items():
                     R[p].setdefault(frag, np.zeros((n_cells, counts.size)))[m] = counts / total_simulated_particles
-                for q in product_edges:
-                    G[offsets[p].start + m, offsets[q]] = run['products'][q] / total_simulated_particles
-                    outside[q][0] += run['below'][q] / total_simulated_particles
-                    outside[q][1] += run['above'][q] / total_simulated_particles
+                if medium != 'StdRock':
+                    for q in product_edges:
+                        G[offsets[p].start + m, offsets[q]] = run['products'][q] / total_simulated_particles
+                        outside[q][0] += run['below'][q] / total_simulated_particles
+                        outside[q][1] += run['above'][q] / total_simulated_particles
+        if medium == 'StdRock':
+            for p, edges in product_edges.items():
+                if self._stdrock_dir(p) is None:
+                    if self.verbose > 0:
+                        print(f"Warning: no StdRock/{p} runs: the products of neutrino-made {p}s are not followed.")
+                    continue
+                for q, q_edges in product_edges.items():
+                    rows = self._load_stdrock_rows(p, q, q_edges, total_simulated_particles, primary_bins_gev=edges)
+                    n_p, n_q = len(edges) - 1, len(q_edges) - 1
+                    G[offsets[p], offsets[q]] = np.bincount(rows['primary_cell'] * n_q + rows['cell'],
+                                                            minlength=n_p * n_q).reshape(n_p, n_q) * rows['weight']
         return offsets, R, G, outside
+
+
+    def _neutrino_run_pass(self, species, run_dir, edges, t_kyr, product_edges, total_simulated_particles,
+                           neutrino_bias, rho, solid_angle_factor, with_recoils=True):
+        """One pass over the neutrino runs of a folder: recoils and first products, per gram of the run medium.
+
+        Rate per gram:  solid_angle_factor * sum_i Phi_i(t) * counts_i / (N * bias_i * L * rho), with Phi_i the
+        flux integrated over the energy cell of run i, L the target length and rho the density of the run medium.
+
+        Args:
+            species (str): Neutrino species.
+            run_dir (str): Run folder (mineral or StdRock).
+            edges (np.ndarray): Energy cell edges of the runs used [GeV].
+            t_kyr (np.ndarray): Local times [kyr], shape (T,).
+            product_edges (dict): {product: energy cell edges [GeV]}.
+            total_simulated_particles (float): Primaries per run.
+            neutrino_bias: See _neutrino_bias.
+            rho (float): Density of the run medium [g/cm^3].
+            solid_angle_factor (float): See integrate_atmospheric_neutrinos.
+            with_recoils (bool, optional): Also collect the recoils. Defaults to True.
+
+        Returns:
+            dict: 'recoils' {fragment: (T, n_recoil_bins)} [per g per s], 'S0' (T, K) first products [per g per s],
+            'lost' {product: [below, above]} (products outside the cells, time-averaged [per g per s]), 'report'
+            (n_runs, minimum and maximum bias, maximum biased interactions per primary).
+        """
+        n_t, n_r = t_kyr.size, len(RECOIL_ENERGY_BINS_MEV) - 1
+        n_k = sum(len(e) - 1 for e in product_edges.values())
+        length_cm = self._geant4_geometry(run_dir)["target_length_m"] * 100.0
+        phi_cell = self._flux_cell_integral(species, t_kyr, edges)          # (T, n_cells)
+        if self.verbose > 0 and not np.any(phi_cell > 0):
+            print(f"Warning: the flux history has no {species} flux (templates built without neutrinos?): "
+                  f"{species} gives zero.")
+        out = {'recoils': {}, 'S0': np.zeros((n_t, n_k)), 'lost': {p: [0.0, 0.0] for p in product_edges}}
+        biases, fractions = [], []
+        for i, e0 in enumerate(edges[:-1]):
+            bias = self._neutrino_bias(species, e0, neutrino_bias, data_dir=run_dir)
+            run = self._read_recoils_and_products(os.path.join(run_dir, f"outNuclei_{e0:.6f}.txt"), product_edges)
+            w = solid_angle_factor * phi_cell[:, i] / (total_simulated_particles * bias * length_cm * rho)
+            if with_recoils:
+                for frag, counts in run['recoils'].items():
+                    out['recoils'].setdefault(frag, np.zeros((n_t, n_r)))
+                    out['recoils'][frag] += np.outer(w, counts)
+            col = 0
+            for p, p_edges in product_edges.items():
+                n_p = len(p_edges) - 1
+                out['S0'][:, col:col + n_p] += np.outer(w, run['products'][p])
+                out['lost'][p][0] += float(np.mean(w)) * run['below'][p]
+                out['lost'][p][1] += float(np.mean(w)) * run['above'][p]
+                col += n_p
+            biases.append(bias)
+            fractions.append(run['n_vertices'] / total_simulated_particles)
+        out['report'] = (len(edges) - 1, min(biases), max(biases), max(fractions))
+        return out
 
 
     def integrate_atmospheric_neutrinos(
@@ -2926,6 +3180,7 @@ class Paleodetector:
         secondaries=True, product_simulated_particles=None, nucleus=DEFAULT_TRACK_SUM,
         annealing=None, annealing_r_min=0.0, x_grid=TRACK_LENGTH_BINS_NM,
         solid_angle_factor=NEUTRINO_SOLID_ANGLE_FACTOR, flux_history=None,
+        secondary_medium='auto', stdrock_neutrino_bias=None,
     ):
         """Track counts from atmospheric neutrinos: their own interactions in the sample and those of the
         particles they produce in the surrounding rock.
@@ -2942,17 +3197,26 @@ class Paleodetector:
           Rate of a fragment per gram:  solid_angle_factor * sum_i Phi_i(t) * counts_i / (N * bias_i * L * rho),
           with Phi_i the flux integrated over the energy cell of run i.
 
-        Secondaries ('nu_secondary_<product>', if secondaries=True). The muons, neutrons and protons written by the
-        neutrino runs are followed with the mineral runs of the same particle (energy cell lower edge, as in
-        _process_secondary_geant4_data), and the neutrons and protons those produce in turn too (all generations,
-        cross-generations included: products = S0 (I - G)^-1, see _neutrino_product_operator). The surrounding
-        rock is taken to be the mineral itself and much thicker than the products' ranges; then, for a source
-        uniform in space, every product makes all its recoils in rock like the sample and the recoil rate per gram
-        equals (products made per gram) x (recoils per product over its whole path) -- again no overburden or
-        geometry. This holds for neutrons and protons (ranges below ~1 m.w.e.) and for muons whose range is
-        smaller than the rock around the sample; within a muon range of the surface the down-going contribution
-        is overestimated (up to 2x), but there the cosmic-ray muons dominate by far. Recoils of products with
-        energies outside the product run grid are missing (reported).
+        Secondaries ('nu_secondary_<product>', if secondaries=True): the muons, neutrons and protons the neutrinos
+        make in the rock around the sample, and the neutrons and protons those make in turn (all generations,
+        cross-generations included: products = S0 (I - G)^-1, see _neutrino_product_operator). The rock around the
+        sample is taken to be much thicker than the products' ranges and the neutrino source uniform in it; then
+        the products are in equilibrium and the recoil rate per gram of sample is
+
+            (products made per gram of rock, all generations) x (recoils per product over its whole path in the
+            mineral),
+
+        with no overburden or geometry (path lengths in g/cm^2 taken equal in rock and mineral). The rock is
+        set by secondary_medium:
+          * 'StdRock': generic crust, as for the atmospheric secondaries. The first products come from the
+            StdRock/<neutrino species> runs (bias read from their geometry.json, or stdrock_neutrino_bias), the
+            generations from the StdRock runs of the products; the recoils from the mineral runs of the products.
+          * 'mineral': the sample sits in a large body of the same mineral; everything from the mineral runs.
+          * 'auto' (default): 'StdRock' if every neutrino species computed has StdRock runs, else 'mineral'.
+        This holds for neutrons and protons (ranges below ~1 m.w.e.) and for muons whose range is smaller than the
+        rock around the sample; within a muon range of the surface the down-going contribution is overestimated
+        (up to 2x), but there the cosmic-ray muons dominate by far. Recoils of products with energies outside the
+        product run grid are missing (reported).
 
         Args:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm]. Defaults to None
@@ -2977,13 +3241,18 @@ class Paleodetector:
                 NEUTRINO_SOLID_ANGLE_FACTOR (4: isotropic, from all directions).
             flux_history (FluxHistory, optional): If given, set with set_flux_history before the integration;
                 None keeps the current one. Defaults to None.
+            secondary_medium (str, optional): Rock in which the secondaries are made: 'auto', 'StdRock' or
+                'mineral' (see above). Defaults to 'auto'.
+            stdrock_neutrino_bias (float, dict, callable or None, optional): Bias of the StdRock neutrino runs, same
+                forms as neutrino_bias. Defaults to None (from their geometry.json).
 
         Returns:
             tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each neutrino species, each
             'nu_secondary_<product>' (summed over the neutrino species) and 'total'.
 
         Raises:
-            ValueError: If a species has no runs, e_range is invalid, or a run has no bias.
+            ValueError: If a species has no runs, e_range is invalid, a run has no bias, or secondary_medium is
+                'StdRock' without StdRock neutrino runs.
         """
         if flux_history is not None:
             self.set_flux_history(flux_history)
@@ -3012,50 +3281,63 @@ class Paleodetector:
         product_edges = {p: self.energy_bins[p] for p in products}
         n_cells_total = sum(len(e) - 1 for e in product_edges.values())
 
-        # --- neutrino runs: recoils of the neutrinos and first products ---
+        # --- neutrino runs in the mineral: recoils of the neutrinos (and first products, medium 'mineral') ---
+        stdrock_nu = {sp: os.path.join(self.data_path, "Geant4_data", "StdRock", sp) for sp in species_list}
+        has_stdrock = {sp: _geant4_energy_edges(d) is not None for sp, d in stdrock_nu.items()}
+        if secondary_medium == 'auto':
+            secondary_medium = 'StdRock' if all(has_stdrock.values()) else 'mineral'
+            if products and self.verbose > 0 and secondary_medium == 'mineral':
+                missing = [sp for sp, ok in has_stdrock.items() if not ok]
+                print(f"Neutrino secondaries made in the mineral (no StdRock runs for {missing}).")
+        if secondary_medium not in ('StdRock', 'mineral'):
+            raise ValueError(f"secondary_medium must be 'auto', 'StdRock' or 'mineral', got {secondary_medium!r}.")
+        if products and secondary_medium == 'StdRock' and not all(has_stdrock.values()):
+            raise ValueError(f"No StdRock neutrino runs for {[sp for sp, ok in has_stdrock.items() if not ok]} in "
+                             f"{os.path.join(self.data_path, 'Geant4_data', 'StdRock')}.")
+
         recoils = {}                                            # species -> {fragment: (T, n_r)} [per g per s]
-        S0 = np.zeros((n_t, n_cells_total))                     # first products [per g per s]
+        S0 = np.zeros((n_t, n_cells_total))                     # first products [per g of rock per s]
         lost = {p: [0.0, 0.0] for p in products}                # products outside the cells [per g per s]
         report = []
-        for s in species_list:
-            edges = self._energy_edges(s, e_range.get(s))
-            run_dir = os.path.join(self.data_path, "Geant4_data", self.name, s)
-            length_cm = self._geant4_geometry(run_dir)["target_length_m"] * 100.0
-            phi_cell = self._flux_cell_integral(s, t_kyr, edges)          # (T, n_cells)
-            if self.verbose > 0 and not np.any(phi_cell > 0):
-                print(f"Warning: the flux history has no {s} flux (templates built without neutrinos?): "
-                      f"{s} gives zero.")
-            spec, biases, fractions = {}, [], []
-            for i, e0 in enumerate(edges[:-1]):
-                bias = self._neutrino_bias(s, e0, neutrino_bias)
-                run = self._read_recoils_and_products(os.path.join(run_dir, f"outNuclei_{e0:.6f}.txt"), product_edges)
-                w = solid_angle_factor * phi_cell[:, i] / (total_simulated_particles * bias * length_cm * rho)
-                for frag, counts in run['recoils'].items():
-                    spec.setdefault(frag, np.zeros((n_t, n_r)))
-                    spec[frag] += np.outer(w, counts)
-                col = 0
+        for sp in species_list:
+            run_dir = os.path.join(self.data_path, "Geant4_data", self.name, sp)
+            res = self._neutrino_run_pass(sp, run_dir, self._energy_edges(sp, e_range.get(sp)), t_kyr,
+                                          product_edges, total_simulated_particles, neutrino_bias, rho,
+                                          solid_angle_factor)
+            recoils[sp] = res['recoils']
+            report.append((sp, self.name, *res['report']))
+            if secondary_medium == 'mineral':
+                S0 += res['S0']
                 for p in products:
-                    n_p = len(product_edges[p]) - 1
-                    S0[:, col:col + n_p] += np.outer(w, run['products'][p])
-                    lost[p][0] += float(np.mean(w)) * run['below'][p]
-                    lost[p][1] += float(np.mean(w)) * run['above'][p]
-                    col += n_p
-                biases.append(bias)
-                fractions.append(run['n_vertices'] / total_simulated_particles)
-            recoils[s] = spec
-            report.append((s, len(edges) - 1, min(biases), max(biases), max(fractions)))
+                    lost[p] = [a + b for a, b in zip(lost[p], res['lost'][p])]
+
+        # --- neutrino runs in StdRock: first products (medium 'StdRock') ---
+        if products and secondary_medium == 'StdRock':
+            for sp in species_list:
+                run_dir = stdrock_nu[sp]
+                geo = self._geant4_geometry(run_dir)
+                rho_rock = geo["density_g_cm3"] if geo["density_g_cm3"] is not None else 2.65
+                edges = _restrict_edges(_geant4_energy_edges(run_dir)['edges'], e_range.get(sp), f"StdRock/{sp}")
+                res = self._neutrino_run_pass(sp, run_dir, edges, t_kyr, product_edges, total_simulated_particles,
+                                              stdrock_neutrino_bias, rho_rock, solid_angle_factor,
+                                              with_recoils=False)
+                S0 += res['S0']
+                for p in products:
+                    lost[p] = [a + b for a, b in zip(lost[p], res['lost'][p])]
+                report.append((sp, 'StdRock', *res['report']))
 
         if self.verbose > 0:
-            for s, n, b_lo, b_hi, f_max in report:
+            for sp, where, n, b_lo, b_hi, f_max in report:
                 bias_txt = f"{b_lo:.3g}" if b_lo == b_hi else f"{b_lo:.3g}-{b_hi:.3g}"
-                print(f"Neutrinos {s}: {n} runs, bias {bias_txt}, biased interactions per primary up to {f_max:.3g}"
+                print(f"Neutrinos {sp} ({where} runs): {n} runs, bias {bias_txt}, biased interactions per primary "
+                      f"up to {f_max:.3g}"
                       + ("" if f_max <= NEUTRINO_MAX_INTERACTION_FRACTION else
                          f"  (warning: above {NEUTRINO_MAX_INTERACTION_FRACTION}, the beam is depleted along the "
                          "target and the rate is underestimated: lower the bias)"))
 
         # --- products and their generations ---
         if products:
-            offsets, R, G, outside = self._neutrino_product_operator(product_edges, n_prod_sim)
+            offsets, R, G, outside = self._neutrino_product_operator(product_edges, n_prod_sim, secondary_medium)
             radius = np.max(np.abs(np.linalg.eigvals(G))) if G.size else 0.0
             if radius < 1.0:
                 S = np.linalg.solve((np.eye(n_cells_total) - G).T, S0.T).T       # S0 (I - G)^-1
@@ -3089,29 +3371,34 @@ class Paleodetector:
         for key, spec in recoils.items():
             recoil_data = {'Er_bins': RECOIL_ENERGY_BINS_MEV, 't_kyr': t_kyr,
                            **{frag: arr * to_per_kyr_mev for frag, arr in spec.items()}}
-            dRdx = self._convert_recoil_to_track_spectrum(recoil_data, x_grid, fragments=list(spec))
-            if nucleus not in dRdx:
-                raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS} or a fragment of {key} "
-                                 f"({sorted(k for k in dRdx if k not in TRACK_SUMS)}).")
-            rate = np.broadcast_to(np.atleast_2d(dRdx[nucleus]), (n_t, len(x_grid) - 1))
-            results[key] = self._integrate_rate_over_window(rate, t_kyr, x_bins, x_grid, annealing, annealing_r_min)
+            dRdx = self._select_nucleus(
+                self._convert_recoil_to_track_spectrum(recoil_data, x_grid, fragments=list(spec)), nucleus, key
+            )
+            results[key] = self._integrate_rate_over_window(dRdx, t_kyr, x_bins, x_grid, annealing, annealing_r_min)
 
         results['total'] = sum(results.values())
         return x_bins, results
 
 
 def _species_worker(self_and_args):
-    """Pool worker: computes the track counts of one species.
+    """Pool worker of integrate_all_particles: computes the track counts of one task.
 
     Args:
-        self_and_args (tuple): (Paleodetector instance, keyword arguments of
-            integrate_particle_signal_spectrum including 'species').
+        self_and_args (tuple): (Paleodetector instance, keyword arguments of integrate_particle_signal_spectrum
+            with either 'species' (one primary species) or 'secondary_species' (list of secondary species, solved
+            together by _integrate_secondary_species, energy_bins_gev then being a dict per species)).
 
     Returns:
-        tuple[str, np.ndarray]: (species, tracks per mg in each bin).
+        list[tuple[str, np.ndarray]]: (species, tracks per mg in each bin) for each species of the task.
     """
     self, kwargs = self_and_args
+    kwargs = dict(kwargs)
+    if 'secondary_species' in kwargs:
+        secondary = kwargs.pop('secondary_species')
+        if self.verbose > 1:
+            print(f"Processing secondary species: {secondary}")
+        return list(self._integrate_secondary_species(secondary, **kwargs).items())
     species = kwargs.pop('species')
     if self.verbose > 1:
         print(f"Processing species: {species}")
-    return species, self.integrate_particle_signal_spectrum(species=species, **kwargs)
+    return [(species, self.integrate_particle_signal_spectrum(species=species, **kwargs))]
