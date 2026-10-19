@@ -30,14 +30,13 @@ _ION_NAME_RE = re.compile(r"^([A-Z][a-z]?)(\d+)(?:\[[^\]]*\])?$")
 # Track sums. "total" adds every charged fragment; "total_no_light_ions", the default, leaves out hydrogen and helium
 # (Z <= LIGHT_ION_MAX_Z: p, d, t, 3He, alpha). Their energy loss is almost all ionisation spread along the path
 # (dE/dx at most ~0.1 keV/nm for protons and ~0.4 keV/nm for alphas, at the Bragg peak), which leaves isolated point
-# defects rather than the continuous damaged core that etches faster than the bulk (V > 1), so in crystals such as
-# halite they are not expected to give etchable tracks. Heavier recoils (Z >= 3) are kept.
+# defects rather than the continuous damaged core, so they are not expected to give etchable tracks.
 TOTAL_ALL_FRAGMENTS = "total"
 TOTAL_NO_LIGHT_IONS = "total_no_light_ions"
 TRACK_SUMS = (TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)
 DEFAULT_TRACK_SUM = TOTAL_NO_LIGHT_IONS
 LIGHT_ION_MAX_Z = 2
-_LIGHT_ION_ELEMENTS = {"H", "He"}   # elements with Z <= LIGHT_ION_MAX_Z
+_LIGHT_ION_ELEMENTS = {"H", "He"}
 
 
 def is_light_ion(fragment):
@@ -120,38 +119,112 @@ TRACK_LENGTH_BINS_NM = np.logspace(LENGTH_MIN_LOG_NM, LENGTH_MAX_LOG_NM, LENGTH_
 
 _ENERGY_EDGE_RTOL = 1e-9
 
-# Species whose recoil calculation is implemented. Any MCEQ_SPECIES folder found in Data/Geant4_data/<mineral> is
-# listed at creation; only these (and the secondary species below) can be computed for now. Muons use the stopping
-# depths of StdRock/mu-; the hadrons (neutron, proton) the interaction depths of StdRock/<species>.
 COMPUTABLE_SPECIES = ('mu-', 'mu+', 'neutron', 'proton')
 MUON_SPECIES = ('mu-', 'mu+')
-# Secondary species: particles of type DERIVED_SPECIES[s] produced in the window above the sample by the primaries in
-# SECONDARY_SOURCES (StdRock runs), plus all their later generations, cross-generations included (neutrons from
-# protons and protons from neutrons): the products are followed as one cascade (_secondary_yield). Their recoils (and
-# energy grid) come from the mineral runs of each product. Same generation policy as the neutrino products
-# (_neutrino_product_operator); muons are not produced by the hadron runs, so the chain is
-# (mu, n, p) -> secondary n, p -> tertiary n, p from both -> ...
+
 DERIVED_SPECIES = {'secondary_neutron': 'neutron', 'secondary_proton': 'proton'}
 SECONDARY_SOURCES = ('mu-', 'mu+', 'neutron', 'proton')
 IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E) is reported as a gap
 
-# Atmospheric neutrinos (integrate_atmospheric_neutrinos). Folders Data/Geant4_data/<mineral>/<species>, named as the
-# MCEQ_SPECIES keys (Geant4 gun names: nu_mu, anti_nu_mu, nu_e, anti_nu_e), with biased cross-sections.
-NEUTRINO_SPECIES = ('nu_mu', 'nu_mu_bar', 'nu_e', 'nu_e_bar')
-# Particles produced by the neutrinos (written by the neutrino runs) that are followed to their own recoils, with the
-# mineral runs of the same particle; the neutrons and protons they produce in turn are followed too (generations).
+NEUTRINO_SPECIES = ('nu_mu', 'anti_nu_mu', 'nu_e', 'anti_nu_e')
 NEUTRINO_PRODUCTS = ('mu-', 'mu+', 'neutron', 'proton')
 NEUTRINO_SECONDARY_PREFIX = 'nu_secondary_'
-# The flux templates give the flux crossing a horizontal plane from above, Phi = integral I cos(theta) dOmega over the
-# upper hemisphere (= pi I for an isotropic intensity I). Neutrinos reach a buried sample from every direction, through
-# the Earth too, and the interaction rate per unit volume is integral I dOmega over 4 pi = 4 pi I = 4 Phi. Exact for an
-# isotropic, up-down symmetric flux; it ignores the oscillation of up-going nu_mu (a few tens of % below ~10 GeV) and
-# the horizontal enhancement of the flux above a few GeV.
 NEUTRINO_SOLID_ANGLE_FACTOR = 4.0
-NEUTRINO_MAX_INTERACTION_FRACTION = 0.1   # biased interactions per primary above this are reported (linear regime)
+NEUTRINO_MAX_INTERACTION_FRACTION = 0.1 
 NEUTRINO_MAX_GENERATIONS = 50             # cap on the product generations if the series does not converge
 
-DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 200)
+DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 500)
+
+def set_integration_x_bins_nm(integration_x_bins_nm):
+    """Sets the module-wide default output track-length binning.
+
+    Purpose: every integrate_* function returns counts on x_bins; when x_bins is None they use this default, read
+    at call time (_resolve_x_bins). Changing it once (e.g. to the bins of a microscopy descriptor) avoids passing
+    x_bins to every call. It does not change the fine internal grid TRACK_LENGTH_BINS_NM.
+
+    Args:
+        integration_x_bins_nm (np.ndarray): Bin edges [nm].
+    """
+    global DEFAULT_INTEGRATION_X_BINS_NM 
+    
+    DEFAULT_INTEGRATION_X_BINS_NM = integration_x_bins_nm
+    return
+
+
+def _geant4_energy_edges(data_dir):
+    """Primary-energy bins of a Geant4 run directory, built from its file names.
+
+    Purpose: the code integrates the cosmic-ray flux over energy bins and weights each bin by the response of one
+    Geant4 run. Each outNuclei_<E>.txt is taken as the response at the lower edge E of its bin; a bin ends at the
+    next file energy and the last one at one more step of the same logarithmic size as the last step (the
+    convention of the run grids). Built per species at creation (_scan_geant4_species), so every species uses all
+    and only the energies actually simulated. Irregular steps are reported because the run below a gap then
+    stands for the whole gap.
+
+    Args:
+        data_dir (str): Directory containing outNuclei_<E>.txt files.
+
+    Returns:
+        dict or None: 'edges' (bin edges [GeV], n_files + 1 values), 'n_files', 'gaps' (list of (E_low, E_high)
+        steps larger than IRREGULAR_STEP_FACTOR times the median step in log(E), so one missing file on a
+        logarithmic grid, a doubled step, is reported); None if fewer than 2 files.
+    """
+    energies = np.array([e for e, _ in _list_geant4_energy_files(data_dir)])
+    if energies.size < 2:
+        return None
+    ratios = energies[1:] / energies[:-1]
+    edges = np.append(energies, energies[-1] * ratios[-1])
+    log_steps = np.log(ratios)
+    big = log_steps > IRREGULAR_STEP_FACTOR * np.median(log_steps)
+    gaps = [(energies[i], energies[i + 1]) for i in np.where(big)[0]]
+    return {'edges': edges, 'n_files': energies.size, 'gaps': gaps}
+
+
+def _restrict_edges(edges, e_range, label):
+    """Keeps the energy bins lying entirely inside a range.
+
+    Purpose: e_range options (integrate_all_particles, integrate_atmospheric_neutrinos) select a part of a Geant4
+    run grid; this is the single place where that selection is made, for the mineral and the StdRock grids alike.
+
+    Args:
+        edges (np.ndarray): Bin edges [GeV].
+        e_range (tuple[float, float] or None): (E_min, E_max) [GeV]; None keeps every bin.
+        label (str): Name used in the error messages.
+
+    Returns:
+        np.ndarray: The kept bin edges [GeV].
+
+    Raises:
+        ValueError: If e_range is not increasing, is outside the grid, or contains no complete bin.
+    """
+    if e_range is None:
+        return edges
+    lo, hi = (float(v) for v in e_range)
+    tol = 1 + _ENERGY_EDGE_RTOL
+    if not lo < hi:
+        raise ValueError(f"{label}: e_range {e_range} must be (E_min, E_max) with E_min < E_max.")
+    if lo * tol < edges[0] or hi > edges[-1] * tol:
+        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV is outside the available range "
+                         f"({edges[0]:.4g}, {edges[-1]:.4g}) GeV.")
+    inside = np.where((edges[:-1] * tol >= lo) & (edges[1:] <= hi * tol))[0]
+    if inside.size == 0:
+        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV contains no complete energy bin.")
+    return edges[inside[0]:inside[-1] + 2]
+
+
+def _resolve_x_bins(x_bins):
+    """The given output track-length bins, or the module default (set_integration_x_bins_nm) if None.
+
+    Purpose: one place for the x_bins default, read at call time so that set_integration_x_bins_nm takes effect
+    without reloading the module.
+
+    Args:
+        x_bins (array_like or None): Bin edges [nm].
+
+    Returns:
+        np.ndarray: Bin edges [nm].
+    """
+    return DEFAULT_INTEGRATION_X_BINS_NM if x_bins is None else np.asarray(x_bins, dtype=float)
 
 
 # --- Depth-probability tables from the StdRock Geant4 runs ---
@@ -458,99 +531,6 @@ def _shorten_tracks(density, grid_edges, r, r_min=0.0):
             continue
         out[k] = np.diff(np.interp(grid_edges / r[k], grid_edges, cum[k])) / widths
     return out.reshape(density.shape)
-
-
-def set_integration_x_bins_nm(integration_x_bins_nm):
-    """Sets the module-wide default output track-length binning.
-
-    Purpose: every integrate_* function returns counts on x_bins; when x_bins is None they use this default, read
-    at call time (_resolve_x_bins). Changing it once (e.g. to the bins of a microscopy descriptor) avoids passing
-    x_bins to every call. It does not change the fine internal grid TRACK_LENGTH_BINS_NM.
-
-    Args:
-        integration_x_bins_nm (np.ndarray): Bin edges [nm].
-    """
-    global DEFAULT_INTEGRATION_X_BINS_NM 
-    
-    DEFAULT_INTEGRATION_X_BINS_NM = integration_x_bins_nm
-    return
-
-
-def _geant4_energy_edges(data_dir):
-    """Primary-energy bins of a Geant4 run directory, built from its file names.
-
-    Purpose: the code integrates the cosmic-ray flux over energy bins and weights each bin by the response of one
-    Geant4 run. Each outNuclei_<E>.txt is taken as the response at the lower edge E of its bin; a bin ends at the
-    next file energy and the last one at one more step of the same logarithmic size as the last step (the
-    convention of the run grids). Built per species at creation (_scan_geant4_species), so every species uses all
-    and only the energies actually simulated. Irregular steps are reported because the run below a gap then
-    stands for the whole gap.
-
-    Args:
-        data_dir (str): Directory containing outNuclei_<E>.txt files.
-
-    Returns:
-        dict or None: 'edges' (bin edges [GeV], n_files + 1 values), 'n_files', 'gaps' (list of (E_low, E_high)
-        steps larger than IRREGULAR_STEP_FACTOR times the median step in log(E), so one missing file on a
-        logarithmic grid, a doubled step, is reported); None if fewer than 2 files.
-    """
-    energies = np.array([e for e, _ in _list_geant4_energy_files(data_dir)])
-    if energies.size < 2:
-        return None
-    ratios = energies[1:] / energies[:-1]
-    edges = np.append(energies, energies[-1] * ratios[-1])
-    log_steps = np.log(ratios)
-    big = log_steps > IRREGULAR_STEP_FACTOR * np.median(log_steps)
-    gaps = [(energies[i], energies[i + 1]) for i in np.where(big)[0]]
-    return {'edges': edges, 'n_files': energies.size, 'gaps': gaps}
-
-
-def _restrict_edges(edges, e_range, label):
-    """Keeps the energy bins lying entirely inside a range.
-
-    Purpose: e_range options (integrate_all_particles, integrate_atmospheric_neutrinos) select a part of a Geant4
-    run grid; this is the single place where that selection is made, for the mineral and the StdRock grids alike.
-
-    Args:
-        edges (np.ndarray): Bin edges [GeV].
-        e_range (tuple[float, float] or None): (E_min, E_max) [GeV]; None keeps every bin.
-        label (str): Name used in the error messages.
-
-    Returns:
-        np.ndarray: The kept bin edges [GeV].
-
-    Raises:
-        ValueError: If e_range is not increasing, is outside the grid, or contains no complete bin.
-    """
-    if e_range is None:
-        return edges
-    lo, hi = (float(v) for v in e_range)
-    tol = 1 + _ENERGY_EDGE_RTOL
-    if not lo < hi:
-        raise ValueError(f"{label}: e_range {e_range} must be (E_min, E_max) with E_min < E_max.")
-    if lo * tol < edges[0] or hi > edges[-1] * tol:
-        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV is outside the available range "
-                         f"({edges[0]:.4g}, {edges[-1]:.4g}) GeV.")
-    inside = np.where((edges[:-1] * tol >= lo) & (edges[1:] <= hi * tol))[0]
-    if inside.size == 0:
-        raise ValueError(f"{label}: e_range ({lo:g}, {hi:g}) GeV contains no complete energy bin.")
-    return edges[inside[0]:inside[-1] + 2]
-
-
-def _resolve_x_bins(x_bins):
-    """The given output track-length bins, or the module default (set_integration_x_bins_nm) if None.
-
-    Purpose: one place for the x_bins default, read at call time so that set_integration_x_bins_nm takes effect
-    without reloading the module.
-
-    Args:
-        x_bins (array_like or None): Bin edges [nm].
-
-    Returns:
-        np.ndarray: Bin edges [nm].
-    """
-    return DEFAULT_INTEGRATION_X_BINS_NM if x_bins is None else np.asarray(x_bins, dtype=float)
-
 
 def log_interp1d(xx, yy, kind='linear'):
     """Builds an interpolator that is linear in log-log space.
@@ -873,7 +853,7 @@ class Paleodetector:
             if derived in self.available_species():
                 sources = [src for src in SECONDARY_SOURCES if self._stdrock_dir(src) is not None]
                 lines.append(f"  {derived:<10} {product}s produced by {', '.join(sources)} above the sample "
-                             f"(StdRock runs, all generations of the n + p cascade), recoils from the {product} runs")
+                             f"(StdRock runs, all generations of the n + p cascade)")
         print("\n".join(lines))
 
 
