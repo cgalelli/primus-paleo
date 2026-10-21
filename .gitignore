@@ -4,3 +4,4 @@ Data/Geant4_data/CmakeLists.txt
 __pycache__/
 Data/models/**
 Data/profiler_calibration/**
+.vscode/**
