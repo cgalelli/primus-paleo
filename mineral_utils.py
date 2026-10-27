@@ -422,6 +422,129 @@ def _rebin_density(density, grid_edges, out_edges):
     cumulative = np.concatenate(([0.0], np.cumsum(np.asarray(density, dtype=float) * np.diff(grid_edges))))
     return np.diff(np.interp(np.asarray(out_edges, dtype=float), grid_edges, cumulative))
 
+def interaction_profiles(mineral, energies_gev, z_edges_mwe, species=('neutron', 'proton', 'mu-'), capture=True):
+    """Interaction depth profiles from the StdRock depth tables, as used by the integrations.
+
+    Hadrons: dP/dz of the interaction depth, F(z_hi) - F(z_lo) per bin (exponential tail included).
+    Muons:   in-flight interactions only (no capture), (G(z_hi) - G(z_lo)) / E[R] per bin, i.e. interaction
+             density proportional to the survival probability P(R > z); mu+ uses the same mu- table.
+
+    Args:
+        mineral (Paleodetector): any detector of the mineral (the tables come from StdRock, not from the mineral).
+        energies_gev (array_like): primary energies [GeV].
+        z_edges_mwe (np.ndarray): depth bin edges along the path [m.w.e.].
+        species (tuple[str]): any of 'neutron', 'proton', 'mu-', 'mu+' (with a depth table).
+
+    Returns:
+        dict: species -> dP/dz [1/m.w.e.], shape (n_depth_bins, n_energies).
+    """
+    E = np.atleast_1d(np.asarray(energies_gev, float))
+    z_lo = np.broadcast_to(z_edges_mwe[:-1, None], (len(z_edges_mwe) - 1, E.size))
+    z_hi = np.broadcast_to(z_edges_mwe[1:, None], z_lo.shape)
+    dz = np.diff(z_edges_mwe)[:, None]
+    out = {}
+    for s in species:
+        if s in MUON_SPECIES:
+            prob, _capture = mineral._muon_depth_probabilities(E, z_lo, z_hi)   # in flight; _capture = stopping peak
+            if capture:
+                prob += _capture
+        else:
+            prob = mineral._hadron_depth_probability(E, z_lo, z_hi, s)
+        out[s] = prob / dz
+    return out
+
+    def plot_secondary_production(self, sources=None, products=('neutron', 'proton'),
+                                  total_simulated_particles=1e4, product_bins_gev=None, z_edges_mwe=None,
+                                  example_species='mu-', example_energy_gev=None, t_kyr=None):
+        """Overview of the secondary neutrons and protons produced in the StdRock runs, in three panels.
+
+        Purpose: a diagnostic of the input of the atmospheric secondary cascade (_secondary_yield), straight from the
+        StdRock rows (_load_stdrock_rows), to see which primaries make the secondaries, where and with what energy.
+          (a) Yield: secondaries per primary vs primary energy, one line per source and product.
+          (b) Where and with what energy: production depth vs secondary energy (neutrons + protons) for one run.
+          (c) Who makes them at each depth: production rate per gram of rock vs depth, each run weighted by the flux
+              integrated over its energy cell (flux history at t_kyr). Every primary is taken as vertical, so the
+              panel shows shapes and crossover depths; the integrations also spread the primaries over zenith angle.
+        Yields only count products made inside the StdRock target (a lower limit for muons leaving it).
+
+        Args:
+            sources (list[str], optional): Primary species. Defaults to None (SECONDARY_SOURCES with StdRock runs;
+                mu+ falls back on the mu- runs without captures, see _stdrock_dir).
+            products (tuple[str], optional): Secondaries shown. Defaults to ('neutron', 'proton').
+            total_simulated_particles (float, optional): Primaries per StdRock run. Defaults to 1e4.
+            product_bins_gev (np.ndarray, optional): Secondary energy bins [GeV]. Defaults to 40 log bins, 1 MeV-10 GeV.
+            z_edges_mwe (np.ndarray, optional): Depth bins [m.w.e.]. Defaults to 120 log bins from 0.01 m.w.e. to the
+                longest StdRock target.
+            example_species (str, optional): Source shown in panel (b). Defaults to 'mu-'.
+            example_energy_gev (float, optional): Primary energy of panel (b); the run whose cell contains it is used.
+                Defaults to None (the highest-energy run).
+            t_kyr (float, optional): Local time of the flux used in panel (c) [kyr]. Defaults to None (present).
+
+        Returns:
+            tuple: (figure, array of the three axes).
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LogNorm
+
+        sources = [src for src in (SECONDARY_SOURCES if sources is None else sources) if self._stdrock_dir(src)]
+        if not sources:
+            raise ValueError("No StdRock runs for any of the requested sources.")
+        product_bins_gev = np.logspace(-3, 1, 41) if product_bins_gev is None else np.asarray(product_bins_gev, float)
+        rows = {(src, q): self._load_stdrock_rows(src, q, product_bins_gev, total_simulated_particles)
+                for src in sources for q in products}
+        if z_edges_mwe is None:
+            z_max = max(r['target_mwe'] for r in rows.values())
+            z_edges_mwe = np.logspace(-2, np.log10(z_max), 120)
+        z_edges_mwe = np.asarray(z_edges_mwe, float)
+        z_mid = np.sqrt(np.maximum(z_edges_mwe[1:] * z_edges_mwe[:-1], 1e-300))
+        styles = ('-', '--', ':', '-.')
+
+        fig, ax = plt.subplots(1, 3, figsize=[17, 4.6])
+
+        # (a) yield per primary vs primary energy
+        for k, src in enumerate(sources):
+            for q, ls in zip(products, styles):
+                r = rows[(src, q)]
+                e0 = r['primary_bins'][:-1]
+                y = np.bincount(r['primary_cell'], minlength=e0.size) * r['weight']
+                ax[0].loglog(e0, np.where(y > 0, y, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
+        ax[0].set(xlabel="Primary energy (GeV)", ylabel="Secondaries per primary", title="(a) Yield")
+        ax[0].legend(fontsize='x-small', ncol=2)
+
+        # (b) production depth x secondary energy for one run
+        if example_species not in sources:
+            example_species = sources[0]
+        pb = rows[(example_species, products[0])]['primary_bins']
+        i0 = (len(pb) - 2 if example_energy_gev is None
+              else int(np.clip(np.searchsorted(pb, example_energy_gev, side='right') - 1, 0, len(pb) - 2)))
+        H = np.zeros((len(z_edges_mwe) - 1, len(product_bins_gev) - 1))
+        for q in products:
+            r = rows[(example_species, q)]
+            sel = r['primary_cell'] == i0
+            H += np.histogram2d(r['depth_mwe'][sel], product_bins_gev[r['cell'][sel]],
+                                bins=[z_edges_mwe, product_bins_gev])[0] * r['weight']
+        dens = H / np.diff(z_edges_mwe)[:, None] / np.diff(np.log10(product_bins_gev))[None, :]
+        if np.any(dens > 0):
+            m = ax[1].pcolormesh(z_edges_mwe, product_bins_gev, np.where(dens > 0, dens, np.nan).T,
+                                 norm=LogNorm(), shading='flat')
+            fig.colorbar(m, ax=ax[1], label="per primary per m.w.e. per decade")
+        ax[1].set(xscale='log', yscale='log', xlabel="Production depth (m.w.e.)", ylabel="Secondary energy (GeV)",
+                  title=f"(b) {' + '.join(products)} from {example_species} at {pb[i0]:.3g} GeV")
+
+        # (c) flux-weighted production rate vs depth
+        t_now = np.array([self.total_age_kyr if t_kyr is None else float(t_kyr)])
+        for k, src in enumerate(sources):
+            for q, ls in zip(products, styles):
+                r = rows[(src, q)]
+                phi = self._flux_cell_integral(src, t_now, r['primary_bins'])[0]          # cm^-2 s^-1 per cell
+                w = phi[r['primary_cell']] * r['weight']
+                rate = np.histogram(r['depth_mwe'], bins=z_edges_mwe, weights=w)[0] / (np.diff(z_edges_mwe) * 100.)
+                ax[2].loglog(z_mid, np.where(rate > 0, rate, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
+        ax[2].set(xlabel="Depth (m.w.e.)", ylabel=r"Production rate (g$^{-1}$ s$^{-1}$)",
+                  title="(c) Who makes the secondaries")
+        ax[2].legend(fontsize='x-small', ncol=2)
+        fig.tight_layout()
+        return fig, ax
 
 # --- Track annealing laws -------------------------------------------------------------------------------------
 K_B_EV = 8.617333262e-5
