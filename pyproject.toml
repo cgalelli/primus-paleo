@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "primus-paleo"
+version = "0.1.0"
+description = "Simulation of paleo-detector track spectra from cosmic rays, neutrinos and radioactivity (PRImuS)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Claudio Galelli" }]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "mendeleev",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]                 # plot_secondary_production and the analysis notebooks
+mceq = ["MCEq", "crflux"]             # building new flux templates (loading saved ones needs neither)
+dev = ["pytest", "matplotlib"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["mineral_utils", "flux_history"]   # deprecated shims for notebooks written before the package
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -11,8 +11,9 @@ from mendeleev import element
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-from flux_history import FluxHistory, MCEQ_SPECIES
-from paleo_core import (
+from . import config
+from .flux import FluxHistory, MCEQ_SPECIES
+from ._core import (
     B0_U238, CAPTURE_SPECTRUM_MAX_E0_GEV, COMPUTABLE_SPECIES, DEFAULT_TRACK_SUM, DEPTH_FLOOR_MWE,
     DERIVED_SPECIES, FISSIONS_U238_G_KYR, KYR_PER_SECOND, MIN_DEPTH_SAMPLES, MUON_SPECIES,
     NEUTRINO_MAX_GENERATIONS, NEUTRINO_MAX_INTERACTION_FRACTION, NEUTRINO_PRODUCTS, NEUTRINO_SECONDARY_PREFIX,
@@ -49,13 +50,14 @@ class Paleodetector:
         flux_history (FluxHistory or None): Cosmic-ray flux history.
         verbose (int): Verbosity level (0 = silent).
     """
-    
-    def __init__(self, mineral_config, total_age_kyr, overburden_history=None, flux_history=None, data_path_prefix="Data"):
+
+    def __init__(self, mineral_config, total_age_kyr, overburden_history=None, flux_history=None, data_path_prefix=None):
         """Initialises the detector and builds the depth-probability tables.
 
         Args:
             mineral_config (dict): Mineral properties. Required keys: 'name',
                 'density_g_cm3', 'uranium_concentration_g_g', 'an_coeff_n_nalpha'.
+                Or the name of a material of the mineral library (config.mineral_config), e.g. "Halite".
             total_age_kyr (float): Exposure age of the sample [kyr].
             overburden_history (dict or float, optional): Overburden history (see
                 _interpolate_overburden_history), or a constant overburden [m.w.e.].
@@ -66,17 +68,19 @@ class Paleodetector:
                 time total_age_kyr (present) to 0. If None, a baseline-only history is
                 used. To change it later use set_flux_history (the only other way to
                 set it). Defaults to None.
-            data_path_prefix (str, optional): Root of the data directory.
-                Defaults to "Data".
+            data_path_prefix (str, optional): Root of the data directory. Defaults to None (config.data_path():
+                set_data_path, PRIMUS_DATA, <repository>/Data or ./Data).
         """
+        if isinstance(mineral_config, str):
+            mineral_config = dict(config.mineral_config(mineral_config, data_path_prefix), name=mineral_config)
         self.config = mineral_config
         self.name = mineral_config['name']
-        self.data_path = data_path_prefix
+        self.data_path = config.data_path(data_path_prefix)
 
         self.verbose = 1
 
         self.radiogenic_spectrum = self._radiogenic_spectrum()
-        
+
         self.alpha_n_spectrum = self._alpha_n_spectrum()
 
         self.total_age_kyr = total_age_kyr
@@ -268,7 +272,7 @@ class Paleodetector:
         t = np.concatenate([np.linspace(0.0, t_now, TIME_GRID_BACKBONE), self._overburden_breakpoints,
                             self._flux_breakpoints()])
         t = np.unique(t[(t >= 0.0) & (t <= t_now)])
-        n_start = t.size        
+        n_start = t.size
         seg_edges = np.unique(np.concatenate([[0.0, t_now], self._overburden_breakpoints,
                                               self._flux_breakpoints(nodes=False)]))
         min_dt = 1e-6 * t_now                                   # steps (jumps) are not refined below this
@@ -504,7 +508,7 @@ class Paleodetector:
         """
         if filename in self._nuclear_data_cache:
             return self._nuclear_data_cache[filename]
-        
+
         filepath = os.path.join(self.data_path,"nuclear_data", filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Nuclear data file not found: {filepath}")
@@ -515,11 +519,11 @@ class Paleodetector:
             cols_to_use = (1, 2, 3)
         else:
             raise ValueError(f"Unknown nuclear data file format: {filename}")
-            
+
         self._nuclear_data_cache[filename] = np.loadtxt(filepath, usecols=cols_to_use, unpack=True)
         return self._nuclear_data_cache[filename]
 
-        
+
     def _fission_rate_per_g_kyr(self):
         """Spontaneous-fission rate of the mineral.
 
@@ -550,14 +554,14 @@ class Paleodetector:
 
         energies_mev = energies * 1e3
         watt_shape = np.exp(-energies_mev / WATT_A_MEV) * np.sinh(np.sqrt(WATT_B_PER_MEV * energies_mev))
-        
+
         sf_flux = watt_shape * (sf_yield_per_g_s/ np.trapezoid(watt_shape, energies))
 
         interpolator = interp1d(energies, sf_flux, bounds_error=False, fill_value='extrapolate')
 
         return interpolator
 
-    
+
     def _alpha_n_spectrum(self):
         """Neutron emission spectrum from (alpha,n) reactions.
 
@@ -609,7 +613,7 @@ class Paleodetector:
         """
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
-        
+
         if background_type == 'fission_n':
             flux_interpolator = self.radiogenic_spectrum
         elif background_type == 'alpha_n':
@@ -621,7 +625,7 @@ class Paleodetector:
         all_fragments = self._get_all_fragments(energy_bins_gev[:-1], 'neutron')
 
         geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, "neutron")
-                
+
         all_recoil_spectra = {}
 
         fragment_spectra = {frag: np.zeros(len(RECOIL_ENERGY_BINS_MEV) - 1) for frag in all_fragments}
@@ -641,7 +645,7 @@ class Paleodetector:
             if not os.path.exists(filepath): continue
 
             try:
-                df = pd.read_csv(filepath, sep=r'\s+', header=None, usecols=[0, 2], 
+                df = pd.read_csv(filepath, sep=r'\s+', header=None, usecols=[0, 2],
                                 names=['name', 'rec_e'], dtype={'name': str, 'rec_e': float})
                 names = normalize_fragment_names(df['name'].values)
                 rec_energies = df['rec_e'].values
@@ -675,14 +679,14 @@ class Paleodetector:
             **normalized_spectra,
         }
 
-    
-    def calculate_background_neutron_spectrum(self, 
-        x_bins=None, 
-        energy_bins_gev=None, 
+
+    def calculate_background_neutron_spectrum(self,
+        x_bins=None,
+        energy_bins_gev=None,
         background_types=('fission_n', 'alpha_n'),
-        total_simulated_particles=1e4, 
+        total_simulated_particles=1e4,
         nucleus=DEFAULT_TRACK_SUM,
-        ): 
+        ):
         """Track-length rate from radiogenic neutrons.
 
         Args:
@@ -725,12 +729,12 @@ class Paleodetector:
 
 
     def integrate_background_neutron_spectrum(
-        self, 
-        x_bins=None, 
-        energy_bins_gev=None,  
+        self,
+        x_bins=None,
+        energy_bins_gev=None,
         background_types=('fission_n', 'alpha_n'),
-        total_simulated_particles=1e4, 
-        x_grid=TRACK_LENGTH_BINS_NM, 
+        total_simulated_particles=1e4,
+        x_grid=TRACK_LENGTH_BINS_NM,
         nucleus=DEFAULT_TRACK_SUM,
         annealing=None,
         annealing_r_min=0.0,
@@ -771,10 +775,10 @@ class Paleodetector:
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
 
         sum_drdx = self.calculate_background_neutron_spectrum(
-            x_grid, 
-            energy_bins_gev, 
+            x_grid,
+            energy_bins_gev,
             background_types,
-            total_simulated_particles, 
+            total_simulated_particles,
             nucleus=nucleus,
             )
 
@@ -783,7 +787,7 @@ class Paleodetector:
         total_tracks_g = _rebin_density(sum_drdx, x_grid, x_bins)
 
         return x_bins, total_tracks_g
-    
+
     def calculate_fission_spectrum(self, x_bins=TRACK_LENGTH_BINS_NM):
         """Track-length rate from U-238 spontaneous fission.
 
@@ -806,7 +810,7 @@ class Paleodetector:
         """
         if self.verbose>0:
             print("Calculating spontaneous fission background...")
-        
+
         Z_fission, A_fission, _ = self._load_nuclear_data("U238.dat")
         Z_bind, A_bind, B_bind = self._load_nuclear_data("BindingEne.txt")
         binding_map = {(int(z), int(a)): b for z, a, b in zip(Z_bind, A_bind, B_bind)}
@@ -881,7 +885,7 @@ class Paleodetector:
 
         return dRdx
 
-    
+
     def integrate_fission_spectrum(self, x_bins=None, x_grid=TRACK_LENGTH_BINS_NM, annealing=None,
                                   annealing_r_min=0.0):
         """Track counts from spontaneous fission over the sample age.
@@ -1166,7 +1170,7 @@ class Paleodetector:
         """
         return t_kyr - self.total_age_kyr
 
-    
+
     def _secondary_window_mwe(self, product='neutron'):
         """Width of the secondary production window above the sample.
 
@@ -1469,7 +1473,7 @@ class Paleodetector:
         """
         geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
         all_fragments = set()
-        
+
         for energy_name in energy_names_gev:
             filepath = os.path.join(geant4_input_dir, f"outNuclei_{energy_name:.6f}.txt")
             if not os.path.exists(filepath): continue
@@ -1941,7 +1945,7 @@ class Paleodetector:
             ion_a = int(''.join(filter(str.isdigit, corr_nuclide_name)))
 
             filepath = os.path.join(geant4_input_dir, f"DEDX_Z{ion_z}_A{ion_a}.txt")
-            if not os.path.exists(filepath):  
+            if not os.path.exists(filepath):
                 missing_tables.append(nuclide_name)
                 continue
 
@@ -1973,7 +1977,7 @@ class Paleodetector:
 
         if input_was_1d:
             dRdx_by_nucleus = {name: arr[0] for name, arr in dRdx_by_nucleus.items()}
- 
+
         return dRdx_by_nucleus
 
 
@@ -2004,10 +2008,10 @@ class Paleodetector:
 
     def calculate_particle_signal_spectrum(
         self,  t_kyr_array, x_bins=None,
-        energy_bins_gev=None, total_simulated_particles=1e4, 
+        energy_bins_gev=None, total_simulated_particles=1e4,
         species='mu-', nucleus=DEFAULT_TRACK_SUM,
     ):
-        
+
         """Track-length rate from one cosmic-ray species at given times.
 
         Args:
@@ -2050,7 +2054,7 @@ class Paleodetector:
 
     def integrate_particle_signal_spectrum(
         self, x_bins=None, energy_bins_gev=None,
-        exposure_window_kyr=None, total_simulated_particles=1e4, 
+        exposure_window_kyr=None, total_simulated_particles=1e4,
         x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus=DEFAULT_TRACK_SUM, e_range=None,
         annealing=None, annealing_r_min=0.0,
     ):
@@ -2185,7 +2189,7 @@ class Paleodetector:
 
     def integrate_all_particles(
         self,  x_bins=None, e_range=None,
-        exposure_window_kyr=None, 
+        exposure_window_kyr=None,
         total_simulated_particles=1e4, species_list=None, nucleus=DEFAULT_TRACK_SUM,
         annealing=None, annealing_r_min=0.0, flux_history=None
     ):

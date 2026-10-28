@@ -3,7 +3,7 @@ and diagnostic profiles and plots of a Paleodetector's depth tables and secondar
 
 import numpy as np
 
-from paleo_core import (
+from ._core import (
     MUON_SPECIES, SECONDARY_SOURCES, _resolve_x_bins,
 )
 
@@ -138,14 +138,14 @@ def plot_secondary_production(self, sources=None, products=('neutron', 'proton')
 
 def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral_ratio=1.0, n_s=128):
     """Surface opening of etched latent tracks (Huygens construction, constant etch rates).
- 
+
     Every point of a straight latent track starts dissolving when the etchant reaches it (along the track at v_T,
     from its top point) and from then on grows at the bulk rate v_B: vertically at v_B, laterally at
     lateral_ratio * v_B. The pit is the union of these growing ellipses plus the removed bulk layer; its opening is
     the section of that union by the final surface. Covers in one construction the critical angle
     (sin(dip) < 1/V gives no opening), the conical phase, over-etching (the etch front has reached the track end and
     the tip rounds off) and pits that fade out because the bulk has etched through them.
- 
+
     Args:
         length_nm (np.ndarray): Latent track length [nm].
         dip_rad (np.ndarray): Angle between track and surface plane (pi/2 = perpendicular).
@@ -156,7 +156,7 @@ def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral
         lateral_ratio (float, optional): Lateral / vertical bulk etch rate. 1 = isotropic wet etching (HF);
             0 = fully directional etching (pit walls do not widen). Defaults to 1.
         n_s (int, optional): Points along the track used for the construction. Defaults to 128.
- 
+
     Returns:
         tuple: (major axis, minor axis) of the opening [nm]; NaN where the track gives no opening.
     """
@@ -166,7 +166,7 @@ def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral
     R = (z_top + L * sin_d - z0) / np.maximum(sin_d, 1e-12)  # latent length below that point
     hp = removed_nm - z0                                      # bulk removal left after the track was reached
     ok = (hp > 0) & (R > 0)
- 
+
     major, minor = np.full(L.shape, np.nan), np.full(L.shape, np.nan)
     idx = np.where(ok)[0]
     for k in range(0, len(idx), 20000):                       # chunks keep memory bounded
@@ -185,18 +185,18 @@ def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral
         major[i[any_hit]] = (hi - lo)[any_hit]
         minor[i[any_hit]] = 2. * np.where(hit, a, 0.).max(axis=1)[any_hit]
     return major, minor
- 
- 
+
+
 def rebin_counts(counts, old_edges, new_edges):
     """Redistributes counts from one binning to another, assuming a uniform density inside each old bin.
- 
+
     Each new bin receives, from every old bin, the fraction of that old bin it overlaps. The total is conserved
     where the two binnings cover the same range; counts outside `new_edges` are dropped.
- 
+
     Args:
         counts (np.ndarray): Counts in the bins of `old_edges` (len(old_edges) - 1 values).
         old_edges, new_edges (np.ndarray): Increasing bin edges, same units (e.g. nm).
- 
+
     Returns:
         np.ndarray: Counts in the bins of `new_edges`.
     """
@@ -208,27 +208,27 @@ def rebin_counts(counts, old_edges, new_edges):
     hi = np.minimum(old_edges[1:][None, :], new_edges[1:][:, None])
     overlap = np.clip(hi - lo, 0., None) / np.diff(old_edges)[None, :]
     return overlap @ counts
- 
- 
+
+
 ETCH_DEFAULTS = {
     'HF': {'removed_nm': 4000., 'v_ratio': 2.5, 'lateral_ratio': 1.0},      # wet, isotropic (obsidian)
     'plasma': {'removed_nm': 100., 'v_ratio': 10.0, 'lateral_ratio': 0.1},  # dry, directional (halite)
 }
- 
- 
+
+
 def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, removed_nm=None, v_ratio=None,
                         lateral_ratio=None, angular_pdf=None, min_width_nm=0.345 * 3 * 1e3, measure='major',
                         rng=None, x_bins=None, out_bins=None, etch_type="HF"):
     """Monte Carlo of the etched-pit size distribution on the final surface, from a latent track-length spectrum.
- 
+
     Same population and normalisation as slice_spectrum (tracks per mg -> tracks on sample_area_cm2), with the
     measured size given by the pit opening of `etch_pit_axes` instead of the projected track length.
- 
+
     The latent spectrum and the measured sizes can use different binnings: `x_bins` describes `counts_mg` (e.g. the
     wide bins of the theoretical spectrum) and `out_bins` the returned histogram (e.g. the bins of the descriptor).
     Latent lengths are drawn uniformly inside their bin, so wide input bins do not produce a comb of discrete
     lengths, and the measured sizes are histogrammed directly on `out_bins` (no approximation from rebinning).
- 
+
     Args:
         counts_mg (np.ndarray): Latent track spectrum, tracks per mg in each bin of x_bins.
         sample_area_cm2, sample_density_g_cm3 (float): Analysed area [cm^2] and target density [g/cm^3].
@@ -244,10 +244,10 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         out_bins (np.ndarray, optional): Bin edges of the returned histogram [nm]. Defaults to x_bins.
         etch_type (str, optional): 'HF' or 'plasma': sets the defaults of removed_nm, v_ratio and lateral_ratio
             (ETCH_DEFAULTS); explicitly given values always win, including 0. Defaults to "HF".
- 
+
     Returns:
         np.ndarray: Expected number of pits per bin of out_bins on the analysed area.
- 
+
     Raises:
         ValueError: If etch_type or measure is unknown, or counts_mg does not match x_bins.
     """
@@ -259,7 +259,7 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
     removed_nm = d['removed_nm'] if removed_nm is None else removed_nm
     v_ratio = d['v_ratio'] if v_ratio is None else v_ratio
     lateral_ratio = d['lateral_ratio'] if lateral_ratio is None else lateral_ratio
- 
+
     rng = rng or np.random.default_rng()
     x_bins = _resolve_x_bins(x_bins)
     out_bins = x_bins if out_bins is None else np.asarray(out_bins, float)
@@ -269,23 +269,23 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
     total = counts_mg.sum()
     if total <= 0:
         return np.zeros(len(out_bins) - 1)
- 
+
     side_cm = (1.e-3 / sample_density_g_cm3) ** (1. / 3.)
     side_nm = side_cm * 1.e7
     n = int(round(sample_area_cm2 / side_cm ** 2 * total))
- 
-    k = rng.choice(len(counts_mg), size=n, p=counts_mg / total)            
-    L = rng.uniform(x_bins[k], x_bins[k + 1])                              
+
+    k = rng.choice(len(counts_mg), size=n, p=counts_mg / total)
+    L = rng.uniform(x_bins[k], x_bins[k + 1])
     if angular_pdf is not None:
         grid = np.linspace(0., np.pi / 2., len(angular_pdf))
         dip = rng.choice(grid, size=n, p=np.asarray(angular_pdf, float) / np.sum(angular_pdf))
     else:
         dip = np.arcsin(rng.uniform(0., 1., size=n))
     z_top = rng.uniform(-side_nm / 2., side_nm / 2., size=n)
- 
+
     keep = (z_top < removed_nm) & (z_top + L * np.sin(dip) > 0.)
     major, minor = etch_pit_axes(L[keep], dip[keep], z_top[keep], removed_nm, v_ratio, lateral_ratio)
- 
+
     resolved = np.isfinite(minor) & (minor >= min_width_nm)
     size = (major if measure == 'major' else minor)[resolved]
     return np.histogram(size, bins=out_bins)[0]

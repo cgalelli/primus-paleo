@@ -1,12 +1,12 @@
 """Internal building blocks of the paleo-detector code: constants, binnings, species tables, fragment naming,
 Geant4 file discovery, depth-table maths, annealing laws and small numerical helpers.
 
-Mostly internal: notebooks use these names through mineral_utils, which re-exports the public ones.
+Internal: notebooks use these names through primus_paleo, which re-exports the public ones.
 
 Constants are read by the other modules when they are imported, so to change one (e.g. TIME_GRID_RTOL) edit it here.
 The one setting meant to change at run time is the default output binning: use set_integration_x_bins_nm, which
 updates DEFAULT_INTEGRATION_X_BINS_NM here, where every function reads it at call time (_resolve_x_bins). Read its
-current value as mineral_utils.DEFAULT_INTEGRATION_X_BINS_NM; do not copy it with "from paleo_core import ...".
+current value as primus_paleo.DEFAULT_INTEGRATION_X_BINS_NM; do not copy it with "from ._core import ...".
 """
 
 import os
@@ -129,7 +129,7 @@ def normalize_fragment_names(names):
 
 # --- Binning setup ---
 RECOIL_N_BINS= 301
-RECOIL_ER_MIN_LOG_MEV= -3 
+RECOIL_ER_MIN_LOG_MEV= -3
 RECOIL_ER_MAX_LOG_MEV= 4
 RECOIL_ENERGY_BINS_MEV = np.logspace(RECOIL_ER_MIN_LOG_MEV, RECOIL_ER_MAX_LOG_MEV, RECOIL_N_BINS)
 
@@ -151,7 +151,7 @@ NEUTRINO_SPECIES = ('nu_mu', 'anti_nu_mu', 'nu_e', 'anti_nu_e')
 NEUTRINO_PRODUCTS = ('mu-', 'mu+', 'neutron', 'proton')
 NEUTRINO_SECONDARY_PREFIX = 'nu_secondary_'
 NEUTRINO_SOLID_ANGLE_FACTOR = 4.0
-NEUTRINO_MAX_INTERACTION_FRACTION = 0.1 
+NEUTRINO_MAX_INTERACTION_FRACTION = 0.1
 NEUTRINO_MAX_GENERATIONS = 50             # cap on the product generations if the series does not converge
 
 DEFAULT_INTEGRATION_X_BINS_NM = np.linspace(0, 50000, 500)
@@ -166,8 +166,8 @@ def set_integration_x_bins_nm(integration_x_bins_nm):
     Args:
         integration_x_bins_nm (np.ndarray): Bin edges [nm].
     """
-    global DEFAULT_INTEGRATION_X_BINS_NM 
-    
+    global DEFAULT_INTEGRATION_X_BINS_NM
+
     DEFAULT_INTEGRATION_X_BINS_NM = integration_x_bins_nm
     return
 

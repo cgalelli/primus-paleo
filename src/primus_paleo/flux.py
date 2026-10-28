@@ -4,6 +4,8 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.special import erfc, roots_jacobi
 
+from . import config
+
 def _hemisphere_gauss_legendre(n_angles):
     """
     Zenith angles (degrees) and weights for the Lambertian (cosine-
@@ -142,7 +144,7 @@ class FluxTemplate:
         return cls(name, energy_gev, species_grids, t_since_kyr=t_since_kyr)
 
     @classmethod
-    def get_or_build(cls, params, template_dir="Data/flux_data", force_rebuild=False):
+    def get_or_build(cls, params, template_dir=None, force_rebuild=False):
         """
         `params` is a small dict describing a
         physical scenario, e.g. `{"kind": "SN", "distance_pc": 200}`.
@@ -151,6 +153,8 @@ class FluxTemplate:
         and returns it. Otherwise, calls MCEq (lazily imported) to build it, saves it
         to `template_dir`, and returns it. Next time, this scenario is loaded.
         """
+        template_dir = config.flux_template_dir() if template_dir is None else template_dir
+
         name = "_".join(str(val) for val in params.values())
         path = os.path.join(template_dir, name + ".npz")
         if os.path.exists(path) and not force_rebuild:
@@ -199,7 +203,7 @@ class FluxHistory:
     Timeline: see module docstring -- 0 = present, negative = past.
     """
 
-    def __init__(self, baseline={"kind": "Baseline"}, events=None, excursions=None, template_dir="Data/flux_data"):
+    def __init__(self, baseline={"kind": "Baseline"}, events=None, excursions=None, template_dir=None):
         """
         Args:
             baseline: a FluxTemplate, a cached template name (str), or a
@@ -214,7 +218,7 @@ class FluxHistory:
             name: optional human label; if omitted, `.signature` derives
                 one from the actual content.
         """
-        self.template_dir = template_dir
+        self.template_dir = config.flux_template_dir() if template_dir is None else template_dir
         self._baseline_spec = baseline
         self._baseline_cutoff_variants = {}
         self.baseline = self._resolve(baseline)

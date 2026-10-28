@@ -2,22 +2,28 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below."
 type: software
 title: "primus-paleo: simulation and track-identification framework for cosmic-ray paleo-detectors"
-version: "1.0.0"
-date-released: "2026-10-12"
+version: "2.0.0"
+date-released: "2026-10-28"
 license: BSD-3-Clause
 repository-code: "https://github.com/cgalelli/primus-paleo"
 abstract: >-
-  Code for the PRImuS paleo-detector project: simulation of nuclear-recoil
-  track spectra in minerals from past cosmic-ray fluxes (mineral_utils,
-  flux_history; MCEq, and Geant4 inputs), the OptimusPrimus deep-learning
-  pipeline for track identification in optical microscopy images, and the notebooks
-  reproducing the figures of the associated analyses. Simulation outputs are not
-  included but can be regenerated with the provided code.
+  Code for the PRImuS paleo-detector project. The primus_paleo Python package
+  simulates nuclear-recoil track spectra in minerals from past cosmic-ray fluxes:
+  cosmic-ray muons, neutrons and protons with their secondary cascades, atmospheric
+  neutrinos, spontaneous fission and radiogenic neutrons, through the overburden and
+  flux history of a sample, with track annealing and the etching and slicing of
+  the resulting spectra. It comes with the Geant4 application that produces the
+  particle-interaction simulations it reads, flux templates computed with MCEq, the
+  OptimusPrimus deep-learning pipeline for track identification in optical microscopy
+  images, and the notebooks reproducing the figures of the associated analyses.
+  Simulation outputs are not included but can be regenerated with the provided code.
 keywords:
   - paleo-detectors
   - cosmic rays
+  - atmospheric neutrinos
   - nuclear recoil tracks
   - Geant4
+  - MCEq
   - deep learning
   - track detection
 authors:
@@ -26,8 +32,55 @@ authors:
     email: claudio.galelli@mi.infn.it
     affiliation: "INFN, Sezione di Milano"
     orcid: "https://orcid.org/0000-0002-7372-9703"
-  
 identifiers:
-   - type: doi
-     value: "10.5281/zenodo.23320945"
-     description: "Concept DOI (all versions)"
+  - type: doi
+    value: "10.5281/zenodo.23320945"
+    description: "Concept DOI (all versions)"
+references:
+  - type: article
+    title: "A volcanic chronosequence as a time-resolved paleo-detector array to study the cosmic-ray flux in the late Pleistocene and Holocene"
+    authors:
+      - family-names: Galelli
+        given-names: Claudio
+      - family-names: Caccianiga
+        given-names: Lorenzo
+      - family-names: Apollonio
+        given-names: Lorenzo
+      - family-names: Magnani
+        given-names: Paolo
+      - family-names: Breton
+        given-names: Vincent
+    journal: "Journal of Cosmology and Astroparticle Physics"
+    volume: "2026"
+    issue: "04"
+    start: "023"
+    year: 2026
+    doi: "10.1088/1475-7516/2026/04/023"
+  - type: article
+    title: "Sedimentary rocks from Mediterranean drought in the Messinian age as a probe of the past cosmic ray flux"
+    authors:
+      - family-names: Caccianiga
+        given-names: Lorenzo
+      - name: "et al."
+    journal: "Physical Review D"
+    volume: "110"
+    start: "L121301"
+    year: 2024
+    identifiers:
+      - type: other
+        value: "arXiv:2405.04908"
+  - type: conference-paper
+    title: "Probing Ancient Cosmic Ray Flux with Paleo-Detectors and the Launch of the PRImuS Project"
+    authors:
+      - family-names: Galelli
+        given-names: Claudio
+      - family-names: Apollonio
+        given-names: Lorenzo
+      - family-names: Magnani
+        given-names: Paolo
+      - family-names: Caccianiga
+        given-names: Lorenzo
+    collection-title: "39th International Cosmic Ray Conference (ICRC 2025)"
+    volume: "ICRC2025"
+    start: "262"
+    year: 2025

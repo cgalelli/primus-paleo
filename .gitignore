@@ -1,7 +1,7 @@
-Data/images/*
-Data/Geant4_data/build/*
-Data/Geant4_data/CmakeLists.txt
 __pycache__/
-Data/models/**
-Data/profiler_calibration/**
-.vscode/**
+.vscode/
+*.egg-info/
+.ipynb_checkpoints/
+geant4/build/
+Data/profiler_calibration/
+Data/images/*
