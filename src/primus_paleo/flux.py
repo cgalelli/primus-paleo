@@ -154,7 +154,6 @@ class FluxTemplate:
         to `template_dir`, and returns it. Next time, this scenario is loaded.
         """
         template_dir = config.flux_template_dir() if template_dir is None else template_dir
-
         name = "_".join(str(val) for val in params.values())
         path = os.path.join(template_dir, name + ".npz")
         if os.path.exists(path) and not force_rebuild:
@@ -214,7 +213,8 @@ class FluxHistory:
             excursions: list of dicts, each with 'start_time_kyr',
                 'end_time_kyr', 'geomagnetic_cutoff', and optionally
                 'label' -- see `add_excursion`.
-            template_dir: directory used to load/save templates.
+            template_dir: directory used to load/save templates. Defaults to None: <data root>/flux_data
+                (config.flux_template_dir()).
             name: optional human label; if omitted, `.signature` derives
                 one from the actual content.
         """
@@ -636,6 +636,95 @@ NEUTRINO_LOW_E = {
     'e_peak_gev': 0.04,      # peak of dN/dE (FLUKA: ~40 MeV)
 }
 LOW_E_GRID = {'e_min_gev': 1e-4, 'n_per_decade': 10}   # template grid extended down to the lowest Geant4 energy
+# Geomagnetic-cutoff scaling of the low-energy splice. The LOW_E_SPLICE shapes are normalised to MCEq at e_match
+# (~7 GeV), where the cutoff has almost no effect, so on their own they do not respond to the cutoff. Their
+# low-energy part is therefore multiplied by F(Rc, x) / F(Rc_ref, x), the nucleon-flux scaling for spallation of
+# Desilets, Zreda & Prabu 2006 (EPSL 246, 265), Eqs. (5)-(7), at the observation depth x:
+#     F(Rc, x) = f(Rc) f(x; Rc),
+#     f(Rc)    = 1 - exp(-alpha Rc^-k)                       (Dorman function, sea level; f(0) = 1),
+#     f(x; Rc) = exp[G(1033; Rc) - G(x; Rc)],                 G = integral of 1/Lambda(x; Rc) dx, with
+#     1/Lambda = n / (1 + exp(-a Rc^-kappa)) + (a0 + a1 Rc + a2 Rc^2) x + (a3 + ...) x^2 + (a6 + ...) x^3.
+# Table 2 coefficients; valid for x = 500-1033 g/cm^2 (0-5700 m) and Rc = 0-17.3 GV. The attenuation length grows
+# with Rc, so the latitude effect grows with altitude. Rc_ref is the cutoff the uncorrected splice stands for: 5 GV,
+# the default baseline cutoff, so templates built at 5 GV are unchanged. Set 'species' to () to switch it off.
+CUTOFF_SCALING = {
+    'species': ('neutron', 'proton'),
+    'alpha': 10.275,
+    'k': 0.9615,
+    'reference_cutoff_gv': 5.0,
+    'sea_level_depth_g_cm2': 1033.,
+    'attenuation': {
+        'n': 1.0177e-02, 'a': 1.0207e-01, 'kappa': -3.9527e-01,
+        'a_coeffs': (8.5236e-06, -6.3670e-07, -7.0814e-09,
+                     -9.9182e-09, 9.9250e-10, 2.4925e-11,
+                     3.8615e-12, -4.8194e-13, -1.5371e-14),
+    },
+}
+
+
+def atmospheric_depth_g_cm2(h_obs_km):
+    """
+    Vertical atmospheric depth [g/cm^2] at altitude `h_obs_km` (ICAO standard atmosphere, troposphere), with
+    sea level at CUTOFF_SCALING['sea_level_depth_g_cm2'].
+
+    Args:
+        h_obs_km (float or None): Altitude [km]; None means sea level.
+
+    Returns:
+        float: Atmospheric depth [g/cm^2].
+    """
+    h_m = 0. if h_obs_km is None else 1.e3 * float(h_obs_km)
+    return CUTOFF_SCALING['sea_level_depth_g_cm2'] * (1. - 2.25577e-5 * h_m) ** 5.25588
+
+
+def nucleon_flux_scaling(geomagnetic_cutoff, depth_g_cm2=None):
+    """
+    Spallation-nucleon flux relative to sea level, high latitude: F(Rc, x) = f(Rc) f(x; Rc) of Desilets, Zreda &
+    Prabu 2006, Eqs. (5)-(7) (see CUTOFF_SCALING).
+
+    Args:
+        geomagnetic_cutoff (float or None): Vertical cutoff rigidity [GV]; None or <= 0 means no cutoff.
+        depth_g_cm2 (float, optional): Atmospheric depth [g/cm^2]. Defaults to None: sea level.
+
+    Returns:
+        float: F(Rc, x).
+    """
+    c = CUTOFF_SCALING
+    rc = 0. if geomagnetic_cutoff is None else max(float(geomagnetic_cutoff), 0.)
+    x0 = c['sea_level_depth_g_cm2']
+    x = x0 if depth_g_cm2 is None else float(depth_g_cm2)
+
+    f_rc = 1. if rc == 0. else 1. - np.exp(-c['alpha'] * rc ** (-c['k']))
+
+    att = c['attenuation']
+    a0, a1, a2, a3, a4, a5, a6, a7, a8 = att['a_coeffs']
+    b0 = att['n'] / (1. + np.exp(-att['a'] * rc ** (-att['kappa'])))
+    b1 = a0 + a1 * rc + a2 * rc ** 2
+    b2 = a3 + a4 * rc + a5 * rc ** 2
+    b3 = a6 + a7 * rc + a8 * rc ** 2
+
+    def G(xx):
+        return b0 * xx + b1 * xx ** 2 / 2. + b2 * xx ** 3 / 3. + b3 * xx ** 4 / 4.
+
+    return f_rc * np.exp(G(x0) - G(x))
+
+
+def cutoff_scaling_factor(geomagnetic_cutoff, h_obs_km=None, reference_cutoff=None):
+    """
+    F(Rc, x) / F(Rc_ref, x) at the observation altitude (see CUTOFF_SCALING): the factor applied to the
+    low-energy nucleon splice of a template built at `geomagnetic_cutoff`.
+
+    Args:
+        geomagnetic_cutoff (float or None): Vertical cutoff rigidity [GV]; None or <= 0 means no cutoff.
+        h_obs_km (float, optional): Observation altitude [km]. Defaults to None: sea level.
+        reference_cutoff (float, optional): Rc_ref [GV]. Defaults to CUTOFF_SCALING['reference_cutoff_gv'].
+
+    Returns:
+        float: The scaling factor (> 1 below Rc_ref, < 1 above).
+    """
+    reference_cutoff = CUTOFF_SCALING['reference_cutoff_gv'] if reference_cutoff is None else reference_cutoff
+    x = atmospheric_depth_g_cm2(h_obs_km)
+    return nucleon_flux_scaling(geomagnetic_cutoff, x) / nucleon_flux_scaling(reference_cutoff, x)
 
 
 def _loglog(x_new, x, y):
@@ -645,7 +734,8 @@ def _loglog(x_new, x, y):
     return np.power(10.0, f(np.log10(x_new)))
 
 
-def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS):
+def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS,
+                           geomagnetic_cutoff=None, h_obs_km=None):
     """
     `_zenith_averaged_secondaries` and the primary flux on the MCEq grid extended down to LOW_E_GRID['e_min_gev'],
     with the low-energy correction of every LOW_E_SPLICE species. Used by every template (steady and, per time
@@ -657,6 +747,14 @@ def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, 
     so flux and slope are continuous. Muons and the primary are only extended as FluxTemplate would have
     extrapolated them (unchanged where they were queried before); neutrinos are continued below
     NEUTRINO_LOW_E['e_match_gev'] by a log-normal peaking at e_peak_gev. Fluxes are floored at 1e-44 for FluxTemplate's log-space interpolator.
+    For the species in CUTOFF_SCALING['species'] the low-energy shape is multiplied by
+    cutoff_scaling_factor(geomagnetic_cutoff, h_obs_km), so the splice follows the cutoff (MCEq above e_match is
+    untouched).
+
+    Args:
+        geomagnetic_cutoff (float, optional): Cutoff [GV] the primary model was built with. Defaults to None:
+            no cutoff scaling (factor 1).
+        h_obs_km (float, optional): Observation altitude [km] for the cutoff scaling. Defaults to None: sea level.
 
     Returns:
         tuple: (e_ext, fluxes, primary): extended grid, dict species -> flux on e_ext, primary flux on e_ext.
@@ -693,6 +791,8 @@ def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, 
                 raise ValueError(f"{key}: only {win.sum()} MCEq grid points around {c['e_match_gev']} GeV; "
                                  "change LOW_E_SPLICE e_match_gev or blend_dex.")
             k = np.exp(np.mean(np.log(flux[win] / shape(e_grid[win]))))
+            if geomagnetic_cutoff is not None and key in CUTOFF_SCALING['species']:
+                k *= cutoff_scaling_factor(geomagnetic_cutoff, h_obs_km)
             s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
             mceq_ext = np.exp(s * np.log(mceq_ext) + (1.0 - s) * np.log(np.clip(k * shape(e_ext), 1e-300, None)))
         fluxes[key] = np.clip(mceq_ext, 1e-44, None)
@@ -744,6 +844,7 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
     if name is None:
         name = f"{model[0].__name__}_{model[1]}"
+    MCEq.config.mceq_db_fname = "mceq_db_lext_dpm193_v142.h5"
 
     mceq_run = MCEqRun(
     interaction_model=interaction_model,
@@ -766,7 +867,8 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
         _set_h_obs(mceq_run, reference_h_obs_cm)
 
-        e_ext, fluxes, primary = _corrected_secondaries(mceq_run, model_instance, angles)
+        e_ext, fluxes, primary = _corrected_secondaries(mceq_run, model_instance, angles,
+                                                        geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
 
     else:
         steps, primary = [], []
@@ -780,7 +882,9 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
 
             _set_h_obs(mceq_run, reference_h_obs_cm)
 
-            e_ext, fluxes_t, primary_t = _corrected_secondaries(mceq_run, model_instance, angles)
+            e_ext, fluxes_t, primary_t = _corrected_secondaries(mceq_run, model_instance, angles,
+                                                                geomagnetic_cutoff=geomagnetic_cutoff,
+                                                                h_obs_km=h_obs_km)
             steps.append(fluxes_t)
             primary.append(primary_t)
 

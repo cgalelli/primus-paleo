@@ -2229,7 +2229,8 @@ class Paleodetector:
         Raises:
             ValueError: If a species has no runs, or e_range names a species not computed or an invalid range.
         """
-        self.set_flux_history(flux_history)
+        if flux_history is not None:
+            self.set_flux_history(flux_history)
 
         x_bins = _resolve_x_bins(x_bins)
         species_list = self.available_species() if species_list is None else list(species_list)
