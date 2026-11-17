@@ -5,3 +5,4 @@ __pycache__/
 geant4/build/
 Data/images/*
 demo/figures/*
+Data/models/*
