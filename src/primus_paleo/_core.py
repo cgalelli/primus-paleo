@@ -28,7 +28,8 @@ __all__ = [
     'CAPTURE_SPECTRUM_MAX_E0_GEV', 'NEUTRON_TAIL_P', 'NEUTRON_P_NODES', 'SECONDARY_WINDOW_SURVIVAL',
     'SECONDARY_WINDOW_BINS', 'TIME_GRID_BACKBONE', 'TIME_GRID_RTOL', 'TIME_GRID_MAX_POINTS',
     'TIME_GRID_MAX_PASSES', 'TIME_GRID_ATTENUATION_MWE', 'TIME_GRID_FLUX_PROBES', 'K_B_EV', 'SECONDS_PER_KYR',
-    'log_interp1d',
+    'log_interp1d', 'ELEMENT_SYMBOLS', 'TRACK_GROUPS', 'TRACK_GROUPS_KEY', 'MAJOR_ELEMENT_MASS_FRACTION', 'atomic_number',
+    'fragment_charge', 'predict_track_groups', 'track_group',
 ]
 
 # --- Physical Constants ---
@@ -58,6 +59,101 @@ TRACK_SUMS = (TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)
 DEFAULT_TRACK_SUM = TOTAL_NO_LIGHT_IONS
 LIGHT_ION_MAX_Z = 2
 _LIGHT_ION_ELEMENTS = {"H", "He"}
+
+
+# --- Elements ---
+# Symbols by atomic number (Z = position + 1) and standard atomic weights up to U (for mass fractions only).
+ELEMENT_SYMBOLS = (
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y",
+    "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce",
+    "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir",
+    "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm",
+    "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc",
+    "Lv", "Ts", "Og",
+)
+_ATOMIC_NUMBERS = {symbol: z for z, symbol in enumerate(ELEMENT_SYMBOLS, start=1)}
+_ATOMIC_WEIGHTS = dict(zip(ELEMENT_SYMBOLS, (
+    1.008, 4.0026, 6.94, 9.0122, 10.81, 12.011, 14.007, 15.999, 18.998, 20.180, 22.990, 24.305, 26.982, 28.085,
+    30.974, 32.06, 35.45, 39.948, 39.098, 40.078, 44.956, 47.867, 50.942, 51.996, 54.938, 55.845, 58.933, 58.693,
+    63.546, 65.38, 69.723, 72.630, 74.922, 78.971, 79.904, 83.798, 85.468, 87.62, 88.906, 91.224, 92.906, 95.95,
+    98.0, 101.07, 102.91, 106.42, 107.87, 112.41, 114.82, 118.71, 121.76, 127.60, 126.90, 131.29, 132.91, 137.33,
+    138.91, 140.12, 140.91, 144.24, 145.0, 150.36, 151.96, 157.25, 158.93, 162.50, 164.93, 167.26, 168.93, 173.05,
+    174.97, 178.49, 180.95, 183.84, 186.21, 190.23, 192.22, 195.08, 196.97, 200.59, 204.38, 207.2, 208.98, 209.0,
+    210.0, 222.0, 223.0, 226.0, 227.0, 232.04, 231.04, 238.03,
+)))
+
+
+def atomic_number(symbol):
+    """Atomic number of an element symbol ("Na" -> 11), or None if unknown."""
+    return _ATOMIC_NUMBERS.get(symbol)
+
+
+def fragment_charge(fragment):
+    """Atomic number Z of a fragment key ("Na23" -> 11, "alpha" -> 2, "proton" -> 1), or None (e.g. "neutron")."""
+    symbol = _LIGHT_ION_SYMBOLS.get(fragment, fragment)
+    return atomic_number(''.join(filter(str.isalpha, symbol)))
+
+
+# --- Track groups ---
+# Every recoil is put in one group by its Z, with two mineral-dependent thresholds (see predict_track_groups):
+#   'heavy'         Z >= heavy_min_z    as heavy as the heaviest major atom of the lattice, or heavier (fission
+#                                        fragments are always here)
+#   'medium_heavy'  medium_min_z <= Z < heavy_min_z    lattice-like ions: from the lightest to below the heaviest
+#                                        major atom
+#   'medium_light'  LIGHT_ION_MAX_Z < Z < medium_min_z    lighter than every major atom (spallation debris)
+#   'light'         Z <= LIGHT_ION_MAX_Z    H and He, not expected to leave etchable tracks
+# nucleus=TRACK_GROUPS_KEY in the integrate_* functions returns them, with 'total' and 'total_no_light_ions'.
+TRACK_GROUPS = ('heavy', 'medium_heavy', 'medium_light', 'light')
+TRACK_GROUPS_KEY = 'groups'
+MAJOR_ELEMENT_MASS_FRACTION = 0.05     # elements below this mass fraction do not set the thresholds
+
+
+def predict_track_groups(nuclei, stoich, major_mass_fraction=MAJOR_ELEMENT_MASS_FRACTION):
+    """Default track-group thresholds of a mineral from its composition.
+
+    A bookkeeping rule, not a registration threshold: it splits the recoils by how they compare with the atoms of
+    the lattice. The major elements are those with a mass fraction of at least major_mass_fraction, H and He left
+    out. heavy_min_z is the Z of the heaviest major element, medium_min_z that of the lightest. Override them per
+    mineral with a 'track_groups' entry in the mineral library, or with Paleodetector.set_track_groups.
+
+    Examples (5 %): halite NaCl -> heavy Z >= 17 (Cl), medium_heavy 11-16, medium_light 3-10; olivine Fo90 ->
+    heavy Z >= 26 (Fe, 7.6 %), medium_heavy 8-25; quartz -> heavy Z >= 14, medium_heavy 8-13.
+
+    Args:
+        nuclei (list[str]): Element symbols.
+        stoich (list[float]): Atoms per formula unit.
+        major_mass_fraction (float, optional): Mass fraction above which an element is major.
+            Defaults to MAJOR_ELEMENT_MASS_FRACTION.
+
+    Returns:
+        dict: 'heavy_min_z', 'medium_min_z', 'majors' (symbols of the major elements, heaviest first).
+
+    Raises:
+        ValueError: If an element is unknown or the composition has no element heavier than He.
+    """
+    unknown = [s for s in nuclei if s not in _ATOMIC_WEIGHTS]
+    if unknown:
+        raise ValueError(f"Unknown or unsupported elements {unknown} (symbols up to U).")
+    mass = np.array([_ATOMIC_WEIGHTS[s] * float(n) for s, n in zip(nuclei, stoich)])
+    frac = mass / mass.sum()
+    candidates = [(atomic_number(s), s, f) for s, f in zip(nuclei, frac) if atomic_number(s) > LIGHT_ION_MAX_Z]
+    if not candidates:
+        raise ValueError(f"No element heavier than He in {nuclei}.")
+    majors = [c for c in candidates if c[2] >= major_mass_fraction] or [max(candidates, key=lambda c: c[2])]
+    majors = sorted(majors, reverse=True)
+    return {'heavy_min_z': majors[0][0], 'medium_min_z': majors[-1][0], 'majors': [m[1] for m in majors]}
+
+
+def track_group(z, thresholds):
+    """Track group of a recoil of atomic number z (see TRACK_GROUPS), with thresholds from predict_track_groups."""
+    if z <= LIGHT_ION_MAX_Z:
+        return 'light'
+    if z >= thresholds['heavy_min_z']:
+        return 'heavy'
+    if z >= thresholds['medium_min_z']:
+        return 'medium_heavy'
+    return 'medium_light'
 
 
 def is_light_ion(fragment):
