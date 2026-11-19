@@ -3,6 +3,7 @@ particles (primaries and secondaries) and atmospheric neutrinos, given its overb
 
 import json
 import os
+from collections import OrderedDict
 from multiprocessing import Pool
 
 import numpy as np
@@ -21,7 +22,8 @@ from ._core import (
     PROTON_MASS_MEV, RECOIL_ENERGY_BINS_MEV, SECONDARY_SOURCES, SECONDARY_WINDOW_BINS,
     SECONDARY_WINDOW_SURVIVAL, STOPPING_P_NODES, TIME_GRID_ATTENUATION_MWE, TIME_GRID_BACKBONE,
     TIME_GRID_FLUX_PROBES, TIME_GRID_MAX_PASSES, TIME_GRID_MAX_POINTS, TIME_GRID_RTOL, TOTAL_ALL_FRAGMENTS,
-    TOTAL_NO_LIGHT_IONS, TRACK_LENGTH_BINS_NM, TRACK_SUMS, TRUNCATION_FRACTION, U238_ABUNDANCE, WATT_A_MEV,
+    TOTAL_NO_LIGHT_IONS, TRACK_GROUPS, TRACK_GROUPS_KEY, TRACK_LENGTH_BINS_NM, TRACK_SUMS, TRUNCATION_FRACTION,
+    U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, atomic_number, predict_track_groups, track_group,
     WATT_B_PER_MEV, _ANNEALING_GEOTHERM_DEFAULTS, _ENERGY_EDGE_RTOL, _LIGHT_ION_SYMBOLS, _R_FRESH,
     _annealing_law, _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
     _piecewise_cdf_and_integral, _rebin_density, _resolve_x_bins, _restrict_edges, _shorten_tracks,
@@ -31,6 +33,189 @@ from ._core import (
 __all__ = [
     'Paleodetector',
 ]
+
+
+# --- Speed helpers: caches and a compiled loop. None of them changes a number of the results. ------------------------
+
+# mendeleev's element() runs a database query (~0.2 s per call, once per fragment and conversion), so Z is read
+# from the table in _core; unknown symbols still go to mendeleev.
+def _element_symbol(z):
+    """Element symbol of an atomic number."""
+    return ELEMENT_SYMBOLS[int(z) - 1]
+
+
+def _atomic_number(symbol):
+    """Atomic number of an element symbol (_core table; mendeleev only for a symbol not in it)."""
+    z = atomic_number(symbol)
+    return z if z is not None else element(symbol).atomic_number
+
+
+# Process-wide cache of what is read from the Geant4 files: per-fragment recoil histograms of the mineral runs, the
+# StdRock production rows, the range tables. Keys contain each file's modification time and size, so an entry is
+# never reused after a file changes. Shared by every Paleodetector of the session (e.g. one per sample age) and sent
+# to the integrate_all_particles workers, which send back what they read. Least recently used entries are dropped
+# beyond GEANT4_FILE_CACHE_MAX_BYTES; 0 disables the cache.
+GEANT4_FILE_CACHE_MAX_BYTES = 2_000_000_000
+_FILE_CACHE = OrderedDict()
+_FILE_CACHE_SIZE = [0]
+
+
+def _nbytes(value):
+    if isinstance(value, np.ndarray):
+        return value.nbytes
+    if isinstance(value, dict):
+        return sum(_nbytes(v) for v in value.values()) + 64 * len(value)
+    if isinstance(value, (list, tuple)):
+        return sum(_nbytes(v) for v in value) + 8 * len(value)
+    return 64
+
+
+def _file_stamp(path):
+    """(path, mtime_ns, size) of a file, or None if it does not exist."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (path, st.st_mtime_ns, st.st_size)
+
+
+def _cache_get(key):
+    if key in _FILE_CACHE:
+        _FILE_CACHE.move_to_end(key)
+        return True, _FILE_CACHE[key]
+    return False, None
+
+
+def _cache_put(key, value):
+    if GEANT4_FILE_CACHE_MAX_BYTES <= 0 or key in _FILE_CACHE:
+        return
+    size = _nbytes(value)
+    if size > GEANT4_FILE_CACHE_MAX_BYTES:
+        return
+    _FILE_CACHE[key] = value
+    _FILE_CACHE_SIZE[0] += size
+    while _FILE_CACHE_SIZE[0] > GEANT4_FILE_CACHE_MAX_BYTES and _FILE_CACHE:
+        _, old = _FILE_CACHE.popitem(last=False)
+        _FILE_CACHE_SIZE[0] -= _nbytes(old)
+
+
+def clear_geant4_file_cache():
+    """Empties the process-wide cache of Geant4 file contents (e.g. to free memory)."""
+    _FILE_CACHE.clear()
+    _FILE_CACHE_SIZE[0] = 0
+
+
+def _mineral_run_histograms(filepath):
+    """Per-fragment recoil-energy histograms of one mineral run file, cached.
+
+    Same reading and the same np.histogram calls as before (rows of each fragment in file order), so the counts are
+    identical; they depend only on the file, while the flux weights they multiply change from call to call.
+
+    Returns:
+        dict or None: None if the file is missing or empty; else {'all': {fragment: counts}, 'peak': {fragment:
+        counts of the rows with remaining energy 0, or None if there are none}, 'elastic': {same, other rows}}.
+        Fragments are the non-empty normalised names (normalize_fragment_names).
+    """
+    stamp = _file_stamp(filepath)
+    if stamp is None:
+        return None
+    key = ('mineral_hist', stamp, RECOIL_ENERGY_BINS_MEV.size, float(RECOIL_ENERGY_BINS_MEV[0]),
+           float(RECOIL_ENERGY_BINS_MEV[-1]))
+    hit, value = _cache_get(key)
+    if hit:
+        return value
+    value = None
+    if stamp[2] > 0:
+        try:
+            df = pd.read_csv(
+                filepath, sep=r'\s+', header=None, usecols=[0, 2, 5],
+                names=['name', 'rec_e', 'rem_e'],
+                dtype={'name': str, 'rec_e': float, 'rem_e': float},
+            )
+        except pd.errors.EmptyDataError:
+            df = None
+        if df is not None:
+            names = normalize_fragment_names(df['name'].values)
+            rec_energies = df['rec_e'].values
+            rem_energies = df['rem_e'].values
+            keep = names != ''
+            names, rec_energies, rem_energies = names[keep], rec_energies[keep], rem_energies[keep]
+            value = {'all': {}, 'peak': {}, 'elastic': {}}
+            for frag in np.unique(names):
+                frag_mask = (names == frag)
+                rec = rec_energies[frag_mask]
+                rem = rem_energies[frag_mask]
+                value['all'][frag] = np.histogram(rec, bins=RECOIL_ENERGY_BINS_MEV)[0]
+                mask_peak = (rem == 0.0)
+                rec_peak, rec_elastic = rec[mask_peak], rec[~mask_peak]
+                value['peak'][frag] = (np.histogram(rec_peak, bins=RECOIL_ENERGY_BINS_MEV)[0]
+                                       if len(rec_peak) > 0 else None)
+                value['elastic'][frag] = (np.histogram(rec_elastic, bins=RECOIL_ENERGY_BINS_MEV)[0]
+                                          if len(rec_elastic) > 0 else None)
+    _cache_put(key, value)
+    return value
+
+
+def _range_table(filepath):
+    """Columns of a DEDX_Z<z>_A<a>.txt range table (np.loadtxt, as before), cached."""
+    stamp = _file_stamp(filepath)
+    key = ('range', stamp)
+    hit, value = _cache_get(key)
+    if hit:
+        return value
+    value = np.loadtxt(filepath, skiprows=1, unpack=True)
+    _cache_put(key, value)
+    return value
+
+
+try:
+    import numba as _numba
+except ImportError:                                   # optional: the numpy loop below is used instead
+    _numba = None
+
+if _numba is not None:
+    @_numba.njit(cache=True, parallel=True)
+    def _window_source_numba(A, depth, primary_cell, cell, lo_idx, hi_idx, beyond, window_top, phi_cell, weight,
+                             delta, n_b, n_q, k0):
+        """Compiled form of the (t, c) loop of _secondary_yield: same operations on each row, same order of
+        summation within each bin (np.bincount adds the weights in row order from 0, then the sum is added to A).
+        The times are independent (each writes only A[t]) and run in parallel threads."""
+        n_t, n_c = lo_idx.shape
+        for t in _numba.prange(n_t):
+            buf = np.zeros((n_b, n_q))
+            for c in range(n_c):
+                lo, hi = lo_idx[t, c], hi_idx[t, c]
+                if beyond[t, c] or hi <= lo:
+                    continue
+                buf[:, :] = 0.0
+                top = window_top[t, c]
+                for r in range(lo, hi):
+                    b = int((depth[r] - top) / delta)
+                    if b > n_b - 1:
+                        b = n_b - 1
+                    buf[b, cell[r]] += phi_cell[t, primary_cell[r]] * weight
+                for b in range(n_b):
+                    for k in range(n_q):
+                        A[t, c, b, k0 + k] += buf[b, k]
+
+def _combine_track_results(results):
+    """Sum of several track results: arrays, or dicts of arrays with the same keys (nucleus='groups' or 'all';
+    a key missing from some results counts as 0)."""
+    results = list(results)
+    if not results:
+        return 0.0
+    if not isinstance(results[0], dict):
+        return sum(results)
+    keys = list(dict.fromkeys(k for r in results for k in r))
+    return {k: sum(r[k] for r in results if k in r) for k in keys}
+
+
+def _map_track_result(fn, result):
+    """Applies fn to an array, or to every array of a dict of arrays."""
+    if isinstance(result, dict):
+        return {k: fn(v) for k, v in result.items()}
+    return fn(result)
+
 
 # --- Main Paleodetector Class ---
 class Paleodetector:
@@ -79,6 +264,9 @@ class Paleodetector:
 
         self.verbose = 1
 
+        self.track_groups = None
+        self.set_track_groups()
+
         self.radiogenic_spectrum = self._radiogenic_spectrum()
 
         self.alpha_n_spectrum = self._alpha_n_spectrum()
@@ -111,6 +299,68 @@ class Paleodetector:
 
         if self.verbose > 0:
             self._print_available_species()
+
+
+    def set_track_groups(self, heavy_min_z=None, medium_min_z=None):
+        """Sets the Z thresholds of the track groups (TRACK_GROUPS, used by nucleus='groups').
+
+        Each threshold is, in order of priority: the argument, the 'track_groups' entry of the mineral
+        configuration ({'heavy_min_z': ..., 'medium_min_z': ...}, either key optional), or the prediction from the
+        composition ('nuclei' and 'stoich' of the configuration, see predict_track_groups). Without a composition
+        both must be given here or in the configuration.
+
+        Args:
+            heavy_min_z (int, optional): Smallest Z of the 'heavy' group.
+            medium_min_z (int, optional): Smallest Z of the 'medium_heavy' group (below it: 'medium_light', down
+                to Z = 3).
+
+        Returns:
+            dict: The thresholds in use, with 'source' telling where each came from.
+
+        Raises:
+            ValueError: If a threshold cannot be set, or medium_min_z > heavy_min_z.
+        """
+        predicted = {}
+        if self.config.get('nuclei') and self.config.get('stoich'):
+            predicted = predict_track_groups(self.config['nuclei'], self.config['stoich'])
+        configured = dict(self.config.get('track_groups') or {})
+        out, source = {}, {}
+        for key, given in (('heavy_min_z', heavy_min_z), ('medium_min_z', medium_min_z)):
+            for origin, value in (('argument', given), ('configuration', configured.get(key)),
+                                  ('composition', predicted.get(key))):
+                if value is not None:
+                    out[key], source[key] = int(value), origin
+                    break
+            else:
+                raise ValueError(f"{self.name}: no '{key}' for the track groups: give it to set_track_groups, in a "
+                                 "'track_groups' entry of the mineral configuration, or give 'nuclei' and 'stoich'.")
+        if out['medium_min_z'] > out['heavy_min_z']:
+            raise ValueError(f"medium_min_z ({out['medium_min_z']}) > heavy_min_z ({out['heavy_min_z']}).")
+        out['source'] = source
+        if 'majors' in predicted:
+            out['majors'] = predicted['majors']
+        self.track_groups = out
+        return out
+
+
+    def fragment_track_group(self, fragment):
+        """Track group ('heavy', 'medium_heavy', 'medium_light' or 'light') of a fragment key, e.g. "Na23"."""
+        corr = _LIGHT_ION_SYMBOLS.get(fragment, fragment)
+        return track_group(_atomic_number(''.join(filter(str.isalpha, corr))), self.track_groups)
+
+
+    def describe_track_groups(self):
+        """Prints the track-group thresholds of the mineral and the Z range of each group."""
+        th = self.track_groups
+        h, m = th['heavy_min_z'], th['medium_min_z']
+        sym = lambda z: f"{_element_symbol(z)}({z})"
+        print(f"Track groups of {self.name} (heavy_min_z from the {th['source']['heavy_min_z']}, medium_min_z from "
+              f"the {th['source']['medium_min_z']}"
+              + (f"; major elements {', '.join(th['majors'])}" if 'majors' in th else "") + "):")
+        print(f"  heavy         Z >= {sym(h)} (and spontaneous-fission fragments)")
+        print(f"  medium_heavy  {sym(m)} <= Z < {sym(h)}" if m < h else "  medium_heavy  (empty)")
+        print(f"  medium_light  Li(3) <= Z < {sym(m)}" if m > 3 else "  medium_light  (empty)")
+        print("  light         Z <= 2 (H, He)")
 
 
     def set_flux_history(self, flux_history):
@@ -698,11 +948,12 @@ class Paleodetector:
                 Defaults to ('fission_n', 'alpha_n').
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key.
                 Defaults to 'total_no_light_ions'.
 
         Returns:
-            np.ndarray: dR/dx summed over sources [tracks per mg per kyr per nm].
+            np.ndarray or dict: dR/dx summed over sources [tracks per mg per kyr per nm] (a dict of the track
+            groups and both sums for nucleus='groups').
         """
         x_bins = _resolve_x_bins(x_bins)
         energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
@@ -710,21 +961,29 @@ class Paleodetector:
         x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
 
         sum_drdx = np.zeros_like(x_mids)
+        if nucleus == TRACK_GROUPS_KEY:
+            sum_drdx = {k: np.zeros_like(x_mids) for k in (*TRACK_GROUPS, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)}
         found = False
 
         for background_type in background_types:
-            print(f"Processing background neutron tracks from {background_type}")
+            if self.verbose > 0:
+                print(f"Processing background neutron tracks from {background_type}")
 
             recoil_data = self._process_background_neutron_geant4_data(background_type, energy_bins_gev, total_simulated_particles)
 
             drdx = self._convert_recoil_to_track_spectrum(recoil_data, x_bins=x_bins, energy_bins_gev=energy_bins_gev, species='neutron')
 
-            if nucleus in drdx:                                    # a fragment may be absent from one source
+            if nucleus == TRACK_GROUPS_KEY:
+                for k in sum_drdx:
+                    sum_drdx[k] += drdx[k]
+                found = True
+            elif nucleus in drdx:                                    # a fragment may be absent from one source
                 sum_drdx += drdx[nucleus]
                 found = True
 
         if not found:
-            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS} or a fragment key.")
+            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, '{TRACK_GROUPS_KEY}' or a "
+                             "fragment key.")
         return sum_drdx
 
 
@@ -752,7 +1011,7 @@ class Paleodetector:
                 Defaults to 1e4.
             x_grid (np.ndarray, optional): Fine track-length grid used for the
                 calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key.
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key.
                 Defaults to 'total_no_light_ions'.
             annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
                 at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
@@ -782,9 +1041,10 @@ class Paleodetector:
             nucleus=nucleus,
             )
 
-        sum_drdx = self._age_integrated(x_grid, sum_drdx, annealing, annealing_r_min)
-
-        total_tracks_g = _rebin_density(sum_drdx, x_grid, x_bins)
+        total_tracks_g = _map_track_result(
+            lambda d: _rebin_density(self._age_integrated(x_grid, d, annealing, annealing_r_min), x_grid, x_bins),
+            sum_drdx,
+        )
 
         return x_bins, total_tracks_g
 
@@ -887,7 +1147,7 @@ class Paleodetector:
 
 
     def integrate_fission_spectrum(self, x_bins=None, x_grid=TRACK_LENGTH_BINS_NM, annealing=None,
-                                  annealing_r_min=0.0):
+                                  annealing_r_min=0.0, nucleus=DEFAULT_TRACK_SUM, fission_group='heavy'):
         """Track counts from spontaneous fission over the sample age.
 
         Args:
@@ -908,8 +1168,14 @@ class Paleodetector:
             annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
                 etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
 
+            nucleus (str, optional): 'total_no_light_ions' or 'total' (the same array: fission fragments are never
+                light) or 'groups' (dict: every track in fission_group, the other groups zero, both sums).
+                Defaults to 'total_no_light_ions'.
+            fission_group (str, optional): Track group of the fission fragments with nucleus='groups'. Defaults
+                to 'heavy'.
+
         Returns:
-            tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
+            tuple[np.ndarray, np.ndarray or dict]: x_bins, and tracks per mg in each bin
             accumulated over total_age_kyr (after annealing, if given).
         """
         x_bins = _resolve_x_bins(x_bins)
@@ -920,6 +1186,16 @@ class Paleodetector:
 
         total_tracks_mg = total_tracks_g * 1e-3
 
+        if nucleus == TRACK_GROUPS_KEY:
+            if fission_group not in TRACK_GROUPS:
+                raise ValueError(f"fission_group must be one of {TRACK_GROUPS}, got {fission_group!r}.")
+            out = {g: (total_tracks_mg if g == fission_group else np.zeros_like(total_tracks_mg))
+                   for g in TRACK_GROUPS}
+            out[TOTAL_ALL_FRAGMENTS] = total_tracks_mg
+            out[TOTAL_NO_LIGHT_IONS] = total_tracks_mg if fission_group != 'light' else np.zeros_like(total_tracks_mg)
+            return x_bins, out
+        if nucleus not in TRACK_SUMS:
+            raise ValueError(f"nucleus for fission must be one of {TRACK_SUMS} or '{TRACK_GROUPS_KEY}'.")
         return x_bins, total_tracks_mg
 
 
@@ -1241,6 +1517,24 @@ class Paleodetector:
             raise FileNotFoundError(f"No StdRock runs for {species}.")
         data_dir, drop_stopping = found
         files = _list_geant4_energy_files(data_dir)
+
+        # cached: the rows depend only on the files, the geometry and the arguments
+        cache_key = ('stdrock_rows', tuple(_file_stamp(f) for _, f in files),
+                     _file_stamp(os.path.join(data_dir, "geometry.json")), drop_stopping, product,
+                     np.asarray(product_bins_gev, dtype=float).tobytes(), float(total_simulated_particles),
+                     None if primary_bins_gev is None else np.asarray(primary_bins_gev, dtype=float).tobytes())
+        hit, cached = _cache_get(cache_key)
+        if hit:
+            return cached
+        rows = self._read_stdrock_rows(data_dir, drop_stopping, files, product, product_bins_gev,
+                                       total_simulated_particles, primary_bins_gev)
+        _cache_put(cache_key, rows)
+        return rows
+
+
+    def _read_stdrock_rows(self, data_dir, drop_stopping, files, product, product_bins_gev, total_simulated_particles,
+                           primary_bins_gev):
+        """Reads the rows of _load_stdrock_rows from the files (see there)."""
         file_e = np.array([e for e, _ in files])
         if primary_bins_gev is None:
             info = _geant4_energy_edges(data_dir)
@@ -1419,6 +1713,11 @@ class Paleodetector:
                 depth = rows['depth_mwe']
                 lo_idx = np.searchsorted(depth, window_top, side='left')
                 hi_idx = np.searchsorted(depth, slant, side='left')
+                if _numba is not None:
+                    _window_source_numba(A, depth, rows['primary_cell'], rows['cell'], lo_idx, hi_idx, beyond,
+                                         window_top, phi_cell, float(rows['weight']), float(delta), n_b, n_q,
+                                         offsets[q].start)
+                    continue
                 for t in range(n_t):
                     for c in range(n_c):
                         if beyond[t, c] or hi_idx[t, c] <= lo_idx[t, c]:
@@ -1476,15 +1775,9 @@ class Paleodetector:
 
         for energy_name in energy_names_gev:
             filepath = os.path.join(geant4_input_dir, f"outNuclei_{energy_name:.6f}.txt")
-            if not os.path.exists(filepath): continue
-            elif os.path.getsize(filepath) > 0:
-                names = normalize_fragment_names(
-                    np.loadtxt(filepath, usecols=0, dtype=str, ndmin=1)
-                )
-
-                for name in names:
-                    if name:
-                        all_fragments.add(name)
+            hist = _mineral_run_histograms(filepath)
+            if hist is not None:
+                all_fragments.update(hist['all'])
         return sorted(list(all_fragments))
 
 
@@ -1568,7 +1861,9 @@ class Paleodetector:
             z_min_grid = depth_mwe_array[:, None, None] / C_grid[None, :, :]
             z_max_grid = z_min_grid + target_thickness_mwe / C_grid[None, :, :]
 
-            flux_grid_gev_cm2_s_sr = self.flux_history.get_map(species, t_kyr_flux_array, E_grid)[2].reshape(t_kyr_flux_array.size, *E_grid.shape)
+            # the flux does not depend on the zenith: evaluated once per energy, then broadcast over c
+            flux_e = self.flux_history.get_map(species, t_kyr_flux_array, e_vals)[2]          # (T, N_E)
+            flux_grid_gev_cm2_s_sr = np.broadcast_to(flux_e[:, None, :], (t_kyr_flux_array.size, *E_grid.shape))
 
             if species in ('mu-', 'mu+'):
                 prob_tail_grid, prob_peak_grid = self._muon_depth_probabilities(
@@ -1596,53 +1891,28 @@ class Paleodetector:
                 )
 
             filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_min:.6f}.txt")
-            if not os.path.exists(filepath):
+            hist = _mineral_run_histograms(filepath)
+            if hist is None:
                 continue
-            try:
-                df = pd.read_csv(
-                    filepath, sep=r'\s+', header=None, usecols=[0, 2, 5],
-                    names=['name', 'rec_e', 'rem_e'],
-                    dtype={'name': str, 'rec_e': float, 'rem_e': float},
-                )
-                names = normalize_fragment_names(df['name'].values)
-                rec_energies = df['rec_e'].values
-                rem_energies = df['rem_e'].values
-            except pd.errors.EmptyDataError:
-                continue
-
-            valid_mask = np.isin(names, list(fragment_spectra.keys()))
-            valid_names = names[valid_mask]
-            valid_rec = rec_energies[valid_mask]
-            valid_rem = rem_energies[valid_mask]
-            unique_frags = np.unique(valid_names)
 
             if species == 'mu-':
                 use_for_capture = e_min <= CAPTURE_SPECTRUM_MAX_E0_GEV
                 if use_for_capture:
                     n_capture_files += 1
 
-            for frag in unique_frags:
-                frag_mask = (valid_names == frag)
-                frag_rec_energies = valid_rec[frag_mask]
-                frag_rem_energies = valid_rem[frag_mask]
-
+            for frag in sorted(f for f in hist['all'] if f in fragment_spectra):
                 if species == 'mu-':
-                    mask_peak = (frag_rem_energies == 0.0)
-                    rec_peak = frag_rec_energies[mask_peak]
-                    rec_elastic = frag_rec_energies[~mask_peak]
-
-                    if len(rec_peak) > 0:
-                        counts_peak, _ = np.histogram(rec_peak, bins=RECOIL_ENERGY_BINS_MEV)
+                    counts_peak = hist['peak'][frag]
+                    if counts_peak is not None:
                         per_file_peak[frag] += np.outer(weight_peak_t, counts_peak)
                         if use_for_capture:
                             capture_counts[frag] += counts_peak
 
-                    if len(rec_elastic) > 0:
-                        counts_elastic, _ = np.histogram(rec_elastic, bins=RECOIL_ENERGY_BINS_MEV)
+                    counts_elastic = hist['elastic'][frag]
+                    if counts_elastic is not None:
                         fragment_spectra[frag] += np.outer(weight_elastic_t, counts_elastic)
                 else:
-                    counts, _ = np.histogram(frag_rec_energies, bins=RECOIL_ENERGY_BINS_MEV)
-                    fragment_spectra[frag] += np.outer(weight_elastic_t, counts)
+                    fragment_spectra[frag] += np.outer(weight_elastic_t, hist['all'][frag])
 
         if species == 'mu-':
             if n_capture_files > 0:
@@ -1819,26 +2089,11 @@ class Paleodetector:
             fragment_spectra = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
             for m in range(n_e):
                 filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_cells[m]:.6f}.txt")
-                if not os.path.exists(filepath):
+                hist = _mineral_run_histograms(filepath)
+                if hist is None:
                     continue
-                try:
-                    df = pd.read_csv(
-                        filepath, sep=r'\s+', header=None, usecols=[0, 2],
-                        names=['name', 'rec_e'], dtype={'name': str, 'rec_e': float},
-                    )
-                    names = normalize_fragment_names(df['name'].values)
-                    rec_energies = df['rec_e'].values
-                except pd.errors.EmptyDataError:
-                    continue
-
-                valid_mask = np.isin(names, list(fragment_spectra.keys()))
-                valid_names = names[valid_mask]
-                valid_rec = rec_energies[valid_mask]
-
-                for frag in np.unique(valid_names):
-                    frag_mask = (valid_names == frag)
-                    counts, _ = np.histogram(valid_rec[frag_mask], bins=RECOIL_ENERGY_BINS_MEV)
-                    fragment_spectra[frag] += np.outer(weight_t[:, m], counts)
+                for frag in sorted(f for f in hist['all'] if f in fragment_spectra):
+                    fragment_spectra[frag] += np.outer(weight_t[:, m], hist['all'][frag])
 
             normalized_spectra = {}
             for name, spectrum in fragment_spectra.items():
@@ -1899,8 +2154,9 @@ class Paleodetector:
                 of the species; energy_bins_gev and species are then used only for this).
 
         Returns:
-            dict: dR/dx per fragment and 'total' [tracks per mg per kyr per nm],
-            shape (T, n_x), or (n_x,) if the input was 1-D.
+            dict: dR/dx per fragment, the sums 'total' and 'total_no_light_ions' and one per track group
+            (TRACK_GROUPS, see set_track_groups) [tracks per mg per kyr per nm], shape (T, n_x), or (n_x,) if the
+            input was 1-D.
         """
         x_bins = _resolve_x_bins(x_bins)
 
@@ -1924,7 +2180,8 @@ class Paleodetector:
 
         dRdx_by_nucleus = {}
         dRdx_total = np.zeros((n_t, len(x_bins) - 1))
-        dRdx_heavy = np.zeros((n_t, len(x_bins) - 1))
+        dRdx_no_light = np.zeros((n_t, len(x_bins) - 1))
+        dRdx_groups = {g: np.zeros((n_t, len(x_bins) - 1)) for g in TRACK_GROUPS}
 
         geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, "Range")
         missing_tables = []
@@ -1941,7 +2198,7 @@ class Paleodetector:
 
             corr_nuclide_name = _LIGHT_ION_SYMBOLS.get(nuclide_name, nuclide_name)
             nucleus_name = ''.join(filter(str.isalpha, corr_nuclide_name))
-            ion_z = element(nucleus_name).atomic_number
+            ion_z = _atomic_number(nucleus_name)
             ion_a = int(''.join(filter(str.isdigit, corr_nuclide_name)))
 
             filepath = os.path.join(geant4_input_dir, f"DEDX_Z{ion_z}_A{ion_a}.txt")
@@ -1949,7 +2206,7 @@ class Paleodetector:
                 missing_tables.append(nuclide_name)
                 continue
 
-            e_MeV, dee_dx_mev_um, den_dx_mev_um, length_um = np.loadtxt(filepath, skiprows=1, unpack=True)
+            e_MeV, dee_dx_mev_um, den_dx_mev_um, length_um = _range_table(filepath)
 
             sorted_indices = np.argsort(length_um)
             x_to_e_func = interp1d(length_um[sorted_indices] * 1e3, e_MeV[sorted_indices],
@@ -1967,13 +2224,15 @@ class Paleodetector:
             dRdx_by_nucleus[nuclide_name] = dRdx_nucleus_mg
             dRdx_total += dRdx_nucleus_mg
             if not is_light_ion(nuclide_name):
-                dRdx_heavy += dRdx_nucleus_mg
+                dRdx_no_light += dRdx_nucleus_mg
+            dRdx_groups[track_group(ion_z, self.track_groups)] += dRdx_nucleus_mg
 
         if missing_tables and self.verbose > 0:
             self._report_missing_range_tables(recoil_data, er_bins, all_fragments, missing_tables, species)
 
         dRdx_by_nucleus[TOTAL_ALL_FRAGMENTS] = dRdx_total
-        dRdx_by_nucleus[TOTAL_NO_LIGHT_IONS] = dRdx_heavy
+        dRdx_by_nucleus[TOTAL_NO_LIGHT_IONS] = dRdx_no_light
+        dRdx_by_nucleus.update(dRdx_groups)
 
         if input_was_1d:
             dRdx_by_nucleus = {name: arr[0] for name, arr in dRdx_by_nucleus.items()}
@@ -1989,17 +2248,20 @@ class Paleodetector:
 
         Args:
             dRdx_by_fragment (dict): Output of _convert_recoil_to_track_spectrum.
-            nucleus (str): 'total_no_light_ions', 'total', 'all' (the whole dict) or a fragment key.
+            nucleus (str): 'total_no_light_ions', 'total', 'groups' (dict of the track groups and both sums), 'all'
+                (the whole dict) or a fragment key.
             label (str): Species name, for the error message.
 
         Returns:
-            np.ndarray or dict: The selected rate, or the dict for 'all'.
+            np.ndarray or dict: The selected rate, or a dict for 'groups' and 'all'.
 
         Raises:
             ValueError: If nucleus is not in the dict.
         """
         if nucleus == "all":
             return dRdx_by_fragment
+        if nucleus == TRACK_GROUPS_KEY:
+            return {k: dRdx_by_fragment[k] for k in (*TRACK_GROUPS, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)}
         if nucleus not in dRdx_by_fragment:
             raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, 'all' or a fragment of "
                              f"{label} ({sorted(k for k in dRdx_by_fragment if k not in TRACK_SUMS)}).")
@@ -2027,8 +2289,9 @@ class Paleodetector:
                 whole neutron + proton cascade is computed (cross-generations need both); energy_bins_gev then
                 selects the cells of its own product that are reported (see _secondary_grids).
             nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He, see
-                LIGHT_ION_MAX_Z), 'total' (all fragments), 'all' (dict of every fragment and both sums) or a
-                fragment key. Defaults to 'total_no_light_ions'.
+                LIGHT_ION_MAX_Z), 'total' (all fragments), 'groups' (dict of the track groups and both sums, see
+                set_track_groups), 'all' (dict of every fragment, the groups and both sums) or a fragment key.
+                Defaults to 'total_no_light_ions'.
 
         Returns:
             np.ndarray or dict: dR/dx [tracks per mg per kyr per nm], shape (T, n_x).
@@ -2078,7 +2341,7 @@ class Paleodetector:
                 TRACK_LENGTH_BINS_NM.
             species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
                 'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'.
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key (see
                 calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
             e_range (tuple[float, float], optional): (E_min, E_max) [GeV]: use only the Geant4 files whose bins
                 lie inside it (see _energy_edges). Ignored if energy_bins_gev is given. Defaults to None (all).
@@ -2165,15 +2428,19 @@ class Paleodetector:
         rule, and the fine-grid spectrum is rebinned to x_bins through its cumulative distribution.
 
         Args:
-            dRdx_array (np.ndarray): Rate [tracks per mg per kyr per nm] on x_grid, shape (T, len(x_grid) - 1).
+            dRdx_array (np.ndarray or dict): Rate [tracks per mg per kyr per nm] on x_grid, shape
+                (T, len(x_grid) - 1), or a dict of them (nucleus='groups' or 'all'): each is integrated.
             t_kyr_array (np.ndarray): Times of the rows [kyr], shape (T,).
             x_bins (np.ndarray): Output track-length bin edges [nm].
             x_grid (np.ndarray): Fine track-length grid [nm].
             annealing, annealing_r_min: See integrate_particle_signal_spectrum.
 
         Returns:
-            np.ndarray: Tracks per mg in each bin of x_bins.
+            np.ndarray or dict: Tracks per mg in each bin of x_bins (a dict for a dict input).
         """
+        if isinstance(dRdx_array, dict):
+            return {k: self._integrate_rate_over_window(v, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
+                    for k, v in dRdx_array.items()}
         if annealing is not None:
             r = self._annealing_ratio(t_kyr_array, annealing)
             dRdx_array = _shorten_tracks(dRdx_array, x_grid, r, annealing_r_min)
@@ -2206,7 +2473,7 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species_list (tuple[str], optional): Species to compute. Defaults to None (available_species()).
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key (see
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key (see
                 calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
             annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
                 at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
@@ -2260,12 +2527,17 @@ class Paleodetector:
             tasks.append((self, dict(shared_kwargs, secondary_species=secondaries,
                                      energy_bins_gev={s: edges[s] for s in secondaries})))
 
+        # the workers start with the file cache of this process and send back what they read
+        tasks = [(task_self, dict(kwargs, _file_cache=dict(_FILE_CACHE))) for task_self, kwargs in tasks]
         with Pool(processes=min(len(tasks), os.cpu_count() or 1)) as pool:
             results = list(tqdm(pool.imap(_species_worker, tasks), total=len(tasks)))
+        for _, new_entries in results:
+            for key, value in new_entries.items():
+                _cache_put(key, value)
 
-        computed = dict(pair for result in results for pair in result)
+        computed = dict(pair for result, _ in results for pair in result)
         total_tracks_by_species = {s: computed[s] for s in species_list}
-        total_tracks_by_species['total'] = sum(total_tracks_by_species.values())
+        total_tracks_by_species['total'] = _combine_track_results(total_tracks_by_species.values())
 
         return x_bins, total_tracks_by_species
 
@@ -2572,7 +2844,7 @@ class Paleodetector:
             secondaries (bool, optional): Also compute the products' recoils. Defaults to True.
             product_simulated_particles (float, optional): Primaries per product run (mu-, mu+, neutron, proton in
                 the mineral). Defaults to None (total_simulated_particles).
-            nucleus (str, optional): 'total_no_light_ions', 'total' or a fragment key. Defaults to
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key. Defaults to
                 'total_no_light_ions'.
             annealing, annealing_r_min: See integrate_particle_signal_spectrum.
             x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to TRACK_LENGTH_BINS_NM.
@@ -2715,7 +2987,7 @@ class Paleodetector:
             )
             results[key] = self._integrate_rate_over_window(dRdx, t_kyr, x_bins, x_grid, annealing, annealing_r_min)
 
-        results['total'] = sum(results.values())
+        results['total'] = _combine_track_results(results.values())
         return x_bins, results
 
 
@@ -2728,16 +3000,22 @@ def _species_worker(self_and_args):
             together by _integrate_secondary_species, energy_bins_gev then being a dict per species)).
 
     Returns:
-        list[tuple[str, np.ndarray]]: (species, tracks per mg in each bin) for each species of the task.
+        tuple[list[tuple[str, np.ndarray]], dict]: (species, tracks per mg in each bin) for each species of the task,
+        and the file-cache entries read by this worker (merged into the parent's cache).
     """
     self, kwargs = self_and_args
     kwargs = dict(kwargs)
+    for key, value in kwargs.pop('_file_cache', {}).items():
+        _cache_put(key, value)
+    known = set(_FILE_CACHE)
     if 'secondary_species' in kwargs:
         secondary = kwargs.pop('secondary_species')
         if self.verbose > 1:
             print(f"Processing secondary species: {secondary}")
-        return list(self._integrate_secondary_species(secondary, **kwargs).items())
-    species = kwargs.pop('species')
-    if self.verbose > 1:
-        print(f"Processing species: {species}")
-    return [(species, self.integrate_particle_signal_spectrum(species=species, **kwargs))]
+        result = list(self._integrate_secondary_species(secondary, **kwargs).items())
+    else:
+        species = kwargs.pop('species')
+        if self.verbose > 1:
+            print(f"Processing species: {species}")
+        result = [(species, self.integrate_particle_signal_spectrum(species=species, **kwargs))]
+    return result, {key: _FILE_CACHE[key] for key in _FILE_CACHE if key not in known}
