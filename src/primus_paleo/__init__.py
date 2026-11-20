@@ -27,7 +27,7 @@ except PackageNotFoundError:                                  # running from the
 from . import config, _core, flux, detector, geant4_runs, observables
 from .config import (set_data_path, data_path, set_geant4_path, geant4_app_path, flux_template_dir,
                      mineral_library_path, load_mineral_library, mineral_config, describe)
-from .flux import FluxHistory, FluxTemplate, MCEQ_SPECIES
+from .flux import FluxHistory, FluxTemplate, MCEQ_SPECIES, list_flux_models
 from ._core import *
 from .detector import *
 from .geant4_runs import *

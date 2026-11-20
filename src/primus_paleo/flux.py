@@ -1,4 +1,7 @@
+import functools
+import inspect
 import os
+import re
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator, interp1d
@@ -56,8 +59,9 @@ class FluxTemplate:
     the MCEq cost.
     """
 
-    def __init__(self, name, energy_gev, species_grids, t_since_kyr=None):
+    def __init__(self, name, energy_gev, species_grids, t_since_kyr=None, meta=None):
         self.name = name
+        self.meta = dict(meta or {})          # site of the template: h_obs_km, geomagnetic_cutoff, interaction_model
         self.energy_gev = np.asarray(energy_gev, dtype=float)
         self.t_since_kyr = None if t_since_kyr is None else np.asarray(t_since_kyr, dtype=float)
         self.is_steady = self.t_since_kyr is None
@@ -128,6 +132,8 @@ class FluxTemplate:
             payload['t_since_kyr'] = self.t_since_kyr
         for species, grid in self._grids.items():
             payload[f'species__{species}'] = grid
+        for key, value in self.meta.items():
+            payload[f'meta__{key}'] = np.asarray('' if value is None else value)
         np.savez_compressed(filepath, **payload)
 
     @classmethod
@@ -140,53 +146,34 @@ class FluxTemplate:
                 key.split('__', 1)[1]: data[key]
                 for key in data.files if key.startswith('species__')
             }
+            meta = {key.split('__', 1)[1]: data[key].item() for key in data.files if key.startswith('meta__')}
+        meta = {k: (None if v == '' else v) for k, v in meta.items()}
         name = os.path.splitext(os.path.basename(filepath))[0]
-        return cls(name, energy_gev, species_grids, t_since_kyr=t_since_kyr)
+        return cls(name, energy_gev, species_grids, t_since_kyr=t_since_kyr, meta=meta)
 
     @classmethod
     def get_or_build(cls, params, template_dir=None, force_rebuild=False):
         """
-        `params` is a small dict describing a physical scenario, e.g. `{"kind": "SN", "distance_pc": 200}`.
-
-        If it's already on disk (and `force_rebuild` is False), loads and returns it. Otherwise, calls MCEq (lazily
-        imported) to build it, saves it to `template_dir`, and returns it. Next time, this scenario is loaded.
-
-        Kinds: 'Baseline' (Hillas-Gaisser H3a), 'SN' (SNHG12, params age-grid cut 'tcut' and 'distance_pc'),
-        'Egal' (EgalHG12) and 'Tabulated' (a primary spectrum given as arrays, see `primary_spectrum_spec`).
-        Common optional keys: 'geomagnetic_cutoff' [GV] (default 5.0), 'h_obs_km', 'interaction_model',
-        'solver' ('response' or 'direct', default DEFAULT_SOLVER; not part of the cache name, both give the same
-        template).
+        The template of a spec dict: a 'Baseline' (default, {} = H3a), an analytical model ({"kind": "SN",
+        "distance_pc": 100}, see register_flux_model) or a 'Tabulated' flux (see the primary-flux section), plus the
+        site keys 'h_obs_km' (default sea level), 'geomagnetic_cutoff' [GV] (default 5.0), 'interaction_model' and
+        'solver' ('response' or 'direct', default DEFAULT_SOLVER; not part of the name: both give the same template).
+        In a FluxHistory, give the site once to the history instead.
 
         Caching: templates built with the response matrix are rebuilt from it on demand (a fraction of a second)
-        and kept only in memory for the session, unless SAVE_RESPONSE_TEMPLATES is True; only the matrices
-        (Response_*.npz) live on disk. Templates of the 'direct' solver are saved to and loaded from
-        <template_dir>/<name>.npz as before. A bare template name in FluxHistory still loads its .npz file.
+        and kept in memory for the session, unless SAVE_RESPONSE_TEMPLATES is True; only the matrices
+        (Response_*.npz) live on disk. 'direct' templates are saved to and loaded from <template_dir>/<name>.npz.
         """
         template_dir = config.flux_template_dir() if template_dir is None else template_dir
         params = dict(params)
-        kind = params.get("kind", "Baseline")
-        solver = params.get("solver") or DEFAULT_SOLVER
+        solver = params.pop("solver", None) or DEFAULT_SOLVER
         on_disk = solver == "direct" or SAVE_RESPONSE_TEMPLATES
-
-        if on_disk and kind != "Tabulated":
-            name = "_".join(str(val) for key, val in params.items() if key != "solver")
-            path = os.path.join(template_dir, name + ".npz")
-            if os.path.exists(path) and not force_rebuild:
-                return cls.load(path)
-
-        params.pop("kind", None)
-        params.pop("solver", None)
         geomagnetic_cutoff = params.pop("geomagnetic_cutoff", 5.0)
         h_obs_km = params.pop("h_obs_km", None)
         interaction_model = params.pop("interaction_model", DEFAULT_INTERACTION_MODEL)
 
-        if kind == "Tabulated":
-            data = _tabulated_data(params)
-            name = "_".join(["Tabulated", str(params.get("name", "primary")), data["hash"], f"{geomagnetic_cutoff}GV"])
-        else:
-            name = "_".join([kind, *(str(val) for val in params.values()), f"{geomagnetic_cutoff}GV"])
-        if h_obs_km:
-            name = name + "_" + str(h_obs_km) + "km"
+        label, factory, times = _primary_source(params)
+        name = f"{label}_{geomagnetic_cutoff}GV" + (f"_{h_obs_km}km" if h_obs_km else "")
 
         path = os.path.join(template_dir, name + ".npz")
         memory_key = (os.path.abspath(template_dir), name, interaction_model)
@@ -196,26 +183,9 @@ class FluxTemplate:
             if on_disk and os.path.exists(path):
                 return cls.load(path)
 
-        if kind == "Tabulated":
-            model, params_tuple, t_since_kyr = TabulatedPrimary, (data,), data["t_since_yr"]
-        else:
-            params_tuple = tuple(params.values())
-            if kind == "Baseline":
-                model = None
-            elif kind == "SN":
-                model = SNHG12
-            elif kind == "Egal":
-                model = EgalHG12
-            else:
-                raise ValueError(f"Unknown template kind: {kind}")
-
-            tcut = params.get("tcut", 500.e3)
-            nbins = min(250, int(tcut / 2.e2))
-            t_since_kyr = np.linspace(1., tcut, nbins)
-
-        template = _build_template(name=name, model=model, params=params_tuple, t_since_kyr=t_since_kyr,
-                                   interaction_model=interaction_model, geomagnetic_cutoff=geomagnetic_cutoff,
-                                   h_obs_km=h_obs_km, solver=solver, template_dir=template_dir)
+        template = _build_template(name, factory, t_since_kyr=times, interaction_model=interaction_model,
+                                   h_obs_km=h_obs_km, geomagnetic_cutoff=geomagnetic_cutoff, solver=solver,
+                                   template_dir=template_dir)
         if on_disk:
             template.save(path)
         _TEMPLATE_CACHE[memory_key] = template
@@ -223,16 +193,13 @@ class FluxTemplate:
 
     @classmethod
     def from_primary_spectrum(cls, energy_gev, flux, composition=None, t_since_yr=None, name="primary",
-                              template_dir=None, force_rebuild=False, **options):
-        """
-        Template whose secondaries MCEq computes from a primary spectrum given as arrays: shorthand for
-        `get_or_build(primary_spectrum_spec(...))`. See `primary_spectrum_spec` for the arguments; `options` are
-        the usual 'geomagnetic_cutoff', 'h_obs_km', 'interaction_model', 'solver'. To have the template respond to
-        geomagnetic excursions, pass the spec dict to FluxHistory instead of this pre-built template.
-        """
-        spec = primary_spectrum_spec(energy_gev, flux, composition=composition, t_since_yr=t_since_yr, name=name,
-                                     **options)
-        return cls.get_or_build(spec, template_dir=template_dir, force_rebuild=force_rebuild)
+                              template_dir=None, force_rebuild=False, **site):
+        """Shorthand for get_or_build(primary_spectrum_spec(...)): a 'Tabulated' template from one energy grid."""
+        spec = primary_spectrum_spec(energy_gev, flux, composition=composition, t_since_yr=t_since_yr, name=name)
+        return cls.get_or_build({**spec, **site}, template_dir=template_dir, force_rebuild=force_rebuild)
+
+
+SITE_KEYS = ("h_obs_km", "geomagnetic_cutoff", "interaction_model")
 
 
 class FluxHistory:
@@ -244,11 +211,12 @@ class FluxHistory:
     Timeline: see module docstring -- 0 = present, negative = past.
     """
 
-    def __init__(self, baseline={"kind": "Baseline"}, events=None, excursions=None, template_dir=None):
+    def __init__(self, baseline=None, events=None, excursions=None, template_dir=None, h_obs_km=None,
+                 geomagnetic_cutoff=None, interaction_model=None):
         """
         Args:
-            baseline: a FluxTemplate, a cached template name (str), or a
-                params dict (built on demand) -- e.g. {"kind": "baseline"}.
+            baseline: a params dict (built on demand; None or {} = H3a, see FluxTemplate.get_or_build), a
+                FluxTemplate or a cached template name (str).
             events: list of dicts, each with 'start_time_kyr' (or
                 'time_kyr') and 'template' (FluxTemplate / name / params
                 dict), and optionally 'weight' / 'label'.
@@ -257,13 +225,20 @@ class FluxHistory:
                 'label' -- see `add_excursion`.
             template_dir: directory used to load/save templates. Defaults to None: <data root>/flux_data
                 (config.flux_template_dir()).
-            name: optional human label; if omitted, `.signature` derives
-                one from the actual content.
+            h_obs_km, geomagnetic_cutoff, interaction_model: the site, given once and applied to the baseline,
+                every event and the excursion variants. One not given here is taken from the baseline spec if it
+                has it (older notebooks), else the get_or_build default. An entry with a different value raises.
         """
         self.template_dir = config.flux_template_dir() if template_dir is None else template_dir
-        self._baseline_spec = baseline
+        baseline = {} if baseline is None else baseline
+        site = {k: v for k, v in (("h_obs_km", h_obs_km), ("geomagnetic_cutoff", geomagnetic_cutoff),
+                                  ("interaction_model", interaction_model)) if v is not None}
+        if isinstance(baseline, dict):
+            site = {**{k: baseline[k] for k in SITE_KEYS if k in baseline}, **site}
+        self.site = site
+        self._baseline_spec = self._with_site(baseline, "baseline")
         self._baseline_cutoff_variants = {}
-        self.baseline = self._resolve(baseline)
+        self.baseline = self._resolve(self._baseline_spec)
         self.events = []
         for event in (events or []):
             start_time = event.get("start_time_kyr")
@@ -275,6 +250,27 @@ class FluxHistory:
                 excursion["geomagnetic_cutoff"], label=excursion.get("label"),
             )
 
+    def _with_site(self, spec, label):
+        """The spec with the site of the history; raises if it states a different site."""
+        if isinstance(spec, FluxTemplate):
+            self._check_site(spec, label)
+            return spec
+        if not isinstance(spec, dict):
+            return spec
+        out = dict(spec)
+        for key, value in self.site.items():
+            if key in out and out[key] != value:
+                raise ValueError(f"{label}: {key} = {out[key]!r} differs from the flux history's {value!r}; give "
+                                 "the site once, to FluxHistory.")
+            out[key] = value
+        return out
+
+    def _check_site(self, template, label):
+        for key, value in self.site.items():
+            if key in template.meta and template.meta[key] != value:
+                raise ValueError(f"{label}: template {template.name!r} was built with {key} = "
+                                 f"{template.meta[key]!r}, the flux history has {value!r}.")
+
     def _resolve(self, template):
         if isinstance(template, FluxTemplate):
             return template
@@ -283,7 +279,9 @@ class FluxHistory:
         if isinstance(template, str):
             path = os.path.join(self.template_dir, f"{template}.npz")
             if os.path.exists(path):
-                return FluxTemplate.load(path)
+                loaded = FluxTemplate.load(path)
+                self._check_site(loaded, template)
+                return loaded
             raise FileNotFoundError(
                 f"No cached template named '{template}' in {self.template_dir}. "
                 f"Pass a params dict (e.g. {{'kind': 'SN', 'distance_pc': ...}}) "
@@ -301,6 +299,7 @@ class FluxHistory:
         template at the same or nearby times, e.g. two supernovae close
         together) are superposed automatically.
         """
+        template = self._with_site(template, label or f"event at {start_time_kyr} kyr")
         resolved = self._resolve(template)
         self.events.append({
             "template": resolved, "spec": template, "start_time_kyr": float(start_time_kyr),
@@ -447,256 +446,475 @@ try:
     from crflux.models import PrimaryFlux
 except ImportError:
     PrimaryFlux = object
+try:                                    # crflux >= 2.3: Fe group id 5426 -> 5626 (A = 56)
+    from crflux.models import LEGACY_IDS as _CRFLUX_LEGACY_IDS
+except ImportError:
+    _CRFLUX_LEGACY_IDS = {}
 
 
-class SNHG12(PrimaryFlux):
+# =====================================================================================================================
+# Primary fluxes at the top of the atmosphere
+# =====================================================================================================================
+# Three kinds of template spec (FluxTemplate.get_or_build, FluxHistory):
+#
+#   "Baseline"     steady background: a crflux model, by default Hillas-Gaisser H3a ({} means this), or a steady
+#                  Analytical / Tabulated flux:   {"kind": "Baseline", "model": "H4a"},
+#                  {"kind": "Baseline", "model": ("GlobalSplineFitBeta", None)}, {"kind": "Baseline", "flux": {...}}
+#   Analytical     a function f(E_gev, t_yr, **params) -> {nucleus: flux}, registered under a short name
+#                  (register_flux_model) and used as {"kind": "SN", "distance_pc": 100}, or passed directly as
+#                  {"kind": "Analytical", "function": f, ...}. Built in: "SN", "Egal"; list_flux_models()
+#                  shows every registered model with its parameters.
+#   "Tabulated"    arrays, one entry per nucleus (see _tabulated_data):
+#                  {"kind": "Tabulated", "name": ..., "time_yr": t[n_time],
+#                   "H": {"energy_gev": E[n_energy], "flux_cm2_s_sr_gev": F[n_time, n_energy]}, "He": {...}}
+#
+# Every flux is per nucleus, per GeV of total energy per nucleus, in cm^-2 s^-1 sr^-1, at the top of the
+# atmosphere and before the geomagnetic cutoff, which is applied afterwards (crflux nucleus_flux) at the site's
+# cutoff. Nuclei are named by mass group ('H', 'He', 'CNO', 'MgAlSi', 'Fe'), by nucleus ('O16', 'Fe56') or by CORSIKA
+# id; MCEq splits each into its nucleons (superposition). Transient fluxes (events) are the excess over the baseline.
+# Time grids are fixed per model (log-spaced; keys t_min_yr, t_max_yr, n_times; 'tcut' = t_max_yr): the detector
+# refines its own time grid around the template times.
 
-    def __init__(self, model, geomagnetic_cutoff=5.0):
-        super().__init__(geomagnetic_cutoff=geomagnetic_cutoff)
-        self.name = 'Mod'
-        self.sname = model
-        self.t = model[0] * 3.154e7
-        self.d = model[1] * 3.086e18
-        self.params = {}
-        self.SNfrac = {}
-        self.rid_cutoff = {}
-
-        mass_comp = [14, 402, 1206, 2814, 5426]
-        for mcomp in mass_comp:
-            self.params[mcomp] = {}
-            self.SNfrac[mcomp] = 0.0
-
-        self.rid_cutoff[1] = 4e6
-        self.rid_cutoff[2] = 30e6
-        self.rid_cutoff[3] = 2e9
-
-        self.SNfrac[14] = 0.90    # H
-        self.SNfrac[402] = 0.08   # He
-        self.SNfrac[1206] = 0.01  # CNO
-        self.SNfrac[2814] = 0.005  # MgAlSi
-        self.SNfrac[5426] = 0.005  # Fe
-
-        self.params[14][1] = (1. * 7860, 1.66, 1)    # H
-        self.params[402][1] = (1. * 3550, 1.58, 2)   # He
-        self.params[1206][1] = (1. * 2200, 1.63, 6)  # CNO
-        self.params[2814][1] = (1. * 1430, 1.67, 14)  # MgAlSi
-        self.params[5426][1] = (1. * 2120, 1.63, 26)  # Fe
-
-        self.params[14][2] = (1 * 20, 1.4, 1)      # H
-        self.params[402][2] = (1 * 20, 1.4, 2)     # He
-        self.params[1206][2] = (1 * 13.4, 1.4, 6)  # CNO
-        self.params[2814][2] = (1 * 13.4, 1.4, 14)  # MgAlSi
-        self.params[5426][2] = (1 * 13.4, 1.4, 26)  # Fe
-
-        self.params[14][3] = (1 * 1.7, 1.4, 1)      # H
-        self.params[402][3] = (1 * 1.7, 1.4, 2)     # He
-        self.params[1206][3] = (1 * 1.14, 1.4, 6)   # CNO
-        self.params[2814][3] = (1 * 1.14, 1.4, 14)  # MgAlSi
-        self.params[5426][3] = (1 * 1.14, 1.4, 26)  # Fe
-
-        self.nucleus_ids = list(self.params.keys())
-
-    def _nucleus_flux(self, corsika_id, E):
-        corsika_id = self._find_nearby_id(corsika_id)
-
-        flux = 0.0
-
-        D0 = 2e28
-        Q0 = 4.e52 * self.SNfrac[corsika_id]
-        Ecut = 1e6
-        D = D0 * (E**(1 / 3))
-        Q = Q0 * (E**-2.2) * np.exp(-E / self.params[corsika_id][3][2] / Ecut)
-        flux += ((Q) / (np.pi**1.5 * np.sqrt(4 * D * self.t)**3) *
-                 np.exp(-self.d**2 / (4 * D * self.t))) * 1e4 * 3e10 / 4 * np.pi
-
-        return flux
-
-class EgalHG12(PrimaryFlux):
-
-    def __init__(self, model, geomagnetic_cutoff=0.0):
-        super().__init__(geomagnetic_cutoff=geomagnetic_cutoff)
-        self.name = 'Mod'
-        self.sname = model
-        self.t = model[0] * 3.154e7
-        self.egfactor = model[1]
-        self.egcut = model[2]
-        self.tcut = model[3] * 3.154e7
-        self.params = {}
-        self.SNfrac = {}
-        self.rid_cutoff = {}
-
-        mass_comp = [14, 402, 1206, 2814, 5426]
-        for mcomp in mass_comp:
-            self.params[mcomp] = {}
-
-        self.rid_cutoff[1] = 4e6
-        self.rid_cutoff[2] = 30e6
-        self.rid_cutoff[3] = 2e9
-
-        self.params[14][1] = (1. * 7860, 1.66, 1)    # H
-        self.params[402][1] = (1. * 3550, 1.58, 2)   # He
-        self.params[1206][1] = (1. * 2200, 1.63, 6)  # CNO
-        self.params[2814][1] = (1. * 1430, 1.67, 14)  # MgAlSi
-        self.params[5426][1] = (1. * 2120, 1.63, 26)  # Fe
-
-        self.params[14][2] = (1 * 20, 1.4, 1)      # H
-        self.params[402][2] = (1 * 20, 1.4, 2)     # He
-        self.params[1206][2] = (1 * 13.4, 1.4, 6)  # CNO
-        self.params[2814][2] = (1 * 13.4, 1.4, 14)  # MgAlSi
-        self.params[5426][2] = (1 * 13.4, 1.4, 26)  # Fe
-
-        self.params[14][3] = (1 * 1.7, 1.4, 1)      # H
-        self.params[402][3] = (1 * 1.7, 1.4, 2)     # He
-        self.params[1206][3] = (1 * 1.14, 1.4, 6)   # CNO
-        self.params[2814][3] = (1 * 1.14, 1.4, 14)  # MgAlSi
-        self.params[5426][3] = (1 * 1.14, 1.4, 26)  # Fe
-
-        self.nucleus_ids = list(self.params.keys())
-
-    def _nucleus_flux(self, corsika_id, E):
-        corsika_id = self._find_nearby_id(corsika_id)
-
-        flux = 0.0
-
-        tdecay = np.exp(-self.t / self.tcut) if self.t > self.tcut else 1.0
-
-        flux += self.egfactor * self.params[corsika_id][3][0] * E ** (-self.params[corsika_id][3][1] - 1.0) * \
-            np.exp(-E / self.params[corsika_id][3][2] / self.egcut) * tdecay
-
-        return flux
+SECONDS_PER_YEAR = 3.156e7
+CM_PER_PC = 3.086e18
+SPEED_OF_LIGHT_CM_S = 2.998e10
+MASS_GROUP_IDS = {'H': 14, 'p': 14, 'proton': 14, 'He': 402, 'CNO': 1206, 'MgAlSi': 2814, 'Fe': 5626}
+DEFAULT_TIME_GRID = {'t_min_yr': 10.0, 't_max_yr': 1e6, 'n_times': 200}
+_CRFLUX_BASELINES = {'H3a': ('HillasGaisser2012', 'H3a'), 'H4a': ('HillasGaisser2012', 'H4a')}
+_NUCLEUS_RE = re.compile(r"^([A-Z][a-z]?)(\d+)$")
 
 
-# --- Primary spectra given as arrays --------------------------------------------------------------------------------
-# Mass groups of the Hillas-Gaisser models (CORSIKA ids: 100 A + Z, protons 14).
-MASS_GROUP_IDS = {'H': 14, 'p': 14, 'proton': 14, 'He': 402, 'CNO': 1206, 'MgAlSi': 2814, 'Fe': 5426}
+@functools.lru_cache(maxsize=None)
+def nucleus_id(name):
+    """CORSIKA id (100 A + Z, protons 14) of a mass group ('H', 'He', 'CNO', 'MgAlSi', 'Fe' = Fe56), a nucleus
+    ('O16', 'Fe56') or an id (crflux's old Fe id 5426 is read as 5626)."""
+    if isinstance(name, (int, np.integer)):
+        return _CRFLUX_LEGACY_IDS.get(int(name), int(name))
+    if name in MASS_GROUP_IDS:
+        return MASS_GROUP_IDS[name]
+    m = _NUCLEUS_RE.match(str(name))
+    if m:
+        try:
+            from ._core import atomic_number
+            z = atomic_number(m.group(1))
+        except ImportError:
+            z = None
+        if z is None:
+            from mendeleev import element
+            z = element(m.group(1)).atomic_number
+        a = int(m.group(2))
+        return 14 if (z, a) == (1, 1) else 100 * a + z
+    raise ValueError(f"unknown nucleus {name!r}: use {sorted(MASS_GROUP_IDS)}, a nucleus like 'Fe56' or a CORSIKA id.")
 
 
-def primary_spectrum_spec(energy_gev, flux, composition=None, t_since_yr=None, name="primary", **options):
-    """
-    Template spec (a params dict for FluxTemplate.get_or_build / FluxHistory) for a primary cosmic-ray spectrum
-    given as arrays. MCEq then computes every secondary species from it, so each species responds to the shape of
-    the spectrum (not a common ratio).
+def charge_and_mass(cid):
+    """(Z, A) of a CORSIKA id (14 = proton)."""
+    return (1, 1) if cid == 14 else (cid % 100, cid // 100)
 
-    Units are those of the template's own 'primary' species: energy per nucleus [GeV] (crflux convention, total
-    energy) and flux per nucleus [cm^-2 s^-1 sr^-1 GeV^-1] at the top of the atmosphere, before the geomagnetic
-    cutoff (applied by MCEq's primary model at 'geomagnetic_cutoff', default 5 GV, as for every other kind).
-    Between the given energies the flux is interpolated in log-log; outside them it is 0, so cover the range that
-    matters (MCEq uses primaries above ~3 GeV per nucleon; ~1e7 GeV is enough for everything but deep muons).
+
+# --- Analytical models: registry --------------------------------------------------------------------------------------
+_FLUX_MODELS = {}
+
+
+def register_flux_model(name, time_grid=None):
+    """Decorator registering an analytical primary flux under a short name, usable as {"kind": name, ...}.
+
+    The function is called as f(E_gev, t_yr, **params) and returns {nucleus: flux} (see the section comment for
+    units and nucleus names); E_gev is an array of total energies per nucleus, t_yr the time since the event
+    (None for a steady model). Parameters are the function's keyword arguments, with their defaults.
 
     Args:
-        energy_gev (array_like): Energies per nucleus [GeV], increasing, shape (n_E,).
-        flux (array_like or dict): Per-nucleus flux, either one array (all nuclei, split with `composition`) or a
-            dict mass group -> array, with groups 'H' (or 'p'), 'He', 'CNO', 'MgAlSi', 'Fe' or CORSIKA ids.
-            Shape (n_E,) for a steady spectrum, (n_t, n_E) for a transient one.
-        composition (dict, optional): Fractions per mass group of a single `flux` array, at the same energy per
-            nucleus (normalised to sum 1). Defaults to None: all protons.
-        t_since_yr (array_like, optional): Time since the event onset of each row of a transient `flux`, in YEARS
-            (the time axis of all transient templates is in years: FluxHistory multiplies its kyr by 1e3).
-            Defaults to None (steady).
-        name (str, optional): Label in the cache file name. Defaults to "primary".
-        **options: 'geomagnetic_cutoff', 'h_obs_km', 'interaction_model', 'solver'.
+        name (str): The 'kind' of the specs.
+        time_grid (dict, optional): Default template times {'t_min_yr', 't_max_yr', 'n_times'} (log-spaced).
+            None for a steady flux (a baseline). Defaults to None.
+    """
+    def decorate(function):
+        _FLUX_MODELS[name] = {'function': function, 'time_grid': None if time_grid is None else dict(time_grid)}
+        return function
+    return decorate
+
+
+def flux_model_parameters(name_or_function):
+    """{parameter: default} of an analytical model (registered name or function); required ones map to None."""
+    function = _FLUX_MODELS[name_or_function]['function'] if isinstance(name_or_function, str) else name_or_function
+    out = {}
+    for p in list(inspect.signature(function).parameters.values())[2:]:
+        if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+            continue
+        out[p.name] = None if p.default is p.empty else p.default
+    return out
+
+
+def list_flux_models(verbose=True):
+    """Registered analytical flux models: name, function, default time grid and parameters with defaults.
+
+    Args:
+        verbose (bool, optional): Print them. Defaults to True.
 
     Returns:
-        dict: {'kind': 'Tabulated', ...}, usable as a FluxHistory baseline or event template (and with excursions).
-
-    Notes:
-        A transient event template is the flux *excess* over the baseline, as for 'SN': give the excess primary
-        flux. MCEq is linear, so the secondaries of the excess are exactly the excess of the secondaries.
+        dict: {name: {'function', 'time_grid' (None = steady), 'parameters' {name: default, None if required},
+        'description' (first sentence of the docstring), 'doc' (the whole docstring)}}.
     """
-    spec = {"kind": "Tabulated", "name": name, "energy_gev": np.asarray(energy_gev, dtype=float)}
-    if isinstance(flux, dict):
-        spec["flux"] = {k: np.asarray(v, dtype=float) for k, v in flux.items()}
-    else:
-        spec["flux"] = np.asarray(flux, dtype=float)
-    if composition is not None:
-        spec["composition"] = dict(composition)
-    if t_since_yr is not None:
-        spec["t_since_yr"] = np.asarray(t_since_yr, dtype=float)
-    spec.update(options)
-    return spec
+    out = {}
+    for name, entry in _FLUX_MODELS.items():
+        f = entry['function']
+        text = ' '.join((inspect.getdoc(f) or '').split('\n\n')[0].split())
+        first = re.split(r'(?<=[a-z0-9)])\. |: ', text, maxsplit=1)[0]          # first sentence or clause
+        out[name] = {'function': f, 'time_grid': entry['time_grid'], 'parameters': flux_model_parameters(name),
+                     'description': first, 'doc': inspect.getdoc(f) or ''}
+    if verbose:
+        for name, info in out.items():
+            grid = info['time_grid']
+            when = ("steady" if grid is None else
+                    f"times {grid['t_min_yr']:g}-{grid['t_max_yr']:g} yr ({grid['n_times']}, log)")
+            print(f'{{"kind": "{name}"}}  {info["function"].__name__}: {info["description"]}')
+            print(f"    {when}")
+            for p, default in info['parameters'].items():
+                print(f"    {p} = {'(required)' if default is None else repr(default)}")
+    return out
 
 
-def _tabulated_data(params):
-    """
-    Normalises the arrays of a 'Tabulated' spec: energies, per-group 2D flux grids (n_t or 1, n_E) keyed by CORSIKA
-    id, the time axis (None if steady) and a short hash of all of them for the cache name.
-    """
-    import hashlib
-
-    energy = np.asarray(params["energy_gev"], dtype=float)
-    if energy.ndim != 1 or energy.size < 2 or np.any(np.diff(energy) <= 0) or energy[0] <= 0:
-        raise ValueError("Tabulated: 'energy_gev' must be 1D, positive and increasing, with at least 2 values.")
-    t_since = params.get("t_since_yr")
-    t_since = None if t_since is None else np.asarray(t_since, dtype=float)
-
-    flux = params["flux"]
-    if isinstance(flux, dict):
-        if params.get("composition") is not None:
-            raise ValueError("Tabulated: give 'composition' only with a single flux array, not with a dict.")
-        raw = flux
-    else:
-        composition = params.get("composition") or {"H": 1.0}
-        total = sum(composition.values())
-        raw = {group: np.asarray(flux, dtype=float) * frac / total for group, frac in composition.items()}
-
-    groups = {}
-    for group, grid in raw.items():
-        cid = MASS_GROUP_IDS.get(group, group)
-        if not isinstance(cid, (int, np.integer)):
-            raise ValueError(f"Tabulated: unknown mass group {group!r} (use {sorted(MASS_GROUP_IDS)} or CORSIKA ids).")
-        grid = np.atleast_2d(np.asarray(grid, dtype=float))
-        if grid.shape[-1] != energy.size:
-            raise ValueError(f"Tabulated: flux of {group!r} has {grid.shape[-1]} energies, energy_gev has {energy.size}.")
-        if np.any(grid < 0):
-            raise ValueError(f"Tabulated: negative flux in {group!r}.")
-        groups[int(cid)] = groups.get(int(cid), 0.) + grid
-
-    n_rows = {g.shape[0] for g in groups.values()}
-    if len(n_rows) != 1:
-        raise ValueError("Tabulated: all mass groups need the same number of time rows.")
-    n_rows = n_rows.pop()
-    if t_since is None and n_rows != 1:
-        raise ValueError("Tabulated: a 2D flux needs 't_since_yr' (one time per row).")
-    if t_since is not None and (t_since.ndim != 1 or t_since.size != n_rows or np.any(np.diff(t_since) <= 0)):
-        raise ValueError("Tabulated: 't_since_yr' must be increasing, one value per flux row.")
-
-    h = hashlib.sha1(energy.tobytes())
-    for cid in sorted(groups):
-        h.update(str(cid).encode())
-        h.update(np.ascontiguousarray(groups[cid]).tobytes())
-    if t_since is not None:
-        h.update(t_since.tobytes())
-    return {"energy_gev": energy, "groups": groups, "t_since_yr": t_since, "hash": h.hexdigest()[:10]}
+def _check_parameters(function, params, label):
+    """The function's keyword parameters filled with params; raises on unknown or missing ones."""
+    sig = list(inspect.signature(function).parameters.values())[2:]
+    takes_any = any(p.kind == p.VAR_KEYWORD for p in sig)
+    known = {p.name for p in sig if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)}
+    unknown = set(params) - known
+    if unknown and not takes_any:
+        raise ValueError(f"{label}: unknown parameters {sorted(unknown)}; known: {sorted(known)}.")
+    missing = [p.name for p in sig if p.default is p.empty and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+               and p.name not in params]
+    if missing:
+        raise ValueError(f"{label}: missing parameters {missing}.")
+    return {**{p.name: p.default for p in sig if p.default is not p.empty and p.name in known}, **params}
 
 
-class TabulatedPrimary(PrimaryFlux):
-    """
-    crflux primary model built from arrays (see primary_spectrum_spec). Called like the other models:
-    `TabulatedPrimary((data,), geomagnetic_cutoff)` for a steady spectrum, `TabulatedPrimary((t_since, data), ...)`
-    for the row of a transient one at time t_since (one of data['t_since_yr']). Per-nucleus flux interpolated in
-    log-log, 0 outside the tabulated energies; the cutoff is applied by crflux's nucleus_flux as for every model.
-    """
+def _time_grid(grid):
+    t_min, t_max, n = float(grid['t_min_yr']), float(grid['t_max_yr']), int(grid['n_times'])
+    if not 0 < t_min < t_max:
+        raise ValueError(f"time grid needs 0 < t_min_yr < t_max_yr, got {t_min}, {t_max}.")
+    return np.geomspace(t_min, t_max, n)
 
-    def __init__(self, model, geomagnetic_cutoff=5.0):
+
+class PrimarySource:
+    """A primary flux at the top of the atmosphere, as the solvers use it: the flux of each nucleus
+    [m^-2 s^-1 sr^-1 GeV^-1, crflux units] at given total energies per nucleus, before the geomagnetic cutoff.
+    The split into nucleons and the cutoff are applied by nucleon_spectra / total_nucleus_flux (response solver)
+    or by crflux through _SourceAsCrflux (direct solver, MCEq)."""
+
+    nucleus_ids = ()
+    name = 'primary'
+
+    def fluxes(self, energies):
+        """{CORSIKA id: flux} at {CORSIKA id: energies per nucleus [GeV]}."""
+        raise NotImplementedError
+
+
+class _FunctionSource(PrimarySource):
+    """An analytical flux function (see register_flux_model) at one time. Called once per evaluation, with the
+    energies of every nucleus concatenated."""
+
+    def __init__(self, function, t_yr, params):
+        self.function, self.t_yr, self.params = function, t_yr, dict(params)
+        probe = function(np.array([10.0]), t_yr, **self.params)
+        self._names = {nucleus_id(k): k for k in probe}
+        self.nucleus_ids = sorted(self._names)
+        self.name = getattr(function, '__name__', 'flux model')
+
+    def fluxes(self, energies):
+        ids = [cid for cid in self.nucleus_ids if cid in energies]
+        arrays = [np.atleast_1d(np.asarray(energies[cid], dtype=float)) for cid in ids]
+        edges = np.cumsum([0] + [a.size for a in arrays])
+        values = self.function(np.concatenate(arrays), self.t_yr, **self.params)
+        out = {}
+        for k, cid in enumerate(ids):
+            v = np.broadcast_to(np.asarray(values[self._names[cid]], dtype=float), (edges[-1],))
+            out[cid] = v[edges[k]:edges[k + 1]] * 1e4                              # cm^-2 -> m^-2 (crflux units)
+        return out
+
+
+class _CrfluxSource(PrimarySource):
+    """A crflux model (the baselines), taken without its own geomagnetic cutoff."""
+
+    def __init__(self, model):
+        if not getattr(model, 'nucleus_ids', None):
+            raise ValueError(f"{type(model).__name__} gives nucleons only, without nuclei: not supported.")
+        self.model = model
+        self.nucleus_ids = list(model.nucleus_ids)
+        self.name = getattr(model, 'name', type(model).__name__)
+
+    def fluxes(self, energies):
+        return {cid: self.model.nucleus_flux(cid, E) for cid, E in energies.items()}
+
+
+def _cutoff_energy(Z, A, rigidity_gv):
+    """Total energy per nucleus at the cutoff rigidity, with the installed crflux's convention: sqrt((Z R)^2 + M^2)
+    (crflux >= 2.3) or Z R (earlier), so the response and direct solvers cut the same way."""
+    if hasattr(PrimaryFlux, 'cutoff_energy'):
+        return PrimaryFlux.cutoff_energy(Z, A, rigidity_gv)
+    return Z * rigidity_gv
+
+
+def _apply_cutoff(cid, E, flux, geomagnetic_cutoff):
+    """Flux set to 0 below the geomagnetic cutoff (as crflux's nucleus_flux; no cut for None or 0)."""
+    if not geomagnetic_cutoff:
+        return flux
+    Z, A = charge_and_mass(cid)
+    return np.where(E >= _cutoff_energy(Z, A, geomagnetic_cutoff), flux, 0.0)
+
+
+def nucleon_spectra(source, e_nucleon_gev, geomagnetic_cutoff):
+    """Proton and neutron fluxes at the given energies per nucleon (superposition, as crflux's p_and_n_flux): a
+    nucleus (Z, A) of energy A E gives Z A phi(A E) protons and (A - Z) A phi(A E) neutrons per GeV."""
+    e = np.atleast_1d(np.asarray(e_nucleon_gev, dtype=float))
+    energies = {cid: e * charge_and_mass(cid)[1] for cid in source.nucleus_ids}
+    fluxes = source.fluxes(energies)
+    p, n = 0, 0
+    for cid in source.nucleus_ids:
+        Z, A = charge_and_mass(cid)
+        phi = _apply_cutoff(cid, energies[cid], fluxes[cid], geomagnetic_cutoff)
+        p = p + Z * A * phi
+        n = n + (A - Z) * A * phi
+    return p, n
+
+
+def total_nucleus_flux(source, E_gev, geomagnetic_cutoff):
+    """All-nucleus flux at the given energies per nucleus, after the cutoff (as crflux's total_flux)."""
+    E = np.atleast_1d(np.asarray(E_gev, dtype=float))
+    fluxes = source.fluxes({cid: E for cid in source.nucleus_ids})
+    return sum(_apply_cutoff(cid, E, fluxes[cid], geomagnetic_cutoff) for cid in source.nucleus_ids)
+
+
+class _SourceAsCrflux(PrimaryFlux):
+    """A PrimarySource as a crflux model, for MCEq (direct solver); crflux applies the cutoff and the split."""
+
+    def __init__(self, source, geomagnetic_cutoff=5.0):
         super().__init__(geomagnetic_cutoff=geomagnetic_cutoff)
-        if isinstance(model[0], dict):
-            data, row = model[0], 0
-        else:
-            data = model[1]
-            row = int(np.argmin(np.abs(data["t_since_yr"] - model[0])))
-        self.name = 'Tabulated'
-        self.sname = 'Tabulated'
-        self._log_e = np.log(data["energy_gev"])
-        # template units (cm^-2) -> crflux units (m^-2)
-        self._log_flux = {cid: np.log(np.clip(grid[row] * 1e4, 1e-300, None)) for cid, grid in data["groups"].items()}
-        self.nucleus_ids = sorted(self._log_flux)
+        self.source = source
+        self.nucleus_ids = list(source.nucleus_ids)
+        self.name = self.sname = source.name
 
     def _nucleus_flux(self, corsika_id, E):
         E = np.atleast_1d(np.asarray(E, dtype=float))
-        log_flux = self._log_flux.get(corsika_id)
-        if log_flux is None:
+        if corsika_id not in self.nucleus_ids:
             return np.zeros_like(E)
-        return np.exp(np.interp(np.log(E), self._log_e, log_flux, left=-np.inf, right=-np.inf))
+        return self.source.fluxes({corsika_id: E})[corsika_id]
+
+
+# --- Built-in analytical models ---------------------------------------------------------------------------------------
+@register_flux_model("SN", time_grid={'t_min_yr': 10.0, 't_max_yr': 5e5, 'n_times': 250})
+def thomas_yelland_sn(E_gev, t_yr, distance_pc, q0_per_gev=3e52, index=2.2, e_cut_gev=1e6, d0_cm2_s=2e28,
+                      delta=1.0 / 3.0):
+    """Nearby supernova, diffusive transport: Thomas & Yelland 2023, ApJ 950, 41, Sect. 2. Protons released at
+    once with Q(E) = Q0 (E / GeV)^-index exp(-E / E_c), D = D0 (E / GeV)^delta, n = Q / (pi^3/2 r_diff^3)
+    exp(-r^2 / r_diff^2) with r_diff = sqrt(4 D t), I = c n / 4 pi. Defaults are the paper's."""
+    E = np.asarray(E_gev, dtype=float)
+    D = d0_cm2_s * E ** delta
+    r_diff = np.sqrt(4 * D * t_yr * SECONDS_PER_YEAR)
+    n = (q0_per_gev * E ** -index * np.exp(-E / e_cut_gev) / (np.pi ** 1.5 * r_diff ** 3)
+         * np.exp(-(distance_pc * CM_PER_PC) ** 2 / r_diff ** 2))
+    return {'H': SPEED_OF_LIGHT_CM_S / (4 * np.pi) * n}
+
+
+# Hillas-Gaisser H3a population 3 (a [m^-2 s^-1 sr^-1 GeV^gamma], gamma, Z), as in crflux
+_H3A_POP3 = {'H': (1.7, 1.4, 1), 'He': (1.7, 1.4, 2), 'CNO': (1.14, 1.4, 6), 'MgAlSi': (1.14, 1.4, 14),
+             'Fe': (1.14, 1.4, 26)}
+
+
+@register_flux_model("Egal", time_grid={'t_min_yr': 10.0, 't_max_yr': 1e6, 'n_times': 200})
+def egal_boost(E_gev, t_yr, boost=1.0, cutoff_rigidity_gv=2e9, duration_yr=1e5, decay_time_yr=1e5):
+    """Phenomenological boost of H3a population 3: boost * a E^(-gamma-1) exp(-E / (Z R_c)), constant for
+    duration_yr, then decaying as exp(-(t - duration_yr) / decay_time_yr). Not a physical source model."""
+    E = np.asarray(E_gev, dtype=float)
+    f_t = 1.0 if t_yr <= duration_yr else float(np.exp(-(t_yr - duration_yr) / decay_time_yr))
+    return {name: boost * f_t * a * 1e-4 * E ** (-gamma - 1.0) * np.exp(-E / (Z * cutoff_rigidity_gv))
+            for name, (a, gamma, Z) in _H3A_POP3.items()}
+
+
+# --- Tabulated fluxes -------------------------------------------------------------------------------------------------
+# energy-like key -> (flux key, conversion factor to energy per nucleus: 'one', 'A' or 'Z')
+_TABLE_AXES = {
+    'energy_gev': ('flux_cm2_s_sr_gev', 'one'),
+    'energy_per_nucleon_gev': ('flux_cm2_s_sr_gev', 'A'),
+    'rigidity_gv': ('flux_cm2_s_sr_gv', 'Z'),
+}
+
+
+def _tabulated_data(spec):
+    """Arrays of a 'Tabulated' spec, per nucleus on its own energy grid, converted to energy per nucleus.
+
+    Spec: {"time_yr": t[n_time] (omit for a steady flux), "<nucleus>": {"energy_gev": E[n_energy],
+    "flux_cm2_s_sr_gev": F[n_time, n_energy]}, ...}; the energy may instead be "energy_per_nucleon_gev" (flux per GeV
+    per nucleon) or "rigidity_gv" with "flux_cm2_s_sr_gv". Flux rows are times, columns energies; a steady flux is
+    1D. The older form {"energy_gev": E, "flux": {...} or array, "composition": ..., "t_since_yr": ...}
+    (primary_spectrum_spec before) is accepted too.
+
+    Returns:
+        dict: 'time_yr' (array or None), 'nuclei' {CORSIKA id: (E per nucleus, flux rows per GeV per nucleus)},
+        'hash'.
+    """
+    import hashlib
+
+    spec = dict(spec)
+    if 'flux' in spec and 'energy_gev' in spec:                         # older single-grid form
+        spec = _legacy_tabulated(spec)
+    times = spec.pop('time_yr', None)
+    times = None if times is None else np.asarray(times, dtype=float)
+    if times is not None and (times.ndim != 1 or times.size < 1 or np.any(np.diff(times) <= 0) or times[0] <= 0):
+        raise ValueError("Tabulated: 'time_yr' must be 1D, positive and increasing.")
+    nuclei = {}
+    for name, entry in spec.items():
+        if name in ('kind', 'name'):
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"Tabulated: {name!r} should be a dict like {{'energy_gev': ..., 'flux_cm2_s_sr_gev': ...}}.")
+        axes = [k for k in _TABLE_AXES if k in entry]
+        if len(axes) != 1:
+            raise ValueError(f"Tabulated {name!r}: give exactly one of {list(_TABLE_AXES)}.")
+        flux_key, factor = _TABLE_AXES[axes[0]]
+        if flux_key not in entry:
+            raise ValueError(f"Tabulated {name!r}: with {axes[0]!r} the flux key is {flux_key!r}.")
+        cid = nucleus_id(name)
+        Z, A = charge_and_mass(cid)
+        c = {'one': 1.0, 'A': float(A), 'Z': float(Z)}[factor]
+        x = np.asarray(entry[axes[0]], dtype=float)
+        f = np.asarray(entry[flux_key], dtype=float)
+        if x.ndim != 1 or x.size < 2 or np.any(np.diff(x) <= 0) or x[0] <= 0:
+            raise ValueError(f"Tabulated {name!r}: {axes[0]} must be 1D, positive and increasing.")
+        expected = (x.size,) if times is None else (times.size, x.size)
+        if f.shape != expected:
+            raise ValueError(f"Tabulated {name!r}: flux has shape {f.shape}, expected {expected} "
+                             f"([n_time, n_energy]{'' if times is not None else ', steady: [n_energy]'}).")
+        if np.any(f < 0):
+            raise ValueError(f"Tabulated {name!r}: negative flux.")
+        nuclei[cid] = (x * c, np.atleast_2d(f) / c)
+    if not nuclei:
+        raise ValueError("Tabulated: no nucleus given.")
+    h = hashlib.sha1(b'' if times is None else times.tobytes())
+    for cid in sorted(nuclei):
+        h.update(str(cid).encode())
+        h.update(np.ascontiguousarray(nuclei[cid][0]).tobytes())
+        h.update(np.ascontiguousarray(nuclei[cid][1]).tobytes())
+    return {'time_yr': times, 'nuclei': nuclei, 'hash': h.hexdigest()[:10]}
+
+
+def _legacy_tabulated(spec):
+    energy = np.asarray(spec['energy_gev'], dtype=float)
+    flux = spec['flux']
+    if isinstance(flux, dict):
+        groups = flux
+    else:
+        comp = _normalised_composition(spec.get('composition') or {'H': 1.0})
+        groups = {g: np.asarray(flux, dtype=float) * frac for g, frac in comp.items()}
+    out = {'kind': 'Tabulated', 'name': spec.get('name', 'primary')}
+    if spec.get('t_since_yr') is not None:
+        out['time_yr'] = spec['t_since_yr']
+    merged = {}
+    for g, f in groups.items():
+        cid = nucleus_id(g)
+        merged[cid] = merged.get(cid, 0.0) + np.asarray(f, dtype=float)
+    for cid, f in merged.items():
+        out[cid] = {'energy_gev': energy, 'flux_cm2_s_sr_gev': f}
+    return out
+
+
+def primary_spectrum_spec(energy_gev, flux, composition=None, t_since_yr=None, name="primary"):
+    """A 'Tabulated' spec from one energy grid: flux an array (split with composition, at equal energy per
+    nucleus; default all protons) or a dict nucleus -> array; [n_time, n_energy] with t_since_yr for an event."""
+    return _legacy_tabulated({'energy_gev': energy_gev, 'flux': flux, 'composition': composition,
+                              't_since_yr': t_since_yr, 'name': name})
+
+
+class _TableSource(PrimarySource):
+    """A 'Tabulated' flux at one of its times (log-log in energy, 0 outside the table)."""
+
+    def __init__(self, data, t_yr=None):
+        row = 0 if t_yr is None or data['time_yr'] is None else int(np.argmin(np.abs(data['time_yr'] - t_yr)))
+        self._tables = {cid: (np.log(E), np.log(np.clip(F[row] * 1e4, 1e-300, None)))     # crflux units, per m^2
+                        for cid, (E, F) in data['nuclei'].items()}
+        self.nucleus_ids = sorted(self._tables)
+        self.name = 'Tabulated'
+
+    def fluxes(self, energies):
+        out = {}
+        for cid, E in energies.items():
+            E = np.atleast_1d(np.asarray(E, dtype=float))
+            log_e, log_f = self._tables[cid]
+            out[cid] = np.exp(np.interp(np.log(E), log_e, log_f, left=-np.inf, right=-np.inf))
+        return out
+
+
+# --- From a spec to a primary model -----------------------------------------------------------------------------------
+def _spec_hash(values):
+    """Short stable hash of a parameter dict (arrays by content), for template names."""
+    import hashlib
+    import json
+
+    def encode(v):
+        if isinstance(v, np.ndarray):
+            return hashlib.sha1(np.ascontiguousarray(v).tobytes()).hexdigest()
+        if isinstance(v, dict):
+            return {str(k): encode(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [encode(x) for x in v]
+        if callable(v):
+            return f"{getattr(v, '__module__', '')}.{getattr(v, '__qualname__', repr(v))}"
+        return v
+    return hashlib.sha1(json.dumps(encode(values), sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
+def _primary_source(params):
+    """(label, factory, times) of a spec without its site keys: factory(t) gives the PrimarySource at time t [yr]
+    (None for a steady flux), times the template times [yr] or None."""
+    params = dict(params)
+    kind = params.pop('kind', 'Baseline')
+
+    if kind == 'Baseline':
+        if 'flux' in params:
+            inner = dict(params.pop('flux'))
+            if params:
+                raise ValueError(f"Baseline: unexpected keys {sorted(params)} next to 'flux'.")
+            label, factory, times = _primary_source(inner)
+            if times is not None:
+                raise ValueError("Baseline: the 'flux' of a baseline must be steady (no time axis).")
+            return 'Baseline_' + label, factory, None
+        model = params.pop('model', 'H3a')
+        if params:
+            raise ValueError(f"Baseline: unknown keys {sorted(params)} (use 'model' or 'flux').")
+        cls_name, tag = _CRFLUX_BASELINES.get(model, model) if isinstance(model, str) else tuple(model)
+        label = 'Baseline' if model == 'H3a' else f"Baseline_{cls_name}_{tag}"
+
+        def factory(t):
+            import crflux.models as pm
+            return _CrfluxSource(getattr(pm, cls_name)(tag, geomagnetic_cutoff=None))
+        return label, factory, None
+
+    if kind == 'Tabulated':
+        data = _tabulated_data(params)
+        label = f"Tabulated_{params.get('name', 'primary')}_{data['hash']}"
+        return label, (lambda t: _TableSource(data, t)), data['time_yr']
+
+    if kind == 'Analytical':
+        function = params.pop('function')
+        steady = bool(params.pop('steady', False))
+        grid_default = None if steady else DEFAULT_TIME_GRID
+        label = getattr(function, '__name__', 'analytical')
+    elif kind in _FLUX_MODELS:
+        function = _FLUX_MODELS[kind]['function']
+        grid_default = _FLUX_MODELS[kind]['time_grid']
+        label = kind
+    else:
+        raise ValueError(f"Unknown template kind {kind!r}: use 'Baseline', 'Tabulated', 'Analytical' or a "
+                         f"registered model ({', '.join(repr(k) for k in _FLUX_MODELS)}).")
+    if 'tcut' in params:                                                   # former name of t_max_yr
+        params.setdefault('t_max_yr', params.pop('tcut'))
+    grid = {k: params.pop(k) for k in ('t_min_yr', 't_max_yr', 'n_times') if k in params}
+    physics = _check_parameters(function, params, label)
+    label = f"{label}_{_spec_hash({'function': function, **physics, **grid})}"
+    if grid_default is None and not grid:
+        return label, (lambda t: _FunctionSource(function, None, physics)), None
+    times = _time_grid({**(grid_default or DEFAULT_TIME_GRID), **grid})
+    return label, (lambda t: _FunctionSource(function, t, physics)), times
 
 
 MCEQ_SPECIES = {
@@ -909,7 +1127,7 @@ def _loglog(x_new, x, y):
     return np.power(10.0, f(np.log10(x_new)))
 
 
-def _postprocess_secondaries(e_grid, raw_fluxes, model_instance, geomagnetic_cutoff=None, h_obs_km=None):
+def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=None, h_obs_km=None):
     """
     Zenith-averaged MCEq fluxes -> template fluxes: the MCEq grid extended down to LOW_E_GRID['e_min_gev'], with the
     low-energy correction of every LOW_E_SPLICE species. Shared by both solvers (direct MCEq solve and response
@@ -930,7 +1148,8 @@ def _postprocess_secondaries(e_grid, raw_fluxes, model_instance, geomagnetic_cut
         e_grid (np.ndarray): MCEq energy grid [GeV].
         raw_fluxes (dict): species -> zenith-averaged MCEq flux on e_grid (`_zenith_averaged_secondaries` or
             `ResponseMatrix.apply`).
-        model_instance: The crflux primary model (for the 'primary' species).
+        total_flux (callable): E per nucleus [GeV] -> all-nucleus primary flux after the cutoff (the 'primary'
+            species).
         geomagnetic_cutoff (float, optional): Cutoff [GV] the primary model was built with. Defaults to None:
             no cutoff scaling (factor 1).
         h_obs_km (float, optional): Observation altitude [km] for the cutoff scaling. Defaults to None: sea level.
@@ -975,7 +1194,7 @@ def _postprocess_secondaries(e_grid, raw_fluxes, model_instance, geomagnetic_cut
             s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
             mceq_ext = np.exp(s * np.log(mceq_ext) + (1.0 - s) * np.log(np.clip(k * shape(e_ext), 1e-300, None)))
         fluxes[key] = np.clip(mceq_ext, 1e-44, None)
-    primary = _loglog(e_ext, e_grid, np.clip(model_instance.total_flux(e_grid), 1e-300, None))
+    primary = _loglog(e_ext, e_grid, np.clip(total_flux(e_grid), 1e-300, None))
     return e_ext, fluxes, primary
 
 
@@ -986,7 +1205,8 @@ def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, 
     `_postprocess_secondaries` (see there for the arguments and the return value).
     """
     raw = _zenith_averaged_secondaries(mceq_run, angles, weights)
-    return _postprocess_secondaries(mceq_run.e_grid, raw, model_instance, geomagnetic_cutoff=geomagnetic_cutoff,
+    return _postprocess_secondaries(mceq_run.e_grid, raw, model_instance.total_flux,
+                                    geomagnetic_cutoff=geomagnetic_cutoff,
                                     h_obs_km=h_obs_km)
 
 
@@ -1107,6 +1327,10 @@ class ResponseMatrix:
     def apply(self, model_instance):
         """Zenith-averaged MCEq fluxes (raw units, on e_grid) for a crflux primary model, as a matrix product."""
         _, p, n = model_instance.p_and_n_flux(self.e_in)
+        return self.apply_nucleons(p, n)
+
+    def apply_nucleons(self, p, n):
+        """Zenith-averaged MCEq fluxes (raw units, on e_grid) for proton and neutron fluxes on e_in (crflux units)."""
         p = np.broadcast_to(np.asarray(p, dtype=float), self.e_in.shape)
         n = np.broadcast_to(np.asarray(n, dtype=float), self.e_in.shape)
         return {key: R[:, 0, :] @ p + R[:, 1, :] @ n for key, R in self.response.items()}
@@ -1216,62 +1440,51 @@ class ResponseMatrix:
         return matrix
 
 
-def _build_template(name=None, model=None, params=None, t_since_kyr=None, interaction_model=DEFAULT_INTERACTION_MODEL,
+def _build_template(name, model_factory, t_since_kyr=None, interaction_model=DEFAULT_INTERACTION_MODEL,
                     h_obs_km=None, geomagnetic_cutoff=5.0, solver=None, template_dir=None):
     """
-    Builds a FluxTemplate: the primary model (class `model`, called as model(params, geomagnetic_cutoff=...), or
-    model((t, *params), ...) at each time t of t_since_kyr for a transient) -> MCEq secondaries, zenith-averaged
-    -> _postprocess_secondaries. model=None is the Hillas-Gaisser H3a baseline (steady).
+    Builds a FluxTemplate: the primary model model_factory(t) at each time of t_since_kyr (model_factory(None) once
+    for a steady flux) -> MCEq secondaries, zenith-averaged -> _postprocess_secondaries.
 
     Args:
+        name (str): Template name.
+        model_factory (callable): t [yr] or None -> PrimarySource (see _primary_source).
+        t_since_kyr (np.ndarray, optional): Template times since the event, in YEARS (the name is historical:
+            FluxHistory converts its kyr with *1e3). None for a steady template.
         solver (str, optional): 'response' (ResponseMatrix of this atmosphere, built once and cached in
             template_dir) or 'direct' (one MCEq solve per spectrum). Defaults to None: DEFAULT_SOLVER.
         template_dir (str, optional): Where the response matrix is cached. Defaults to None:
             config.flux_template_dir().
-
-    Note: the time axis of transient templates (`t_since_kyr`) is in years (the models take model[0] in years and
-    FluxHistory converts its kyr with *1e3); the name is historical.
     """
-    import crflux.models as pm
-
     solver = DEFAULT_SOLVER if solver is None else solver
     if solver not in ("response", "direct"):
         raise ValueError(f"Unknown solver {solver!r} (use 'response' or 'direct').")
 
-    if model is None:
-        model = pm.HillasGaisser2012
-        params = "H3a"
-        name = "Baseline"
-        t_since_kyr = None
-
-    if name is None:
-        name = f"{model[0].__name__}_{model[1]}"
-
-    if params is None:
-        params = ()
-
     if solver == "response":
         matrix = ResponseMatrix.get_or_build(interaction_model, h_obs_km, template_dir)
 
-        def solve(model_instance):
-            return _postprocess_secondaries(matrix.e_grid, matrix.apply(model_instance), model_instance,
+        def solve(source):
+            p, n = nucleon_spectra(source, matrix.e_in, geomagnetic_cutoff)
+            return _postprocess_secondaries(matrix.e_grid, matrix.apply_nucleons(p, n),
+                                            lambda E: total_nucleus_flux(source, E, geomagnetic_cutoff),
                                             geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
     else:
         mceq_run = _new_mceq_run(interaction_model)
         reference_h_obs_cm = (h_obs_km if h_obs_km is not None else 0.) * 1.0e5
 
-        def solve(model_instance):
+        def solve(source):
+            model_instance = _SourceAsCrflux(source, geomagnetic_cutoff)
             mceq_run.set_primary_model(model_instance)
             _set_h_obs(mceq_run, reference_h_obs_cm)
             return _corrected_secondaries(mceq_run, model_instance, DEFAULT_ANGLES_DEG,
                                           geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
 
     if t_since_kyr is None:
-        e_ext, fluxes, primary = solve(model(params, geomagnetic_cutoff=geomagnetic_cutoff))
+        e_ext, fluxes, primary = solve(model_factory(None))
     else:
         steps, primary = [], []
-        for age_kyr in t_since_kyr:
-            e_ext, fluxes_t, primary_t = solve(model((age_kyr, ) + tuple(params), geomagnetic_cutoff=geomagnetic_cutoff))
+        for t_yr in t_since_kyr:
+            e_ext, fluxes_t, primary_t = solve(model_factory(t_yr))
             steps.append(fluxes_t)
             primary.append(primary_t)
         fluxes = {key: np.array([f[key] for f in steps]) for key in MCEQ_SPECIES}
@@ -1283,4 +1496,5 @@ def _build_template(name=None, model=None, params=None, t_since_kyr=None, intera
             **{key: fluxes[key] for key in MCEQ_SPECIES},
         },
         t_since_kyr=t_since_kyr,
+        meta={"h_obs_km": h_obs_km, "geomagnetic_cutoff": geomagnetic_cutoff, "interaction_model": interaction_model},
     )
