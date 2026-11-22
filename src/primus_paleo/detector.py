@@ -176,12 +176,14 @@ except ImportError:                                   # optional: the numpy loop
 if _numba is not None:
     @_numba.njit(cache=True, parallel=True)
     def _window_source_numba(A, depth, primary_cell, cell, lo_idx, hi_idx, beyond, window_top, phi_cell, weight,
-                             delta, n_b, n_q, k0):
+                             delta, n_b, n_q, k0, active):
         """Compiled form of the (t, c) loop of _secondary_yield: same operations on each row, same order of
         summation within each bin (np.bincount adds the weights in row order from 0, then the sum is added to A).
-        The times are independent (each writes only A[t]) and run in parallel threads."""
+        The times are independent (each writes only A[t]) and run in parallel threads; only those with active[t]."""
         n_t, n_c = lo_idx.shape
         for t in _numba.prange(n_t):
+            if not active[t]:
+                continue
             buf = np.zeros((n_b, n_q))
             for c in range(n_c):
                 lo, hi = lo_idx[t, c], hi_idx[t, c]
@@ -1620,6 +1622,41 @@ class Paleodetector:
         return C.reshape(n_s, n_offsets, n_q) * rows['weight']
 
 
+    @staticmethod
+    def _window_source_shared(A, times, rows, lo_idx, hi_idx, beyond, window_top, phi_cell, delta, n_b, n_q,
+                              product_slice):
+        """Source term of _secondary_yield for several times at the same overburden, added to A.
+
+        Same window, binning and rows as the per-time loop (see there), but the rows are counted once per direction,
+        by primary energy cell i, window bin b and product cell k (N[i, b, k]); each time t then gets
+        weight * sum_i phi_cell[t, i] N[i, b, k], a matrix product. Equal to the per-time sums up to the order of
+        the floating-point additions.
+
+        Args:
+            A (np.ndarray): Source array (T, N_C, n_b, K), updated in place.
+            times (np.ndarray): Indices of the times sharing this overburden.
+            rows (dict): Output of _load_stdrock_rows.
+            lo_idx, hi_idx, beyond, window_top (np.ndarray): Their rows for these times, shape (N_C,).
+            phi_cell (np.ndarray): Primary intensity per energy cell, (T, n_primary_cells).
+            delta (float): Window bin width [m.w.e.].
+            n_b, n_q (int): Window bins and product cells.
+            product_slice (slice): Columns of this product on the last axis of A.
+        """
+        depth, prim, cell = rows['depth_mwe'], rows['primary_cell'], rows['cell']
+        n_prim = len(rows['primary_bins']) - 1
+        phi = phi_cell[times]                                             # (len(times), n_prim)
+        for c in range(len(lo_idx)):
+            if beyond[c] or hi_idx[c] <= lo_idx[c]:
+                continue
+            sl = slice(lo_idx[c], hi_idx[c])
+            b = np.minimum(((depth[sl] - window_top[c]) / delta).astype(int), n_b - 1)
+            counts = np.bincount(prim[sl] * (n_b * n_q) + b * n_q + cell[sl],
+                                 minlength=n_prim * n_b * n_q).reshape(n_prim, n_b * n_q)
+            used = np.nonzero(counts.any(axis=1))[0]
+            A[times, c, :, product_slice] += (rows['weight'] * (phi[:, used] @ counts[used])).reshape(
+                len(times), n_b, n_q)
+
+
     def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
                          total_simulated_particles=1e4, species_list=SECONDARY_SOURCES, n_energy_sub=50):
         """Secondary neutrons and protons born in a window above the sample, per direction, as one cascade.
@@ -1682,6 +1719,8 @@ class Paleodetector:
         window_top = slant - window
 
         A = np.zeros((n_t, n_c, n_b, n_k))
+        _, depth_group = np.unique(np.asarray(depth_mwe_array, dtype=float), return_inverse=True)
+        same_depth = [np.nonzero(depth_group == g)[0] for g in range(depth_group.max() + 1)]
         for species in species_list:
             if self._stdrock_dir(species) is None:
                 if self.verbose > 1:
@@ -1713,12 +1752,24 @@ class Paleodetector:
                 depth = rows['depth_mwe']
                 lo_idx = np.searchsorted(depth, window_top, side='left')
                 hi_idx = np.searchsorted(depth, slant, side='left')
+                # times at the same overburden have the same window and binning: the rows are binned once per depth,
+                # by primary energy cell, and each time weights the counts with its own flux (_window_source_shared)
+                single = np.zeros(n_t, dtype=bool)
+                for times in same_depth:
+                    if times.size == 1:
+                        single[times] = True
+                    else:
+                        self._window_source_shared(A, times, rows, lo_idx[times[0]], hi_idx[times[0]],
+                                                   beyond[times[0]], window_top[times[0]], phi_cell, delta, n_b,
+                                                   n_q, offsets[q])
+                if not single.any():
+                    continue
                 if _numba is not None:
                     _window_source_numba(A, depth, rows['primary_cell'], rows['cell'], lo_idx, hi_idx, beyond,
                                          window_top, phi_cell, float(rows['weight']), float(delta), n_b, n_q,
-                                         offsets[q].start)
+                                         offsets[q].start, single)
                     continue
-                for t in range(n_t):
+                for t in np.nonzero(single)[0]:
                     for c in range(n_c):
                         if beyond[t, c] or hi_idx[t, c] <= lo_idx[t, c]:
                             continue
