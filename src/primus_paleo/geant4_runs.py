@@ -424,10 +424,14 @@ def run_geant4_simulation(mineral_name, particle_type, n_events, energies_gev, i
                                     capture_output=True, text=True)
             log.write(result.stdout)
             log.write(result.stderr)
-            if result.returncode != 0:
-                raise RuntimeError(f"Geant4 failed (exit code {result.returncode}) for {mineral_name}/{folder}; "
-                                   f"full log in {log_path}.\n{result.stderr[-3000:]}")
-
+            n_requested = g1 - g0                                     # runs in this batch
+            n_finished = result.stdout.count("Run terminated.")       # one per completed run
+            if result.returncode != 0 and n_finished < n_requested:
+                raise RuntimeError(f"Geant4 failed (exit code {result.returncode}) for {mineral_name}/{folder} after "
+                                f"{n_finished}/{n_requested} runs; full log in {log_path}.\n{result.stderr[-3000:]}")
+            if result.returncode != 0 and verbose:
+                print(f"Warning: Geant4 exited with code {result.returncode} after completing all {n_requested} runs "
+                    f"of {mineral_name}/{folder} (crash at shutdown); keeping the outputs. Log: {log_path}")
             missing = []
             for i, energy in enumerate(energies_gev[g0:g1]):
                 src = os.path.join(paths['output'], f"outNuclei_{i}.txt")
