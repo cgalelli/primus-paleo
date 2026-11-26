@@ -22,55 +22,52 @@ few GeV, where MCEq is not meant for nucleons, the nucleon fluxes are continued 
 (LOW_E_SPLICE, scaled with the cutoff by CUTOFF_SCALING) and the neutrinos by a log-normal (NEUTRINO_LOW_E).
 
 Units. A template stores, per species of MCEQ_SPECIES, the zenith-integrated flux crossing a horizontal plane
-[cm^-2 s^-1 GeV^-1] (the zenith quadrature _hemisphere_gauss_legendre has weights summing to pi), and, as 'primary',
+[cm^-2 s^-1 GeV^-1] (the zenith quadrature _hemisphere_quadrature has weights summing to pi), and, as 'primary',
 the all-nucleus primary flux at the top of the atmosphere after the cutoff [cm^-2 s^-1 sr^-1 GeV^-1].
 
 Caching. Templates are kept in memory for the session; templates of the 'direct' solver (or all of them, with
 SAVE_RESPONSE_TEMPLATES) are also saved to <template_dir>/<name>.npz (default config.flux_template_dir()).
 """
 import functools
+import hashlib
 import inspect
+import json
 import os
 import re
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator, interp1d
+from scipy.interpolate import RegularGridInterpolator
 from scipy.special import erfc, roots_jacobi
 
 from . import config
-from ._core import SECONDS_PER_YEAR
+from ._core import SECONDS_PER_YEAR, fragment_za, log_interp1d
 
 __all__ = ['FluxHistory', 'FluxTemplate', 'MCEQ_SPECIES', 'list_flux_models', 'register_flux_model']
 
-def _hemisphere_gauss_legendre(n_angles):
-    """
-    Zenith angles (degrees) and weights for the Lambertian (cosine-
-    projected) hemisphere flux integral,
+def _hemisphere_quadrature(n_angles):
+    """Zenith angles and weights for the flux crossing a horizontal plane, from a zenith-dependent intensity.
 
-        Phi_horiz = integral of I(theta) * cos(theta) dOmega
-                  = 2*pi * integral_0^1 I(mu) * mu dmu,   mu = cos(theta)
+        Phi_horizontal = integral I(theta) cos(theta) dOmega = 2 pi integral_0^1 I(mu) mu dmu,   mu = cos(theta)
 
-    Uses Gauss-Jacobi quadrature (weight function mu on [0,1]) so the
-    extra factor of mu is absorbed into the quadrature itself, keeping
-    the same machine-precision exactness (up to degree 2*n_angles-1)
-    the previous Gauss-Legendre scheme had. Verified against
-    int_0^1 mu**k * mu dmu for k up to 21, and against the isotropic
-    check (Phi_horiz = pi for constant I=1).
+    Gauss-Jacobi quadrature with weight function mu on [0, 1], so the factor mu is part of the rule (exact for
+    polynomials in mu up to degree 2 n_angles - 1; a constant I = 1 gives pi). Summing MCEq's solutions
+    [cm^-2 s^-1 sr^-1 GeV^-1] with these weights gives the flux crossing a horizontal plane [cm^-2 s^-1 GeV^-1].
+    Used for DEFAULT_ANGLES_DEG / DEFAULT_ANGLE_WEIGHTS (_zenith_averaged_secondaries).
+
+    Args:
+        n_angles (int): Number of zenith angles.
 
     Returns:
-      (theta_deg, weights): weights sum to pi (not 1). Summing MCEq's
-      raw solution (cm^-2 s^-1 sr^-1 GeV^-1) against these weights
-      therefore gives the flux crossing a horizontal target directly,
-      in cm^-2 s^-1 GeV^-1 -- no further sr^-1 or area rescale needed.
+        tuple[np.ndarray, np.ndarray]: Zenith angles [deg] and weights (summing to pi).
     """
     x, w_jacobi = roots_jacobi(n_angles, alpha=0, beta=1)
     mu = 0.5 * (x + 1.0)
     weights = 0.5 * np.pi * w_jacobi
     theta_deg = np.rad2deg(np.arccos(mu))
     return theta_deg, weights
- 
- 
-DEFAULT_ANGLES_DEG, DEFAULT_ANGLE_WEIGHTS = _hemisphere_gauss_legendre(11)
+
+
+DEFAULT_ANGLES_DEG, DEFAULT_ANGLE_WEIGHTS = _hemisphere_quadrature(11)
 
 DEFAULT_INTERACTION_MODEL = "EPOS-LHC-R"
 
@@ -107,13 +104,12 @@ class FluxTemplate:
             self._interp[species] = self._build_interpolator(grid)
 
     def _build_interpolator(self, grid):
+        """Interpolator of one species: linear in log-log energy (steady: _core.log_interp1d, extrapolating) or in
+        (time, log energy) with log flux (transient: constant beyond the time axis, extrapolated in energy)."""
+        if self.is_steady:
+            return log_interp1d(self.energy_gev, grid)
         log_e = np.log10(self.energy_gev)
         log_flux = np.log10(np.clip(grid, 1e-300, None))
-        if self.is_steady:
-            return interp1d(
-                log_e, log_flux, kind='linear',
-                bounds_error=False, fill_value='extrapolate',
-            )
         return RegularGridInterpolator(
             (self.t_since_yr, log_e), log_flux,
             method='linear', bounds_error=False, fill_value=None,
@@ -137,9 +133,9 @@ class FluxTemplate:
         if species not in self._interp:
             return np.zeros_like(energy_gev)
 
-        log_e = np.log10(energy_gev)
         if self.is_steady:
-            return np.power(10.0, self._interp[species](log_e))
+            return self._interp[species](energy_gev)
+        log_e = np.log10(energy_gev)
 
         if t_since_yr is None:
             raise ValueError(f"Template '{self.name}' is transient: t_since_yr is required.")
@@ -341,7 +337,6 @@ class FluxHistory:
             "template": resolved, "spec": template, "start_time_kyr": float(start_time_kyr),
             "weight": weight, "label": label, "_cutoff_variants": {},
         })
-        self._name = None 
         return resolved
 
     def add_excursion(self, start_time_kyr, end_time_kyr, geomagnetic_cutoff, label=None):
@@ -515,29 +510,19 @@ SPEED_OF_LIGHT_CM_S = 2.998e10
 MASS_GROUP_IDS = {'H': 14, 'p': 14, 'proton': 14, 'He': 402, 'CNO': 1206, 'MgAlSi': 2814, 'Fe': 5626}
 DEFAULT_TIME_GRID = {'t_min_yr': 10.0, 't_max_yr': 1e6, 'n_times': 200}
 _CRFLUX_BASELINES = {'H3a': ('HillasGaisser2012', 'H3a'), 'H4a': ('HillasGaisser2012', 'H4a')}
-_NUCLEUS_RE = re.compile(r"^([A-Z][a-z]?)(\d+)$")
 
 
 @functools.lru_cache(maxsize=None)
 def nucleus_id(name):
     """CORSIKA id (100 A + Z, protons 14) of a mass group ('H', 'He', 'CNO', 'MgAlSi', 'Fe' = Fe56), a nucleus
-    ('O16', 'Fe56') or an id (crflux's old Fe id 5426 is read as 5626)."""
+    ('O16', 'Fe56', 'alpha'; parsed by _core.fragment_za) or an id (crflux's old Fe id 5426 is read as 5626)."""
     if isinstance(name, (int, np.integer)):
         return _CRFLUX_LEGACY_IDS.get(int(name), int(name))
     if name in MASS_GROUP_IDS:
         return MASS_GROUP_IDS[name]
-    m = _NUCLEUS_RE.match(str(name))
-    if m:
-        try:
-            from ._core import atomic_number
-            z = atomic_number(m.group(1))
-        except ImportError:
-            z = None
-        if z is None:
-            from mendeleev import element
-            z = element(m.group(1)).atomic_number
-        a = int(m.group(2))
-        return 14 if (z, a) == (1, 1) else 100 * a + z
+    za = fragment_za(str(name))
+    if za is not None:
+        return 14 if za == (1, 1) else 100 * za[1] + za[0]
     raise ValueError(f"unknown nucleus {name!r}: use {sorted(MASS_GROUP_IDS)}, a nucleus like 'Fe56' or a CORSIKA id.")
 
 
@@ -800,8 +785,6 @@ def _tabulated_data(spec):
         dict: 'time_yr' (array or None), 'nuclei' {CORSIKA id: (E per nucleus, flux rows per GeV per nucleus)},
         'hash'.
     """
-    import hashlib
-
     spec = dict(spec)
     if 'flux' in spec and 'energy_gev' in spec:                         # older single-grid form
         spec = _legacy_tabulated(spec)
@@ -837,12 +820,8 @@ def _tabulated_data(spec):
         nuclei[cid] = (x * c, np.atleast_2d(f) / c)
     if not nuclei:
         raise ValueError("Tabulated: no nucleus given.")
-    h = hashlib.sha1(b'' if times is None else times.tobytes())
-    for cid in sorted(nuclei):
-        h.update(str(cid).encode())
-        h.update(np.ascontiguousarray(nuclei[cid][0]).tobytes())
-        h.update(np.ascontiguousarray(nuclei[cid][1]).tobytes())
-    return {'time_yr': times, 'nuclei': nuclei, 'hash': h.hexdigest()[:10]}
+    digest = _spec_hash({'time_yr': times, 'nuclei': {str(cid): list(nuclei[cid]) for cid in sorted(nuclei)}})
+    return {'time_yr': times, 'nuclei': nuclei, 'hash': digest}
 
 
 def _legacy_tabulated(spec):
@@ -893,13 +872,13 @@ class _TableSource(PrimarySource):
 
 # --- From a spec to a primary model -----------------------------------------------------------------------------------
 def _spec_hash(values):
-    """Short stable hash of a parameter dict (arrays by content), for template names."""
-    import hashlib
-    import json
+    """Short stable hash of a parameter dict, for template names: arrays by shape and content, functions by
+    module and qualified name. Used by _primary_source (analytical specs) and _tabulated_data (tables)."""
 
     def encode(v):
         if isinstance(v, np.ndarray):
-            return hashlib.sha1(np.ascontiguousarray(v).tobytes()).hexdigest()
+            v = np.ascontiguousarray(v, dtype=float)
+            return f"{v.shape}:" + hashlib.sha1(v.tobytes()).hexdigest()
         if isinstance(v, dict):
             return {str(k): encode(x) for k, x in v.items()}
         if isinstance(v, (list, tuple)):
@@ -981,7 +960,7 @@ def _zenith_averaged_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG,
     """
     Zenith-averaged flux of every MCEQ_SPECIES entry, in MCEq's raw units, at `mceq_run`'s *current*
     configuration (interaction model, primary model/params, density model), using one `solve_fullsky` batch
-    call and the solid-angle quadrature `weights` (see `_hemisphere_gauss_legendre`).
+    call and the solid-angle quadrature `weights` (see `_hemisphere_quadrature`).
 
     Returns:
         dict: species -> flux on mceq_run.e_grid (un-rescaled, un-clipped).
@@ -1167,13 +1146,6 @@ def cutoff_scaling_factor(geomagnetic_cutoff, h_obs_km=None, reference_cutoff=No
     return nucleon_flux_scaling(geomagnetic_cutoff, x) / nucleon_flux_scaling(reference_cutoff, x)
 
 
-def _loglog(x_new, x, y):
-    """Log-log linear interpolation, extrapolating linearly: what FluxTemplate does outside its grid."""
-    f = interp1d(np.log10(x), np.log10(np.clip(y, 1e-300, None)), kind='linear',
-                 bounds_error=False, fill_value='extrapolate')
-    return np.power(10.0, f(np.log10(x_new)))
-
-
 def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=None, h_obs_km=None):
     """
     Zenith-averaged MCEq fluxes -> template fluxes: the MCEq grid extended down to LOW_E_GRID['e_min_gev'], with the
@@ -1215,7 +1187,7 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
     fluxes = {}
     for key, flux in raw_fluxes.items():
         flux = np.clip(flux, 1e-300, None)                           # a decayed transient may be exactly 0
-        mceq_ext = _loglog(e_ext, e_grid, flux)
+        mceq_ext = log_interp1d(e_grid, flux)(e_ext)
         if key in NEUTRINO_LOW_E['species']:
             c = NEUTRINO_LOW_E
             em, ep = c['e_match_gev'], c['e_peak_gev']
@@ -1225,7 +1197,7 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
                                  "change NEUTRINO_LOW_E e_match_gev or fit_dex.")
             slope = np.polyfit(np.log(e_grid[win]), np.log(flux[win]), 1)[0]
             a = max(-slope, 0.0) / (2.0 * np.log(em / ep))           # same local slope at E_m
-            low = _loglog(em, e_grid, flux) * np.exp(-a * (np.log(e_ext / ep) ** 2 - np.log(em / ep) ** 2))
+            low = log_interp1d(e_grid, flux)(em) * np.exp(-a * (np.log(e_ext / ep) ** 2 - np.log(em / ep) ** 2))
             mceq_ext = np.where(e_ext < em, low, mceq_ext)
         if key in LOW_E_SPLICE:
             c = LOW_E_SPLICE[key]
@@ -1241,7 +1213,7 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
             s = 0.5 * (1.0 + np.tanh(np.log10(e_ext / c['e_match_gev']) / c['blend_dex']))
             mceq_ext = np.exp(s * np.log(mceq_ext) + (1.0 - s) * np.log(np.clip(k * shape(e_ext), 1e-300, None)))
         fluxes[key] = np.clip(mceq_ext, 1e-44, None)
-    primary = _loglog(e_ext, e_grid, np.clip(total_flux(e_grid), 1e-300, None))
+    primary = log_interp1d(e_grid, np.clip(total_flux(e_grid), 1e-300, None))(e_ext)
     return e_ext, fluxes, primary
 
 

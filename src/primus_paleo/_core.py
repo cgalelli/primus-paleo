@@ -561,9 +561,10 @@ def _rebin_density(density, grid_edges, out_edges):
 def log_interp1d(xx, yy, kind='linear'):
     """Builds an interpolator that is linear in log-log space.
 
-    Purpose: utility for quantities close to power laws (spectra, stopping powers, flux shapes) given at a few
-    points, e.g. in notebooks; interpolating log(y) against log(x) keeps the power-law shape between points and
-    extrapolates it beyond them. Not used by the Paleodetector class itself.
+    Purpose: quantities close to power laws (spectra, stopping powers, flux shapes) given at a few points;
+    interpolating log(y) against log(x) keeps the power-law shape between points and extrapolates it beyond them.
+    Used by flux (steady templates, the low-energy extension of the template grid) and in notebooks. y is floored at
+    1e-300, so a zero flux gives a vanishing value instead of a NaN.
 
     Args:
         xx (np.ndarray): x-coordinates of the data points (> 0).
@@ -571,10 +572,19 @@ def log_interp1d(xx, yy, kind='linear'):
         kind (str, optional): Interpolation kind passed to scipy's interp1d. Defaults to 'linear'.
 
     Returns:
-        callable: f(x) = 10**interp(log10(x)), extrapolating beyond the data.
+        _LogLogInterpolator: f(x) = 10**interp(log10(x)), extrapolating beyond the data (picklable, so detectors
+        holding flux templates can be sent to worker processes).
     """
-    logx = np.log10(xx)
-    logy = np.log10(yy)
-    lin_interp = interp1d(logx, logy, kind=kind, fill_value='extrapolate')
-    log_interp = lambda zz: np.power(10.0, lin_interp(np.log10(zz)))
-    return log_interp
+    return _LogLogInterpolator(xx, yy, kind)
+
+
+class _LogLogInterpolator:
+    """The callable of log_interp1d: 10**interp1d(log10 x, log10 y)(log10 z). A class rather than a closure so that
+    it can be pickled."""
+
+    def __init__(self, xx, yy, kind='linear'):
+        self._lin = interp1d(np.log10(xx), np.log10(np.clip(yy, 1e-300, None)), kind=kind, bounds_error=False,
+                             fill_value='extrapolate')
+
+    def __call__(self, zz):
+        return np.power(10.0, self._lin(np.log10(zz)))
