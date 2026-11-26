@@ -26,6 +26,7 @@ from ._core import (
     U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, fragment_za, predict_track_groups, track_group,
     WATT_B_PER_MEV, _ENERGY_EDGE_RTOL, OBSERVABLE_TRACKS, OBSERVABLE_RECOIL_ENERGY, OBSERVABLES,
     RADIOGENIC_SOURCES, FISSION_KEYS, ENERGY_CELL_NODES, COS_ZENITH_NODES, _depth_cdf_rows,
+    GEANT4_DEFAULT_TARGET_LENGTH_M, GEANT4_HARDCODED_DENSITIES_G_CM3,
     _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
     _rebin_density, _resolve_x_bins, _restrict_edges,
     is_light_ion, normalize_fragment_names,
@@ -1091,7 +1092,8 @@ class Paleodetector:
     def _geant4_geometry(self, data_dir):
         """Geometry of a Geant4 output directory.
 
-        Read from <data_dir>/geometry.json, written by the steering notebook.
+        Read from <data_dir>/geometry.json, written by geant4_runs.run_geant4_simulation; without it, the defaults of
+        _core (a StdRock target of GEANT4_DEFAULT_TARGET_LENGTH_M shot from its top face).
 
         Args:
             data_dir (str): Geant4 output directory.
@@ -1105,9 +1107,9 @@ class Paleodetector:
             return self._geometry_cache[data_dir]
 
         geo = {
-            "depth_reference_z_m": 100.,
-            "target_length_m": 2.0 * 100.,
-            "density_g_cm3": 2.65,
+            "depth_reference_z_m": GEANT4_DEFAULT_TARGET_LENGTH_M / 2.0,
+            "target_length_m": GEANT4_DEFAULT_TARGET_LENGTH_M,
+            "density_g_cm3": GEANT4_HARDCODED_DENSITIES_G_CM3["StdRock"],
             "neutrino_bias": None,
         }
         meta_path = os.path.join(data_dir, "geometry.json")

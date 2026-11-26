@@ -32,7 +32,8 @@ __all__ = [
     'log_interp1d', 'ELEMENT_SYMBOLS', 'TRACK_GROUPS', 'TRACK_GROUPS_KEY', 'MAJOR_ELEMENT_MASS_FRACTION', 'atomic_number',
     'fragment_za', 'predict_track_groups', 'track_group',
     'OBSERVABLE_TRACKS', 'OBSERVABLE_RECOIL_ENERGY', 'OBSERVABLES', 'RADIOGENIC_SOURCES', 'FISSION_KEYS',
-    'ENERGY_CELL_NODES', 'COS_ZENITH_NODES',
+    'ENERGY_CELL_NODES', 'COS_ZENITH_NODES', 'GEANT4_HARDCODED_DENSITIES_G_CM3', 'GEANT4_DEFAULT_TARGET_LENGTH_M',
+    'GEANT4_TARGET_LENGTH_M', 'GEANT4_TARGET_RADIUS_M',
 ]
 
 # --- Physical Constants ---
@@ -381,6 +382,15 @@ def _resolve_x_bins(x_bins):
         np.ndarray: Bin edges [nm].
     """
     return DEFAULT_INTEGRATION_X_BINS_NM if x_bins is None else np.asarray(x_bins, dtype=float)
+
+
+# --- Geometry of the Geant4 targets ---
+# Defaults of geant4_runs.run_geant4_simulation, and what Paleodetector assumes for a run folder without
+# geometry.json: a cylinder of GEANT4_DEFAULT_TARGET_LENGTH_M, shot from its top face (z = length / 2), of StdRock.
+GEANT4_HARDCODED_DENSITIES_G_CM3 = {"StdRock": 2.65, "H2O": 1.0}     # materials defined in DetectorConstruction
+GEANT4_DEFAULT_TARGET_LENGTH_M = 200.
+GEANT4_TARGET_LENGTH_M = {"StdRock": 1000.}       # longer StdRock targets calibrate the deep penetration
+GEANT4_TARGET_RADIUS_M = 10.
 
 
 # --- Depth-probability tables from the StdRock Geant4 runs ---
