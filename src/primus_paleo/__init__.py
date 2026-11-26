@@ -15,8 +15,8 @@ Modules:
     detector        the Paleodetector class
     flux            cosmic-ray flux templates and histories (FluxHistory)
     geant4_runs     running the Geant4 application (materials, runs, stopping-power tables)
-    observables     etch pits, sliced/etched spectra, diagnostic profiles and plots
-    plotting        spectra split by track group (plot_track_groups)
+    observables     what is measured: etch pits, etched spectra, microscope resolution, rebinning
+    plotting        spectra split by track group, diagnostics of a detector (depth profiles, secondary production)
     _core           constants, binnings, species tables, track groups, depth-table maths (internal)
 
 Every public name of these modules is available here. Other names (private helpers, the live value of

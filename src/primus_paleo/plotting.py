@@ -1,4 +1,10 @@
-"""Plots of track-length (or recoil-energy) spectra split by track group (heavy, medium_heavy, medium_light, light).
+"""Plots: track-length (or recoil-energy) spectra split by track group, and diagnostics of a Paleodetector.
+
+Spectra split by track group (heavy, medium_heavy, medium_light, light): plot_track_groups.
+Diagnostics of the inputs of a detector: interaction_profiles (interaction depth profiles of its StdRock depth
+tables) and plot_secondary_production (where and by whom the atmospheric secondaries are made).
+
+plot_track_groups:
 
 Each curve (a scenario, a species, a sample...) gets one colour family; its track groups are shades of that family,
 darkest for the heaviest group. Three layouts, chosen by `style`:
@@ -26,9 +32,11 @@ observable='recoil_energy' here, which sets the axis labels and a logarithmic en
 
 import numpy as np
 
-from ._core import TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS, TRACK_GROUPS
+from ._core import (MUON_SPECIES, SECONDARY_SOURCES, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS, TRACK_GROUPS,
+                    _depth_cdf_rows)
 
-__all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS']
+__all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS',
+           'interaction_profiles', 'plot_secondary_production']
 
 GROUP_LABELS = {
     'heavy': 'heavy',
@@ -236,3 +244,144 @@ def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=T
         axes.flat[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     return fig, axes
+
+
+# --- Diagnostics of a Paleodetector ----------------------------------------------------------------------------------
+G_CM2_PER_MWE = 100.     # rock column of 1 m.w.e. [g/cm^2]
+
+
+def interaction_profiles(detector, energies_gev, z_edges_mwe, species=('neutron', 'proton', 'mu-'), capture=True):
+    """Interaction depth profiles from the StdRock depth tables, as used by the integrations (a diagnostic: returns
+    the profiles, to be plotted against z_edges_mwe).
+
+    The same distributions as Paleodetector._slab_interaction_probabilities, on depth bins instead of the sample
+    slab (both from _depth_cdf_rows on the tables of Paleodetector._depth_table):
+
+    * Hadrons: dP/dz of the interaction depth, F(z_hi) - F(z_lo) per bin (exponential tail included).
+    * Muons: the in-flight interactions, (G(z_hi) - G(z_lo)) / E[R] per bin, i.e. an interaction density
+      proportional to the survival probability P(R > z); with capture=True, plus the stops, F(z_hi) - F(z_lo) (the
+      mu- capture peak; for mu+ the stop is a decay, and the detector does not count it). mu+ uses the mu- table.
+
+    Args:
+        detector (Paleodetector): Any detector (the tables come from the StdRock runs, not from its mineral).
+        energies_gev (array_like): Primary energies [GeV].
+        z_edges_mwe (np.ndarray): Depth bin edges along the path [m.w.e.].
+        species (tuple[str], optional): Any of 'neutron', 'proton', 'mu-', 'mu+' (with a depth table). Defaults
+            to ('neutron', 'proton', 'mu-').
+        capture (bool, optional): Add the muon stops to the in-flight interactions. Defaults to True.
+
+    Returns:
+        dict: species -> dP/dz [1/m.w.e.], shape (n_depth_bins, n_energies).
+    """
+    E = np.atleast_1d(np.asarray(energies_gev, float))
+    z_edges_mwe = np.asarray(z_edges_mwe, float)
+    z_lo = np.broadcast_to(z_edges_mwe[:-1, None], (len(z_edges_mwe) - 1, E.size))
+    z_hi = np.broadcast_to(z_edges_mwe[1:, None], z_lo.shape)
+    dz = np.diff(z_edges_mwe)[:, None]
+    out = {}
+    for s in species:
+        q_rows, tails = detector._depth_rows(s, E)
+        p = detector._depth_table(s)['p']
+        F_lo, G_lo = _depth_cdf_rows(z_lo, q_rows, p, tails)
+        F_hi, G_hi = _depth_cdf_rows(z_hi, q_rows, p, tails)
+        if s in MUON_SPECIES:
+            mean_range = _depth_cdf_rows(np.full(E.size, np.inf), q_rows, p)[1]
+            prob = (G_hi - G_lo) / mean_range + ((F_hi - F_lo) if capture else 0.0)
+        else:
+            prob = F_hi - F_lo
+        out[s] = prob / dz
+    return out
+
+def plot_secondary_production(detector, sources=None, products=('neutron', 'proton'),
+                              total_simulated_particles=1e4, product_bins_gev=None, z_edges_mwe=None,
+                              example_species='mu-', example_energy_gev=None, t_kyr=None):
+    """Overview of the secondary neutrons and protons produced in the StdRock runs, in three panels.
+
+    Purpose: a diagnostic of the input of the atmospheric secondary cascade (Paleodetector._secondary_cascade),
+    straight from the StdRock rows (_load_stdrock_rows), to see which primaries make the secondaries, where and with
+    what energy.
+        (a) Yield: secondaries per primary vs primary energy, one line per source and product.
+        (b) Where and with what energy: production depth vs secondary energy (neutrons + protons) for one run.
+        (c) Who makes them at each depth: production rate per gram of rock vs depth, each run weighted by the flux
+            integrated over its energy cell (flux history at t_kyr; _flux_cell_integral, per cm^2 per s), divided by
+            the rock column of each depth bin (1 m.w.e. = 100 g/cm^2) to give a rate per gram. Every primary is
+            taken as vertical, so the panel shows shapes and crossover depths; the integrations also spread the
+            primaries over zenith angle.
+    Yields only count products made inside the StdRock target (a lower limit for muons leaving it).
+
+    Args:
+        detector (Paleodetector): Any detector (the StdRock runs are shared; its flux history weights panel (c)).
+        sources (list[str], optional): Primary species. Defaults to None (SECONDARY_SOURCES with StdRock runs;
+            mu+ falls back on the mu- runs without captures, see _stdrock_dir).
+        products (tuple[str], optional): Secondaries shown. Defaults to ('neutron', 'proton').
+        total_simulated_particles (float, optional): Primaries per StdRock run. Defaults to 1e4.
+        product_bins_gev (np.ndarray, optional): Secondary energy bins [GeV]. Defaults to 40 log bins, 1 MeV-10 GeV.
+        z_edges_mwe (np.ndarray, optional): Depth bins [m.w.e.]. Defaults to 120 log bins from 0.01 m.w.e. to the
+            longest StdRock target.
+        example_species (str, optional): Source shown in panel (b). Defaults to 'mu-'.
+        example_energy_gev (float, optional): Primary energy of panel (b); the run whose cell contains it is used.
+            Defaults to None (the highest-energy run).
+        t_kyr (float, optional): Local time of the flux used in panel (c) [kyr]. Defaults to None (present).
+
+    Returns:
+        tuple: (figure, array of the three axes).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    sources = [src for src in (SECONDARY_SOURCES if sources is None else sources) if detector._stdrock_dir(src)]
+    if not sources:
+        raise ValueError("No StdRock runs for any of the requested sources.")
+    product_bins_gev = np.logspace(-3, 1, 41) if product_bins_gev is None else np.asarray(product_bins_gev, float)
+    rows = {(src, q): detector._load_stdrock_rows(src, q, product_bins_gev, total_simulated_particles)
+            for src in sources for q in products}
+    if z_edges_mwe is None:
+        z_max = max(r['target_mwe'] for r in rows.values())
+        z_edges_mwe = np.logspace(-2, np.log10(z_max), 120)
+    z_edges_mwe = np.asarray(z_edges_mwe, float)
+    z_mid = np.sqrt(np.maximum(z_edges_mwe[1:] * z_edges_mwe[:-1], 1e-300))
+    styles = ('-', '--', ':', '-.')
+
+    fig, ax = plt.subplots(1, 3, figsize=[17, 4.6])
+
+    for k, src in enumerate(sources):
+        for q, ls in zip(products, styles):
+            r = rows[(src, q)]
+            e0 = r['primary_bins'][:-1]
+            y = np.bincount(r['primary_cell'], minlength=e0.size) * r['weight']
+            ax[0].loglog(e0, np.where(y > 0, y, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
+    ax[0].set(xlabel="Primary energy (GeV)", ylabel="Secondaries per primary", title="(a) Yield")
+    ax[0].legend(fontsize='x-small', ncol=2)
+
+    if example_species not in sources:
+        example_species = sources[0]
+    pb = rows[(example_species, products[0])]['primary_bins']
+    i0 = (len(pb) - 2 if example_energy_gev is None
+            else int(np.clip(np.searchsorted(pb, example_energy_gev, side='right') - 1, 0, len(pb) - 2)))
+    H = np.zeros((len(z_edges_mwe) - 1, len(product_bins_gev) - 1))
+    for q in products:
+        r = rows[(example_species, q)]
+        sel = r['primary_cell'] == i0
+        H += np.histogram2d(r['depth_mwe'][sel], product_bins_gev[r['cell'][sel]],
+                            bins=[z_edges_mwe, product_bins_gev])[0] * r['weight']
+    dens = H / np.diff(z_edges_mwe)[:, None] / np.diff(np.log10(product_bins_gev))[None, :]
+    if np.any(dens > 0):
+        m = ax[1].pcolormesh(z_edges_mwe, product_bins_gev, np.where(dens > 0, dens, np.nan).T,
+                                norm=LogNorm(), shading='flat')
+        fig.colorbar(m, ax=ax[1], label="per primary per m.w.e. per decade")
+    ax[1].set(xscale='log', yscale='log', xlabel="Production depth (m.w.e.)", ylabel="Secondary energy (GeV)",
+                title=f"(b) {' + '.join(products)} from {example_species} at {pb[i0]:.3g} GeV")
+
+    t_now = np.array([detector.total_age_kyr if t_kyr is None else float(t_kyr)])
+    for k, src in enumerate(sources):
+        for q, ls in zip(products, styles):
+            r = rows[(src, q)]
+            phi = detector._flux_cell_integral(src, t_now, r['primary_bins'])[0]
+            w = phi[r['primary_cell']] * r['weight']
+            rate = np.histogram(r['depth_mwe'], bins=z_edges_mwe, weights=w)[0] / (np.diff(z_edges_mwe) * G_CM2_PER_MWE)
+            ax[2].loglog(z_mid, np.where(rate > 0, rate, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
+    ax[2].set(xlabel="Depth (m.w.e.)", ylabel=r"Production rate (g$^{-1}$ s$^{-1}$)",
+                title="(c) Who makes the secondaries")
+    ax[2].legend(fontsize='x-small', ncol=2)
+    fig.tight_layout()
+    return fig, ax

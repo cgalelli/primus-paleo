@@ -1,151 +1,18 @@
-"""What is measured and how to look at it: etch-pit openings and sliced/etched spectra of latent tracks, rebinning,
-and diagnostic profiles and plots of a Paleodetector's depth tables and secondary production."""
+"""What is measured: the etch-pit openings of latent tracks and the expected pit-size spectrum on the analysed
+surface (etching, optical resolution of the microscope), and rebinning of spectra to the bins of a measurement.
+
+The diagnostics of a Paleodetector (interaction_profiles, plot_secondary_production) are in plotting.
+"""
 
 import numpy as np
 
-from ._core import (
-    MUON_SPECIES, SECONDARY_SOURCES, _depth_cdf_rows, _resolve_x_bins,
-)
+from ._core import _rebin_density, _resolve_x_bins
 
 __all__ = [
-    'interaction_profiles', 'plot_secondary_production', 'etch_pit_axes', 'rebin_counts', 'ETCH_DEFAULTS',
-    'slice_spectrum_etch', 'resolution_limit_nm', 'PIXEL_SIZE_UM_AT_10X', 'MIN_RESOLVED_PIXELS',
-    'DEFAULT_MAGNIFICATION',
+    'etch_pit_axes', 'rebin_counts', 'slice_spectrum_etch', 'resolution_limit_nm', 'ETCH_DEFAULTS',
+    'PIXEL_SIZE_UM_AT_10X', 'MIN_RESOLVED_PIXELS', 'DEFAULT_MAGNIFICATION',
 ]
 
-def interaction_profiles(mineral, energies_gev, z_edges_mwe, species=('neutron', 'proton', 'mu-'), capture=True):
-    """Interaction depth profiles from the StdRock depth tables, as used by the integrations.
-
-    The same distributions as Paleodetector._slab_interaction_probabilities, on depth bins instead of the sample
-    slab (both from _depth_cdf_rows on the tables of Paleodetector._depth_table):
-
-    * Hadrons: dP/dz of the interaction depth, F(z_hi) - F(z_lo) per bin (exponential tail included).
-    * Muons: the in-flight interactions, (G(z_hi) - G(z_lo)) / E[R] per bin, i.e. an interaction density
-      proportional to the survival probability P(R > z); with capture=True, plus the stops, F(z_hi) - F(z_lo) (the
-      mu- capture peak; for mu+ the stop is a decay, and the detector does not count it). mu+ uses the mu- table.
-
-    Args:
-        mineral (Paleodetector): Any detector of the mineral (the tables come from StdRock, not from the mineral).
-        energies_gev (array_like): Primary energies [GeV].
-        z_edges_mwe (np.ndarray): Depth bin edges along the path [m.w.e.].
-        species (tuple[str], optional): Any of 'neutron', 'proton', 'mu-', 'mu+' (with a depth table). Defaults
-            to ('neutron', 'proton', 'mu-').
-        capture (bool, optional): Add the muon stops to the in-flight interactions. Defaults to True.
-
-    Returns:
-        dict: species -> dP/dz [1/m.w.e.], shape (n_depth_bins, n_energies).
-    """
-    E = np.atleast_1d(np.asarray(energies_gev, float))
-    z_edges_mwe = np.asarray(z_edges_mwe, float)
-    z_lo = np.broadcast_to(z_edges_mwe[:-1, None], (len(z_edges_mwe) - 1, E.size))
-    z_hi = np.broadcast_to(z_edges_mwe[1:, None], z_lo.shape)
-    dz = np.diff(z_edges_mwe)[:, None]
-    out = {}
-    for s in species:
-        q_rows, tails = mineral._depth_rows(s, E)
-        p = mineral._depth_table(s)['p']
-        F_lo, G_lo = _depth_cdf_rows(z_lo, q_rows, p, tails)
-        F_hi, G_hi = _depth_cdf_rows(z_hi, q_rows, p, tails)
-        if s in MUON_SPECIES:
-            mean_range = _depth_cdf_rows(np.full(E.size, np.inf), q_rows, p)[1]
-            prob = (G_hi - G_lo) / mean_range + ((F_hi - F_lo) if capture else 0.0)
-        else:
-            prob = F_hi - F_lo
-        out[s] = prob / dz
-    return out
-
-def plot_secondary_production(self, sources=None, products=('neutron', 'proton'),
-                                total_simulated_particles=1e4, product_bins_gev=None, z_edges_mwe=None,
-                                example_species='mu-', example_energy_gev=None, t_kyr=None):
-    """Overview of the secondary neutrons and protons produced in the StdRock runs, in three panels.
-
-    Purpose: a diagnostic of the input of the atmospheric secondary cascade (_secondary_cascade), straight from the
-    StdRock rows (_load_stdrock_rows), to see which primaries make the secondaries, where and with what energy.
-        (a) Yield: secondaries per primary vs primary energy, one line per source and product.
-        (b) Where and with what energy: production depth vs secondary energy (neutrons + protons) for one run.
-        (c) Who makes them at each depth: production rate per gram of rock vs depth, each run weighted by the flux
-            integrated over its energy cell (flux history at t_kyr). Every primary is taken as vertical, so the
-            panel shows shapes and crossover depths; the integrations also spread the primaries over zenith angle.
-    Yields only count products made inside the StdRock target (a lower limit for muons leaving it).
-
-    Args:
-        sources (list[str], optional): Primary species. Defaults to None (SECONDARY_SOURCES with StdRock runs;
-            mu+ falls back on the mu- runs without captures, see _stdrock_dir).
-        products (tuple[str], optional): Secondaries shown. Defaults to ('neutron', 'proton').
-        total_simulated_particles (float, optional): Primaries per StdRock run. Defaults to 1e4.
-        product_bins_gev (np.ndarray, optional): Secondary energy bins [GeV]. Defaults to 40 log bins, 1 MeV-10 GeV.
-        z_edges_mwe (np.ndarray, optional): Depth bins [m.w.e.]. Defaults to 120 log bins from 0.01 m.w.e. to the
-            longest StdRock target.
-        example_species (str, optional): Source shown in panel (b). Defaults to 'mu-'.
-        example_energy_gev (float, optional): Primary energy of panel (b); the run whose cell contains it is used.
-            Defaults to None (the highest-energy run).
-        t_kyr (float, optional): Local time of the flux used in panel (c) [kyr]. Defaults to None (present).
-
-    Returns:
-        tuple: (figure, array of the three axes).
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm
-
-    sources = [src for src in (SECONDARY_SOURCES if sources is None else sources) if self._stdrock_dir(src)]
-    if not sources:
-        raise ValueError("No StdRock runs for any of the requested sources.")
-    product_bins_gev = np.logspace(-3, 1, 41) if product_bins_gev is None else np.asarray(product_bins_gev, float)
-    rows = {(src, q): self._load_stdrock_rows(src, q, product_bins_gev, total_simulated_particles)
-            for src in sources for q in products}
-    if z_edges_mwe is None:
-        z_max = max(r['target_mwe'] for r in rows.values())
-        z_edges_mwe = np.logspace(-2, np.log10(z_max), 120)
-    z_edges_mwe = np.asarray(z_edges_mwe, float)
-    z_mid = np.sqrt(np.maximum(z_edges_mwe[1:] * z_edges_mwe[:-1], 1e-300))
-    styles = ('-', '--', ':', '-.')
-
-    fig, ax = plt.subplots(1, 3, figsize=[17, 4.6])
-
-    # (a) yield per primary vs primary energy
-    for k, src in enumerate(sources):
-        for q, ls in zip(products, styles):
-            r = rows[(src, q)]
-            e0 = r['primary_bins'][:-1]
-            y = np.bincount(r['primary_cell'], minlength=e0.size) * r['weight']
-            ax[0].loglog(e0, np.where(y > 0, y, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
-    ax[0].set(xlabel="Primary energy (GeV)", ylabel="Secondaries per primary", title="(a) Yield")
-    ax[0].legend(fontsize='x-small', ncol=2)
-
-    # (b) production depth x secondary energy for one run
-    if example_species not in sources:
-        example_species = sources[0]
-    pb = rows[(example_species, products[0])]['primary_bins']
-    i0 = (len(pb) - 2 if example_energy_gev is None
-            else int(np.clip(np.searchsorted(pb, example_energy_gev, side='right') - 1, 0, len(pb) - 2)))
-    H = np.zeros((len(z_edges_mwe) - 1, len(product_bins_gev) - 1))
-    for q in products:
-        r = rows[(example_species, q)]
-        sel = r['primary_cell'] == i0
-        H += np.histogram2d(r['depth_mwe'][sel], product_bins_gev[r['cell'][sel]],
-                            bins=[z_edges_mwe, product_bins_gev])[0] * r['weight']
-    dens = H / np.diff(z_edges_mwe)[:, None] / np.diff(np.log10(product_bins_gev))[None, :]
-    if np.any(dens > 0):
-        m = ax[1].pcolormesh(z_edges_mwe, product_bins_gev, np.where(dens > 0, dens, np.nan).T,
-                                norm=LogNorm(), shading='flat')
-        fig.colorbar(m, ax=ax[1], label="per primary per m.w.e. per decade")
-    ax[1].set(xscale='log', yscale='log', xlabel="Production depth (m.w.e.)", ylabel="Secondary energy (GeV)",
-                title=f"(b) {' + '.join(products)} from {example_species} at {pb[i0]:.3g} GeV")
-
-    # (c) flux-weighted production rate vs depth
-    t_now = np.array([self.total_age_kyr if t_kyr is None else float(t_kyr)])
-    for k, src in enumerate(sources):
-        for q, ls in zip(products, styles):
-            r = rows[(src, q)]
-            phi = self._flux_cell_integral(src, t_now, r['primary_bins'])[0]          # cm^-2 s^-1 per cell
-            w = phi[r['primary_cell']] * r['weight']
-            rate = np.histogram(r['depth_mwe'], bins=z_edges_mwe, weights=w)[0] / (np.diff(z_edges_mwe) * 100.)
-            ax[2].loglog(z_mid, np.where(rate > 0, rate, np.nan), ls, color=f"C{k}", label=f"{src} \u2192 {q}")
-    ax[2].set(xlabel="Depth (m.w.e.)", ylabel=r"Production rate (g$^{-1}$ s$^{-1}$)",
-                title="(c) Who makes the secondaries")
-    ax[2].legend(fontsize='x-small', ncol=2)
-    fig.tight_layout()
-    return fig, ax
 
 def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral_ratio=1.0, n_s=128):
     """Surface opening of etched latent tracks (Huygens construction, constant etch rates).
@@ -156,6 +23,15 @@ def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral
     the section of that union by the final surface. Covers in one construction the critical angle
     (sin(dip) < 1/V gives no opening), the conical phase, over-etching (the etch front has reached the track end and
     the tip rounds off) and pits that fade out because the bulk has etched through them.
+
+    Construction, for each track: etching of the track starts at depth z0 = max(z_top, 0) (the part above the
+    original surface does not exist); R is the latent length below z0, and h' = h - z0 the bulk removal left once
+    the etchant has reached the track (no opening if h' <= 0 or R <= 0). The etchant runs along the track for
+    s_max = min(R, V h'); a point at distance s along it has then grown vertically by r = h' - s / V, and lies
+    dz = h' - s sin(dip) below the final surface, so its ellipse cuts the surface in a segment of half-width
+    a = lateral_ratio * sqrt(r^2 - dz^2) centred at x = s cos(dip). The opening spans the union of the segments of
+    n_s points along the track: major axis = its extent, minor axis = 2 max(a). Tracks are processed in chunks of
+    ETCH_CHUNK to bound the memory.
 
     Args:
         length_nm (np.ndarray): Latent track length [nm].
@@ -173,19 +49,19 @@ def etch_pit_axes(length_nm, dip_rad, top_depth_nm, removed_nm, v_ratio, lateral
     """
     L, dip, z_top = (np.asarray(a, float) for a in (length_nm, dip_rad, top_depth_nm))
     sin_d, cos_d = np.sin(dip), np.cos(dip)
-    z0 = np.maximum(z_top, 0.)                                # where etching of the track starts
-    R = (z_top + L * sin_d - z0) / np.maximum(sin_d, 1e-12)  # latent length below that point
-    hp = removed_nm - z0                                      # bulk removal left after the track was reached
+    z0 = np.maximum(z_top, 0.)
+    R = (z_top + L * sin_d - z0) / np.maximum(sin_d, 1e-12)
+    hp = removed_nm - z0
     ok = (hp > 0) & (R > 0)
 
     major, minor = np.full(L.shape, np.nan), np.full(L.shape, np.nan)
     idx = np.where(ok)[0]
-    for k in range(0, len(idx), 20000):                       # chunks keep memory bounded
-        i = idx[k:k + 20000]
-        s_max = np.minimum(R[i], v_ratio * hp[i])             # part of the track the etchant has travelled
+    for k in range(0, len(idx), ETCH_CHUNK):
+        i = idx[k:k + ETCH_CHUNK]
+        s_max = np.minimum(R[i], v_ratio * hp[i])
         s = s_max[:, None] * np.linspace(0., 1., n_s)[None, :]
-        r = hp[i, None] - s / v_ratio                         # vertical growth since that point was reached
-        dz = hp[i, None] - s * sin_d[i, None]                 # distance from the point to the final surface
+        r = hp[i, None] - s / v_ratio
+        dz = hp[i, None] - s * sin_d[i, None]
         a2 = r ** 2 - dz ** 2
         a = lateral_ratio * np.sqrt(np.clip(a2, 0., None))
         x = s * cos_d[i, None]
@@ -202,7 +78,8 @@ def rebin_counts(counts, old_edges, new_edges):
     """Redistributes counts from one binning to another, assuming a uniform density inside each old bin.
 
     Each new bin receives, from every old bin, the fraction of that old bin it overlaps. The total is conserved
-    where the two binnings cover the same range; counts outside `new_edges` are dropped.
+    where the two binnings cover the same range; counts outside `new_edges` are dropped. The counts form of
+    _core._rebin_density (which works on densities), e.g. to bring a spectrum to the bins of a descriptor.
 
     Args:
         counts (np.ndarray): Counts in the bins of `old_edges` (len(old_edges) - 1 values).
@@ -210,21 +87,25 @@ def rebin_counts(counts, old_edges, new_edges):
 
     Returns:
         np.ndarray: Counts in the bins of `new_edges`.
+
+    Raises:
+        ValueError: If counts does not match old_edges.
     """
     counts = np.asarray(counts, float)
     old_edges, new_edges = np.asarray(old_edges, float), np.asarray(new_edges, float)
     if len(counts) != len(old_edges) - 1:
         raise ValueError(f"{len(counts)} counts for {len(old_edges) - 1} bins")
-    lo = np.maximum(old_edges[:-1][None, :], new_edges[:-1][:, None])
-    hi = np.minimum(old_edges[1:][None, :], new_edges[1:][:, None])
-    overlap = np.clip(hi - lo, 0., None) / np.diff(old_edges)[None, :]
-    return overlap @ counts
+    return _rebin_density(counts / np.diff(old_edges), old_edges, new_edges)
 
 
+# Etching: ETCH_DEFAULTS gives removed_nm, v_ratio and lateral_ratio of each etching method (slice_spectrum_etch,
+# etch_type=...). The plasma values are placeholders, to be replaced by measured ones.
 ETCH_DEFAULTS = {
-    'HF': {'removed_nm': 4000., 'v_ratio': 2.5, 'lateral_ratio': 1.0},      # wet, isotropic (obsidian)
-    'plasma': {'removed_nm': 100., 'v_ratio': 10.0, 'lateral_ratio': 0.1},  # dry, directional (halite)
+    'HF': {'removed_nm': 4000., 'v_ratio': 2.5, 'lateral_ratio': 1.0},
+    'plasma': {'removed_nm': 100., 'v_ratio': 10.0, 'lateral_ratio': 0.1},
 }
+ETCH_CHUNK = 20000
+
 
 # Microscope: camera pixel size on the sample at 10x; at magnification M it is PIXEL_SIZE_UM_AT_10X * 10 / M (same
 # camera and tube lens). A pit must be at least MIN_RESOLVED_PIXELS pixels wide to be seen (resolution_limit_nm).
@@ -295,7 +176,8 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         x_bins (np.ndarray, optional): Bin edges of `counts_mg` [nm]. Defaults to DEFAULT_INTEGRATION_X_BINS_NM.
         out_bins (np.ndarray, optional): Bin edges of the returned histogram [nm]. Defaults to x_bins.
         etch_type (str, optional): 'HF' or 'plasma': sets the defaults of removed_nm, v_ratio and lateral_ratio
-            (ETCH_DEFAULTS); explicitly given values always win, including 0. Defaults to "HF".
+            (ETCH_DEFAULTS; wet HF is isotropic, dry plasma directional); explicitly given values always win,
+            including 0. Defaults to "HF".
         magnification (float, optional): Objective magnification, for the default min_width_nm. Defaults to 10.
         numerical_aperture (float, optional): NA of the objective, for the default min_width_nm (see
             resolution_limit_nm). Defaults to None (pixel criterion only).
@@ -314,10 +196,9 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         raise ValueError(f"etch_type must be one of {list(ETCH_DEFAULTS)}, got '{etch_type}'")
     if measure not in ('major', 'minor'):
         raise ValueError("measure must be 'major' or 'minor'")
-    d = ETCH_DEFAULTS[etch_type]
-    removed_nm = d['removed_nm'] if removed_nm is None else removed_nm
-    v_ratio = d['v_ratio'] if v_ratio is None else v_ratio
-    lateral_ratio = d['lateral_ratio'] if lateral_ratio is None else lateral_ratio
+    given = {'removed_nm': removed_nm, 'v_ratio': v_ratio, 'lateral_ratio': lateral_ratio}
+    etch = {**ETCH_DEFAULTS[etch_type], **{k: v for k, v in given.items() if v is not None}}
+    removed_nm, v_ratio, lateral_ratio = etch['removed_nm'], etch['v_ratio'], etch['lateral_ratio']
     if min_width_nm is None:
         min_width_nm = resolution_limit_nm(magnification, numerical_aperture=numerical_aperture)
 

@@ -490,7 +490,7 @@ def _depth_cdf_rows(z, q_rows, p, tail_lambdas=None):
     Row j of q_rows (one energy) applies to z[..., j]; a single energy is the one-row case (q_rows of shape (1, n),
     z with a last axis of length 1). Only the node search runs row by row (each row has its own nodes); everything
     else is computed for all rows at once. Used by Paleodetector._slab_interaction_probabilities (primaries),
-    Paleodetector._secondary_recoils (products of the secondary cascade) and observables.interaction_profiles.
+    Paleodetector._secondary_recoils (products of the secondary cascade) and plotting.interaction_profiles.
 
     Args:
         z (array_like): Depths [m.w.e.], shape (..., n_E); the last axis runs over the rows of q_rows. May be inf.
