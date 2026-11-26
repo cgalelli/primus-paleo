@@ -18,7 +18,7 @@ from ._core import (
     B0_U238, CAPTURE_SPECTRUM_MAX_E0_GEV, COMPUTABLE_SPECIES, DEFAULT_TRACK_SUM, DEPTH_FLOOR_MWE,
     DERIVED_SPECIES, FISSIONS_U238_G_KYR, SECONDS_PER_KYR, MIN_DEPTH_SAMPLES, MUON_SPECIES,
     NEUTRINO_MAX_GENERATIONS, NEUTRINO_MAX_INTERACTION_FRACTION, NEUTRINO_PRODUCTS, NEUTRINO_SECONDARY_PREFIX,
-    NEUTRINO_SOLID_ANGLE_FACTOR, NEUTRINO_SPECIES, NEUTRON_MASS_MEV, NEUTRON_P_NODES, NU_BAR_U238_SF,
+    NEUTRINO_SPECIES, NEUTRON_MASS_MEV, NEUTRON_P_NODES, NU_BAR_U238_SF,
     PROTON_MASS_MEV, RECOIL_ENERGY_BINS_MEV, SECONDARY_SOURCES, SECONDARY_WINDOW_BINS,
     SECONDARY_WINDOW_SURVIVAL, STOPPING_P_NODES, TIME_GRID_ATTENUATION_MWE, TIME_GRID_BACKBONE,
     TIME_GRID_FLUX_PROBES, TIME_GRID_MAX_PASSES, TIME_GRID_MAX_POINTS, TIME_GRID_RTOL, TOTAL_ALL_FRAGMENTS,
@@ -304,6 +304,35 @@ def _zenith_density(cos_zenith, weights, intensity, c_vals):
     f = (x - log_mu[j]) / (log_mu[j + 1] - log_mu[j])
     density = 2.0 * np.pi * c_vals * np.exp(log_shape[..., j] * (1.0 - f) + log_shape[..., j + 1] * f)
     return density / np.trapezoid(density, c_vals, axis=-1)[..., None]
+
+
+def _mean_inverse_cos(cos_zenith, weights, intensity):
+    """<1/cos(zenith)> of the flux crossing a horizontal plane, int I dOmega (one hemisphere) / sum_i w_i I_i =
+    2 pi int_0^1 g(mu) dmu, with the interpolation of _zenith_density (g a power law of mu between the nodes, held
+    beyond them), integrated exactly over [0, 1] (2 for an isotropic intensity). Called by
+    Paleodetector._flux_cell_integral (all_directions, for the neutrinos).
+
+    Args:
+        cos_zenith (np.ndarray): Quadrature nodes mu_i, shape (n_angles,).
+        weights (np.ndarray): Quadrature weights, shape (n_angles,).
+        intensity (np.ndarray): Intensities at the nodes, shape (..., n_angles).
+
+    Returns:
+        np.ndarray: <1/cos>, shape (...); 2 (isotropic) where the intensity is zero at every node.
+    """
+    order = np.argsort(cos_zenith)
+    mu = cos_zenith[order]
+    intensity = np.clip(intensity[..., order], 0.0, None)
+    total = intensity @ weights[order]
+    g = np.where(total[..., None] > 0, intensity / np.where(total > 0, total, 1.0)[..., None], 1.0 / np.sum(weights))
+    g0, g1 = g[..., :-1], g[..., 1:]
+    ratio = mu[1:] / mu[:-1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        a = np.log(g1 / g0) / np.log(ratio)
+        power = g0 * mu[:-1] * np.where(np.abs(a + 1) > 1e-9, (ratio ** (a + 1) - 1) / (a + 1), np.log(ratio))
+    trapezoid = 0.5 * (g0 + g1) * (mu[1:] - mu[:-1])
+    segments = np.where((g0 > 0) & (g1 > 0), power, trapezoid)
+    return 2.0 * np.pi * (g[..., 0] * mu[0] + np.sum(segments, axis=-1) + g[..., -1] * (1.0 - mu[-1]))
 
 
 def _product_axis(product_bins_gev):
@@ -2348,9 +2377,9 @@ class Paleodetector:
         return value
 
 
-    def _flux_cell_integral(self, species, t_kyr_array, edges_gev, c_vals=None):
+    def _flux_cell_integral(self, species, t_kyr_array, edges_gev, c_vals=None, all_directions=False):
         """Flux of a species integrated over each energy cell, at local times (_energy_cell_nodes quadrature), and
-        per direction if c_vals is given.
+        per direction if c_vals is given, or from all directions if all_directions.
 
         Called by _secondary_cascade (primaries of the StdRock runs, per direction) and _neutrino_run_pass (neutrino
         runs): the run at the lower edge of a cell is weighted by the flux integrated over its cell.
@@ -2361,18 +2390,28 @@ class Paleodetector:
             edges_gev (np.ndarray): Cell edges [GeV], shape (M,).
             c_vals (np.ndarray, optional): cos(zenith) grid: the flux of each direction is the flux times its zenith
                 density (_zenith_density), per unit cos(zenith). Defaults to None (all directions together).
+            all_directions (bool, optional): Return the intensity integrated over the whole sphere, int I dOmega,
+                the rate of path length per unit volume (neutrinos: no overburden, through the Earth too): the flux
+                times 2 <1/cos(zenith)> (_mean_inverse_cos, at each energy and time), the factor 2 for the up-going
+                half, taken equal to the down-going one. Defaults to False.
 
         Returns:
             np.ndarray: Template flux integrated over energy [cm^-2 s^-1]: the flux crossing a horizontal plane
-            (see the flux module docstring; for neutrinos see NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1), or
-            (T, N_C, M - 1) per unit cos(zenith) with c_vals.
+            (see the flux module docstring), shape (T, M - 1); (T, N_C, M - 1) per unit cos(zenith) with c_vals;
+            int I dOmega with all_directions.
         """
         t_flux = self._flux_time_kyr(np.atleast_1d(np.asarray(t_kyr_array, dtype=float)))
         nodes, weights = _energy_cell_nodes(edges_gev)
         phi = self.flux_history.get_map(species, t_flux, nodes)[2].reshape(t_flux.size, *nodes.shape)
-        if c_vals is None:
+        if c_vals is None and not all_directions:
             return np.sum(phi * weights, axis=-1)
         cos_zenith, zenith_weights, intensity = self.flux_history.get_zenith_map(species, t_flux, nodes)
+        if all_directions:
+            out = np.empty((t_flux.size, nodes.shape[0]))
+            for i in range(nodes.shape[0]):
+                mean_inverse_cos = _mean_inverse_cos(cos_zenith, zenith_weights, intensity[:, i])
+                out[:, i] = np.sum(phi[:, i] * weights[i] * 2.0 * mean_inverse_cos, axis=-1)
+            return out
         out = np.empty((t_flux.size, len(c_vals), nodes.shape[0]))
         for i in range(nodes.shape[0]):
             density = _zenith_density(cos_zenith, zenith_weights, intensity[:, i], c_vals)
@@ -2500,8 +2539,9 @@ class Paleodetector:
                            neutrino_bias, rho, solid_angle_factor, with_recoils=True):
         """One pass over the neutrino runs of a folder: recoils and first products, per gram of the run medium.
 
-        Rate per gram:  solid_angle_factor * sum_i Phi_i(t) * counts_i / (N * bias_i * L * rho), with Phi_i the
-        flux integrated over the energy cell of run i, L the target length and rho the density of the run medium.
+        Rate per gram:  sum_i Psi_i(t) * counts_i / (N * bias_i * L * rho), with Psi_i the intensity from all
+        directions integrated over the energy cell of run i (_flux_cell_integral with all_directions, or
+        solid_angle_factor times the flux), L the target length and rho the density of the run medium.
 
         Args:
             species (str): Neutrino species.
@@ -2523,7 +2563,10 @@ class Paleodetector:
         n_t, n_r = t_kyr.size, len(RECOIL_ENERGY_BINS_MEV) - 1
         offsets, n_k = _product_axis(product_edges)
         length_cm = self._geant4_geometry(run_dir)["target_length_m"] * 100.0
-        phi_cell = self._flux_cell_integral(species, t_kyr, edges)
+        if solid_angle_factor is None:
+            phi_cell = self._flux_cell_integral(species, t_kyr, edges, all_directions=True)
+        else:
+            phi_cell = solid_angle_factor * self._flux_cell_integral(species, t_kyr, edges)
         if not np.any(phi_cell > 0):
             self._log(f"Warning: the flux history has no {species} flux (templates built without neutrinos?): "
                       f"{species} gives zero.")
@@ -2532,7 +2575,7 @@ class Paleodetector:
         for i, e0 in enumerate(edges[:-1]):
             bias = self._neutrino_bias(species, e0, neutrino_bias, data_dir=run_dir)
             run = self._read_recoils_and_products(os.path.join(run_dir, f"outNuclei_{e0:.6f}.txt"), product_edges)
-            w = solid_angle_factor * phi_cell[:, i] / (total_simulated_particles * bias * length_cm * rho)
+            w = phi_cell[:, i] / (total_simulated_particles * bias * length_cm * rho)
             if with_recoils:
                 for frag, counts in run['recoils'].items():
                     out['recoils'].setdefault(frag, np.zeros((n_t, n_r)))
@@ -2552,7 +2595,7 @@ class Paleodetector:
         total_simulated_particles=1e4, neutrino_bias=None, species_list=None,
         secondaries=True, product_simulated_particles=None, nucleus=DEFAULT_TRACK_SUM,
         x_grid=TRACK_LENGTH_BINS_NM,
-        solid_angle_factor=NEUTRINO_SOLID_ANGLE_FACTOR, flux_history=None,
+        solid_angle_factor=None, flux_history=None,
         secondary_medium='auto', stdrock_neutrino_bias=None, observable=OBSERVABLE_TRACKS,
     ):
         """Track counts from atmospheric neutrinos: their own interactions in the sample and those of the
@@ -2563,12 +2606,14 @@ class Paleodetector:
         * No overburden. Neutrinos are not attenuated by any realistic overburden, so the depth tables and the
           overburden history play no role; the rate changes in time only through the flux history.
         * All directions. The sample sees neutrinos from the whole sphere, through the Earth too: the rate per unit
-          volume is solid_angle_factor times the template flux (see NEUTRINO_SOLID_ANGLE_FACTOR).
+          volume follows int I dOmega = 2 <1/cos(zenith)> times the template flux, from the zenith distribution of
+          the templates at each energy and time (_flux_cell_integral with all_directions; 4 for an isotropic
+          intensity, NEUTRINO_SOLID_ANGLE_FACTOR; ~4-5 from MCEq, growing with energy).
         * Biased runs. The interaction probability per primary is uniform along the target (no depletion while the
           biased probability is small), so a run of length L gives the recoils per neutrino per unit path:
               recoils per primary / (bias * L).
-          Rate of a fragment per gram:  solid_angle_factor * sum_i Phi_i(t) * counts_i / (N * bias_i * L * rho),
-          with Phi_i the flux integrated over the energy cell of run i.
+          Rate of a fragment per gram:  sum_i Psi_i(t) * counts_i / (N * bias_i * L * rho), with Psi_i the
+          intensity from all directions integrated over the energy cell of run i.
 
         Secondaries ('nu_secondary_<product>', if secondaries=True): the muons, neutrons and protons the neutrinos
         make in the rock around the sample, and the neutrons and protons those make in turn (all generations,
@@ -2615,8 +2660,9 @@ class Paleodetector:
             nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key. Defaults to
                 'total_no_light_ions'.
             x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to TRACK_LENGTH_BINS_NM.
-            solid_angle_factor (float, optional): Rate per unit volume / template flux. Defaults to
-                NEUTRINO_SOLID_ANGLE_FACTOR (4: isotropic, from all directions).
+            solid_angle_factor (float, optional): A fixed ratio int I dOmega / template flux instead of the one
+                from the zenith distribution (e.g. NEUTRINO_SOLID_ANGLE_FACTOR = 4, isotropic: the default before
+                the templates had zenith data). Defaults to None (from the templates).
             flux_history (FluxHistory, optional): If given, set with set_flux_history before the integration;
                 None keeps the current one. Defaults to None.
             secondary_medium (str, optional): Rock in which the secondaries are made: 'auto', 'StdRock' or

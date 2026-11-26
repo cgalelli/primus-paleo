@@ -269,7 +269,8 @@ IRREGULAR_STEP_FACTOR = 1.5   # a step this many times the median step in log(E)
 NEUTRINO_SPECIES = ('nu_mu', 'anti_nu_mu', 'nu_e', 'anti_nu_e')
 NEUTRINO_PRODUCTS = ('mu-', 'mu+', 'neutron', 'proton')
 NEUTRINO_SECONDARY_PREFIX = 'nu_secondary_'
-NEUTRINO_SOLID_ANGLE_FACTOR = 4.0
+NEUTRINO_SOLID_ANGLE_FACTOR = 4.0             # int I dOmega / flux crossing a plane for an isotropic intensity;
+                                              # the neutrino integrals use the templates' zenith distribution
 NEUTRINO_MAX_INTERACTION_FRACTION = 0.1
 NEUTRINO_MAX_GENERATIONS = 50             # cap on the product generations if the series does not converge
 

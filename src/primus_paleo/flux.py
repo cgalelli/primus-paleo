@@ -30,8 +30,9 @@ Zenith distribution. MCEq solves each zenith angle of the quadrature; besides th
 per species, the angular shape g_i(E) = I_i(E) / sum_j w_j I_j(E) at the quadrature nodes mu_i = cos(theta_i)
 (sum_i w_i g_i = 1), so that the intensity is I_i = flux * g_i and the flux crossing a horizontal plane per unit
 cos(zenith) is 2 pi mu g(mu) * flux (FluxTemplate.zenith_shape, FluxHistory.get_zenith_map; used by Paleodetector
-for the slanted paths through the overburden). Below the low-energy matching energies, where MCEq is not used, the
-shape is held at its value there (_zenith_shapes).
+for the slanted paths through the overburden and for the neutrinos from all directions). Where MCEq is not used, the
+nucleon shape is blended into a measured low-energy one (LOW_E_ZENITH) and the other shapes are held at their value
+at the matching energy (_zenith_shapes).
 
 Caching (_cached). Templates and response matrices are kept in memory for the session; the matrices are saved to
 <template_dir>/Response_*.npz, and templates of the 'direct' solver (or all of them, with SAVE_RESPONSE_TEMPLATES) to
@@ -481,6 +482,17 @@ NEUTRINO_LOW_E = {
     'e_peak_gev': 0.04,      # peak of dN/dE (FLUKA: ~40 MeV)
 }
 LOW_E_GRID = {'e_min_gev': 1e-4, 'n_per_decade': 10}   # template grid extended down to the lowest Geant4 energy
+# Zenith shape of the nucleons where MCEq is not used: MCEq has no angular deflection and is not meant for nucleons
+# below a few GeV. Below e_low_gev the intensity follows I ~ cos^cos_power(theta), measured at ground level for
+# 10-170 MeV neutrons: n = 2.6 +- 0.2 (Moser et al., ICRC 2005, SH 3.5; a neutron scatter camera found cos^2.7 at
+# 0.2-10 MeV, OSTI 1147482); taken for protons too (same cascades). Above e_high_gev (the LOW_E_SPLICE e_match_gev,
+# where the spectrum is MCEq's) the shape is MCEq's; in between the two normalised shapes are mixed with a weight
+# rising smoothly in log E (_zenith_shapes). MCEq gives ~cos^12 for nucleons above 10 GeV (slant absorption).
+LOW_E_ZENITH = {
+    'neutron': {'cos_power': 2.6, 'e_low_gev': 0.17, 'e_high_gev': 7.0},
+    'proton': {'cos_power': 2.6, 'e_low_gev': 0.17, 'e_high_gev': 7.0},
+}
+
 # Geomagnetic-cutoff scaling of the low-energy splice. The LOW_E_SPLICE shapes are normalised to MCEq at e_match
 # (~7 GeV), where the cutoff has almost no effect, so on their own they do not respond to the cutoff. Their
 # low-energy part is therefore multiplied by F(Rc, x) / F(Rc_ref, x), the nucleon-flux scaling for spallation of
@@ -645,20 +657,23 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
     return e_ext, fluxes, primary
 
 
-def _zenith_shapes(e_grid, intensities, weights, e_ext):
+def _zenith_shapes(e_grid, intensities, weights, cos_zenith, e_ext):
     """Angular shape of each species on the template energy grid: g_i(E) = I_i(E) / sum_j w_j I_j(E) at the
     quadrature angles (see the module docstring). Called by _build_template, next to _postprocess_secondaries.
 
-    Below the matching energy of the low-energy extension (LOW_E_SPLICE e_match_gev for nucleons,
-    NEUTRINO_LOW_E['e_match_gev'] for neutrinos, the bottom of the MCEq grid for the others) the shape is held at its
-    value there; energies where MCEq gives no flux take the shape of the nearest energy that has one (an isotropic
-    intensity if none has).
+    MCEq's shape is used where MCEq is: for the LOW_E_ZENITH species (nucleons) it is mixed with the measured
+    low-energy shape cos^n (normalised the same way), g = s g_MCEq + (1 - s) g_low, with s = 3u^2 - 2u^3,
+    u = log(E / e_low) / log(e_high / e_low) clipped to [0, 1]; the mixture is normalised too. For the other species
+    the shape is held below their matching energy (NEUTRINO_LOW_E['e_match_gev'] for neutrinos, the bottom of the
+    MCEq grid for muons). Energies where MCEq gives no flux take its shape at the nearest energy that has one (an
+    isotropic intensity if none has).
 
     Args:
         e_grid (np.ndarray): MCEq energy grid [GeV].
         intensities (dict): species -> intensities (n_angles, len(e_grid)) (_zenith_resolved_secondaries or
             ResponseMatrix.apply_nucleons).
         weights (np.ndarray): Quadrature weights of the angles.
+        cos_zenith (np.ndarray): cos of the quadrature angles.
         e_ext (np.ndarray): Template grid (_postprocess_secondaries): e_grid extended downwards.
 
     Returns:
@@ -666,28 +681,33 @@ def _zenith_shapes(e_grid, intensities, weights, e_ext):
     """
     e_grid = np.asarray(e_grid, dtype=float)
     weights = np.asarray(weights, dtype=float)
+    cos_zenith = np.asarray(cos_zenith, dtype=float)
     on_grid = np.clip(np.searchsorted(e_grid, e_ext), 0, e_grid.size - 1)
+    index = np.arange(e_grid.size)
     shapes = {}
     for key, intensity in intensities.items():
         intensity = np.clip(np.asarray(intensity, dtype=float), 0.0, None)
         total = _zenith_sum(intensity, weights)
         valid = np.nonzero(total > 0)[0]
         if valid.size == 0:
-            shapes[key] = np.full((weights.size, e_ext.size), 1.0 / np.sum(weights))
-            continue
-        nearest = valid[np.clip(np.searchsorted(valid, np.arange(e_grid.size)), 0, valid.size - 1)]
-        lower = valid[np.clip(np.searchsorted(valid, np.arange(e_grid.size)) - 1, 0, valid.size - 1)]
-        nearest = np.where(np.abs(lower - np.arange(e_grid.size)) < np.abs(nearest - np.arange(e_grid.size)),
-                           lower, nearest)
-        g = intensity[:, nearest] / total[nearest]
-        if key in LOW_E_SPLICE:
-            e_hold = LOW_E_SPLICE[key]['e_match_gev']
-        elif key in NEUTRINO_LOW_E['species']:
-            e_hold = NEUTRINO_LOW_E['e_match_gev']
+            g_mceq = np.full((weights.size, e_ext.size), 1.0 / np.sum(weights))
         else:
-            e_hold = e_grid[0]
-        j_hold = min(int(np.searchsorted(e_grid, e_hold)), e_grid.size - 1)
-        shapes[key] = g[:, np.maximum(on_grid, j_hold)]
+            above = valid[np.clip(np.searchsorted(valid, index), 0, valid.size - 1)]
+            below = valid[np.clip(np.searchsorted(valid, index) - 1, 0, valid.size - 1)]
+            nearest = np.where(np.abs(below - index) < np.abs(above - index), below, above)
+            g = intensity[:, nearest] / total[nearest]
+            e_hold = NEUTRINO_LOW_E['e_match_gev'] if key in NEUTRINO_LOW_E['species'] else e_grid[0]
+            j_hold = 0 if key in LOW_E_ZENITH else min(int(np.searchsorted(e_grid, e_hold)), e_grid.size - 1)
+            g_mceq = g[:, np.maximum(on_grid, j_hold)]
+        if key not in LOW_E_ZENITH:
+            shapes[key] = g_mceq
+            continue
+        c = LOW_E_ZENITH[key]
+        g_low = cos_zenith ** c['cos_power'] / np.sum(weights * cos_zenith ** c['cos_power'])
+        u = np.clip(np.log(e_ext / c['e_low_gev']) / np.log(c['e_high_gev'] / c['e_low_gev']), 0.0, 1.0)
+        s = u * u * (3.0 - 2.0 * u)
+        mixed = s * g_mceq + (1.0 - s) * g_low[:, None]
+        shapes[key] = mixed / (weights @ mixed)
     return shapes
 
 
@@ -740,7 +760,7 @@ def _build_template(name, model_factory, t_since_yr=None, interaction_model=DEFA
         e_ext, fluxes, primary = _postprocess_secondaries(
             e_grid, {key: _zenith_sum(v, weights) for key, v in per_angle.items()}, total_flux,
             geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
-        return e_ext, fluxes, primary, _zenith_shapes(e_grid, per_angle, weights, e_ext)
+        return e_ext, fluxes, primary, _zenith_shapes(e_grid, per_angle, weights, np.cos(np.deg2rad(angles)), e_ext)
 
     if t_since_yr is None:
         e_ext, fluxes, primary, shapes = solve(model_factory(None))
