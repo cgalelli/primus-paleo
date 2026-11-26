@@ -24,9 +24,9 @@ from ._core import (
     TIME_GRID_FLUX_PROBES, TIME_GRID_MAX_PASSES, TIME_GRID_MAX_POINTS, TIME_GRID_RTOL, TOTAL_ALL_FRAGMENTS,
     TOTAL_NO_LIGHT_IONS, TRACK_GROUPS, TRACK_GROUPS_KEY, TRACK_LENGTH_BINS_NM, TRACK_SUMS, TRUNCATION_FRACTION,
     U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, atomic_number, predict_track_groups, track_group,
-    WATT_B_PER_MEV, _ANNEALING_GEOTHERM_DEFAULTS, _ENERGY_EDGE_RTOL, _LIGHT_ION_SYMBOLS, _R_FRESH,
-    _annealing_law, _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
-    _piecewise_cdf_and_integral, _rebin_density, _resolve_x_bins, _restrict_edges, _shorten_tracks,
+    WATT_B_PER_MEV, _ENERGY_EDGE_RTOL, _LIGHT_ION_SYMBOLS,
+    _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
+    _piecewise_cdf_and_integral, _rebin_density, _resolve_x_bins, _restrict_edges,
     _slab_probability, is_light_ion, normalize_fragment_names,
 )
 
@@ -212,11 +212,62 @@ def _combine_track_results(results):
     return {k: sum(r[k] for r in results if k in r) for k in keys}
 
 
-def _map_track_result(fn, result):
-    """Applies fn to an array, or to every array of a dict of arrays."""
-    if isinstance(result, dict):
-        return {k: fn(v) for k, v in result.items()}
-    return fn(result)
+# --- Recoil spectra and observables ------------------------------------------------------------------------------------
+# Every source (cosmic-ray primaries and secondaries, neutrinos, radiogenic neutrons, fission fragments) is first turned
+# into recoil spectra (_recoil_spectra), then into a density of the observable on a fine grid (Paleodetector.
+# _recoil_density: track lengths or recoil energies), then into counts in the output bins (Paleodetector.
+# _density_to_counts: time integral, rebinning, sums and groups, selection). Fission tracks are the one exception to
+# the first step (one track per fission, two fragments: Paleodetector._fission_track_density).
+OBSERVABLE_TRACKS = 'tracks'
+OBSERVABLE_RECOIL_ENERGY = 'recoil_energy'
+OBSERVABLES = (OBSERVABLE_TRACKS, OBSERVABLE_RECOIL_ENERGY)
+RADIOGENIC_SOURCES = ('fission_fragments', 'fission_n', 'alpha_n')
+FISSION_KEYS = ('heavier', 'lighter', 'pair')
+
+
+def _output_axes(observable, x_bins, x_grid):
+    """Output bin edges and fine grid of an observable; called at the start of every integrate_* function.
+
+    tracks: x_bins in nm (default: the module default, _resolve_x_bins) and the densities on x_grid.
+    recoil_energy: x_bins in MeV (default RECOIL_ENERGY_BINS_MEV) and the densities on RECOIL_ENERGY_BINS_MEV, the
+    grid the recoils are histogrammed on (x_grid is ignored).
+
+    Args:
+        observable (str): 'tracks' or 'recoil_energy'.
+        x_bins (array_like or None): Output bin edges.
+        x_grid (array_like): Fine track-length grid [nm].
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: (x_bins, grid).
+
+    Raises:
+        ValueError: If observable is unknown.
+    """
+    if observable == OBSERVABLE_TRACKS:
+        return _resolve_x_bins(x_bins), np.asarray(x_grid, dtype=float)
+    if observable == OBSERVABLE_RECOIL_ENERGY:
+        return (RECOIL_ENERGY_BINS_MEV if x_bins is None else np.asarray(x_bins, dtype=float)), RECOIL_ENERGY_BINS_MEV
+    raise ValueError(f"observable must be one of {OBSERVABLES}, got {observable!r}.")
+
+
+def _recoil_spectra(fragments, t_kyr=None):
+    """The recoil spectra every source produces: the common input of Paleodetector._recoil_density.
+
+    Args:
+        fragments (dict): {fragment key: recoils per g of mineral per kyr in each RECOIL_ENERGY_BINS_MEV bin (counts
+            per bin, not per MeV)}, shape (T, n_recoil_bins) for a time-dependent source or (n_recoil_bins,) for a
+            constant one. A 'neutron' entry is dropped (not a recoiling nucleus).
+        t_kyr (np.ndarray, optional): Local times of the rows [kyr]; None for a constant source.
+
+    Returns:
+        dict: {'t_kyr': t_kyr, 'fragments': {fragment: array}}.
+    """
+    return {'t_kyr': t_kyr, 'fragments': {k: v for k, v in fragments.items() if k != 'neutron'}}
+
+
+def _accumulate_into(store, key, value):
+    """store[key] += value, creating the entry at the first value (the readers list fragments as they meet them)."""
+    store[key] = store[key] + value if key in store else value
 
 
 # --- Main Paleodetector Class ---
@@ -279,13 +330,10 @@ class Paleodetector:
 
         self.flux_history = None
         self._time_grid_cache = None
-        self._annealing_cache = {}
         self.set_flux_history(flux_history)
 
         self._nuclear_data_cache = {}
-        self._neutron_bkg_cache = {}
         self._depth_interpolators = {}
-        self._secondary_n_spectrum = {}
         self._geometry_cache = {}
         self._depth_tables = {}
 
@@ -369,8 +417,7 @@ class Paleodetector:
         """Sets the cosmic-ray flux history (the only way to change it after creation) and rebuilds the time grid.
 
         Called by __init__ and whenever the flux history changes. The master time grid depends on the overburden
-        (fixed at creation) and on the flux history, so it is rebuilt here, at once, and its size printed; the
-        annealing cache, which lives on that grid, is cleared.
+        (fixed at creation) and on the flux history, so it is rebuilt here, at once, and its size printed.
 
         Args:
             flux_history (FluxHistory or None): New flux history; None means a baseline-only history.
@@ -381,7 +428,6 @@ class Paleodetector:
             )
         self.flux_history = flux_history
         self._time_grid_cache = None
-        self._annealing_cache = {}
         grid = self._master_time_grid()
         if self.verbose > 0:
             info = self._time_grid_info
@@ -426,9 +472,10 @@ class Paleodetector:
                     "  (no StdRock depth table: not computable)" if species in COMPUTABLE_SPECIES else
                     "  (runs found, calculation not implemented yet)")
             lines.append(f"  {species:<10} energy from {e[0]:.4g} to {e[-2]:.4g} GeV in {info['n_files']} steps{note}")
-            for lo, hi in info['gaps']:
-                lines.append(f"  {'':<10} warning: no file between {lo:.4g} and {hi:.4g} GeV "
-                             f"(the {lo:.4g} GeV run is used for the whole step)")
+            if self.verbose > 1 and info['gaps']:    
+                for lo, hi in info['gaps']:
+                    lines.append(f"  {'':<10} warning: no file between {lo:.4g} and {hi:.4g} GeV "
+                                f"(the {lo:.4g} GeV run is used for the whole step)")
         for derived, product in DERIVED_SPECIES.items():
             if derived in self.available_species():
                 sources = [src for src in SECONDARY_SOURCES if self._stdrock_dir(src) is not None]
@@ -449,13 +496,18 @@ class Paleodetector:
         return out
 
 
-    def _energy_edges(self, species, e_range=None):
-        """Primary-energy bin edges of a species, optionally restricted to a range.
+    def _energy_edges(self, species, e_range=None, edges=None):
+        """Primary-energy bin edges of a species: the given edges, or its Geant4 run grid restricted to a range.
+
+        The single place where the energy bins of a computation are decided; used by every integration path
+        (cosmic-ray primaries and secondaries, radiogenic neutrons, neutrinos) and by the recoil converters to list
+        the fragments.
 
         Args:
             species (str): Species ('mu-', 'mu+', 'neutron', 'secondary_neutron', ...).
             e_range (tuple[float, float], optional): (E_min, E_max) [GeV]. The bins lying entirely inside it are
-                kept. Defaults to None (all the files of the species).
+                kept. Ignored if edges is given. Defaults to None (all the files of the species).
+            edges (array_like, optional): Explicit bin edges [GeV], returned as they are. Defaults to None.
 
         Returns:
             np.ndarray: Bin edges [GeV].
@@ -463,6 +515,8 @@ class Paleodetector:
         Raises:
             ValueError: If the species has no runs, or e_range is outside the available range or contains no bin.
         """
+        if edges is not None:
+            return np.asarray(edges, dtype=float)
         source = DERIVED_SPECIES.get(species, species)
         if source not in self.energy_bins:
             raise ValueError(f"No Geant4 runs of '{source}' for {self.name}; available: {list(self.energy_bins)}.")
@@ -559,106 +613,6 @@ class Paleodetector:
         return np.unique(np.concatenate([[t0, t1], grid[(grid > t0) & (grid < t1)]]))
 
 
-    def _annealing_ratio(self, t_kyr, annealing):
-        """Reduced length r today of tracks formed at the given local times.
-
-        Args:
-            t_kyr (array_like): Formation times [kyr].
-            annealing (float or dict): A number (same r for all formation times), or a dict: {'law': 'table',
-                't_kyr': [...], 'r': [...]} (r at the given formation times, linear in between, constant outside),
-                or a law and a geotherm (see _annealing_law, _annealing_from_law), computed once on the master
-                grid and cached until the flux history changes; other times are computed directly.
-
-        Returns:
-            np.ndarray: r, shape (len(t_kyr),).
-        """
-        t_kyr = np.atleast_1d(np.asarray(t_kyr, dtype=float))
-        if not isinstance(annealing, dict):
-            return np.full(t_kyr.shape, float(annealing))
-        if annealing.get('law') == 'table':
-            nodes, r = np.asarray(annealing['t_kyr'], dtype=float), np.asarray(annealing['r'], dtype=float)
-            order = np.argsort(nodes)
-            return np.interp(t_kyr, nodes[order], r[order])
-        key = repr(sorted(annealing.items()))
-        if key not in self._annealing_cache:
-            grid = self._master_time_grid()
-            self._annealing_cache[key] = (grid, self._annealing_from_law(grid, annealing))
-        grid, r_grid = self._annealing_cache[key]
-        idx = np.clip(np.searchsorted(grid, t_kyr), 0, grid.size - 1)
-        on_grid = grid[idx] == t_kyr
-        r = np.empty(t_kyr.shape)
-        r[on_grid] = r_grid[idx[on_grid]]
-        if not on_grid.all():                     # e.g. window ends: followed exactly, not interpolated
-            r[~on_grid] = self._annealing_from_law(t_kyr[~on_grid], annealing)
-        return r
-
-
-    def _temperature_K(self, t_kyr, T_surface_C, gradient_C_per_km, rock_density_g_cm3):
-        """Sample temperature [K] at local times: depth [m] = overburden [m.w.e.] / rock density, linear geotherm."""
-        depth_m = np.asarray(self._overburden_interpolator(np.asarray(t_kyr, dtype=float))) / rock_density_g_cm3
-        return 273.15 + T_surface_C + gradient_C_per_km * depth_m / 1000.0
-
-
-    def _annealing_from_law(self, t_form_kyr, params):
-        """r today of tracks formed at t_form_kyr, from an isothermal law and the temperature history.
-
-        Temperature: from the overburden history and a linear geotherm (params T_surface_C, gradient_C_per_km,
-        rock_density_g_cm3; defaults 15 C, 25 C/km, 2.16 g/cm^3; a single density converts m.w.e. to metres).
-        Each track is followed from its formation to the present (total_age_kyr), whatever exposure window it was
-        formed in, with the equivalent-time method: at every step of the history, its current r is turned into
-        the time the law needs to reach it at the step's temperature, the step is added and the law gives the new
-        r. The history grid is the master time grid (_master_time_grid) plus the formation times.
-
-        Args:
-            t_form_kyr (np.ndarray): Formation times [kyr].
-            params (dict): Law and constants (see _annealing_law) and the geotherm keys above.
-
-        Returns:
-            np.ndarray: r, shape (len(t_form_kyr),).
-        """
-        p = {**_ANNEALING_GEOTHERM_DEFAULTS, **params}
-        r_iso, t_iso = _annealing_law(p)
-        t_now = float(self.total_age_kyr)
-        t_form = np.clip(np.asarray(t_form_kyr, dtype=float), 0.0, t_now)
-        edges = np.union1d(self._master_time_grid(), t_form)
-        T_mid = self._temperature_K(0.5 * (edges[1:] + edges[:-1]), p['T_surface_C'], p['gradient_C_per_km'],
-                                    p['rock_density_g_cm3'])
-        dt = np.diff(edges)
-        first_step = np.searchsorted(edges, t_form)          # step that starts at each formation time
-        r = np.ones(t_form.shape)
-        for j in range(dt.size):                             # tracks formed before step j anneal through it
-            active = first_step <= j
-            if not np.any(active):
-                continue
-            r_now = r[active]
-            t_eq = np.where(r_now >= _R_FRESH, 0.0, t_iso(r_now, T_mid[j]))
-            r[active] = np.minimum(r_now, r_iso(t_eq + dt[j], T_mid[j]))
-        return r
-
-
-    def _age_integrated(self, x_grid, density, annealing=None, annealing_r_min=0.0):
-        """Tracks accumulated over the sample age from a source constant in time (fission, radiogenic neutrons).
-
-        Without annealing this is density * total_age_kyr. Otherwise the tracks formed at each time of the master
-        grid are shortened by their r (see _annealing_ratio) and the result is integrated over the age.
-
-        Args:
-            x_grid (np.ndarray): Track-length bin edges [nm].
-            density (np.ndarray): Rate per bin of x_grid [tracks per kyr per nm], shape (len(x_grid) - 1,).
-            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
-
-        Returns:
-            np.ndarray: Accumulated density [tracks per nm], shape (len(x_grid) - 1,).
-        """
-        density = np.asarray(density, dtype=float)
-        if annealing is None:
-            return density * self.total_age_kyr
-        t = self._master_time_grid()
-        rows = np.broadcast_to(density, (t.size, density.size))
-        rows = _shorten_tracks(rows, x_grid, self._annealing_ratio(t, annealing), annealing_r_min)
-        return np.trapezoid(rows, t, axis=0)
-
-
     def _exposure_window(self, exposure_window_kyr):
         """[start, end] of an exposure window [kyr]: None means the whole age, a number w means [0, w]."""
         if exposure_window_kyr is None:
@@ -666,11 +620,6 @@ class Paleodetector:
         if isinstance(exposure_window_kyr, (int, float)):
             exposure_window_kyr = [0, exposure_window_kyr]
         return [float(exposure_window_kyr[0]), float(exposure_window_kyr[1])]
-
-
-    def _resolve_energy_bins(self, energy_bins_gev, species):
-        """The given energy bins, or all the bins of the species if None."""
-        return self._energy_edges(species) if energy_bins_gev is None else np.asarray(energy_bins_gev, dtype=float)
 
 
     def _interpolate_overburden_history(self, overburden_history=None):
@@ -780,7 +729,7 @@ class Paleodetector:
         """Spontaneous-fission rate of the mineral.
 
         Single source for both fission branches: the fragment tracks
-        (calculate_fission_spectrum) and the SF neutrons (_radiogenic_spectrum).
+        (_fission_track_density, _fission_fragment_recoils) and the SF neutrons (_radiogenic_spectrum).
 
         Returns:
             float: Fissions per g of mineral per kyr,
@@ -842,270 +791,67 @@ class Paleodetector:
         return interpolator
 
 
-    def _process_background_neutron_geant4_data(self, background_type, energy_bins_gev=None, total_simulated_particles=1e4):
-        """Recoil spectrum induced by radiogenic neutrons.
+    def _radiogenic_neutron_recoils(self, source, energy_bins_gev=None, total_simulated_particles=1e4):
+        """Recoils made in the mineral by the neutrons of one radiogenic source, constant in time.
 
-        The neutrons are produced inside the mineral, so every recoil they cause is
-        counted (infinite homogeneous medium): for each energy bin, the recoils per
-        simulated neutron are weighted by the number of neutrons emitted in that bin.
+        The neutrons are emitted inside the mineral, so every recoil they cause is counted (infinite homogeneous
+        medium): the recoils per neutron of the mineral's neutron run at the lower edge of each energy cell are
+        weighted by the neutrons emitted in the cell (emission spectrum integrated with the trapezoidal rule on 50
+        points). Called by integrate_radiogenic.
 
         Args:
-            background_type (str): 'fission_n' (spontaneous fission) or 'alpha_n'.
-            energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            total_simulated_particles (float, optional): Primaries per Geant4 run.
-                Defaults to 1e4.
+            source (str): 'fission_n' (U-238 spontaneous-fission neutrons, _radiogenic_spectrum) or 'alpha_n'
+                ((alpha,n) neutrons, _alpha_n_spectrum).
+            energy_bins_gev (np.ndarray, optional): Neutron energy cell edges [GeV]. Defaults to None (all the
+                neutron runs of the mineral).
+            total_simulated_particles (float, optional): Neutrons per Geant4 run. Defaults to 1e4.
 
         Returns:
-            dict: 'Er_bins' (recoil energy edges [MeV]) and, for each fragment,
-            dR/dEr [recoils per g per kyr per MeV].
+            dict: Recoil spectra (_recoil_spectra), constant in time.
 
         Raises:
-            ValueError: If background_type is unknown.
+            ValueError: If source is not a neutron source.
         """
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
-
-
-        if background_type == 'fission_n':
-            flux_interpolator = self.radiogenic_spectrum
-        elif background_type == 'alpha_n':
-            flux_interpolator = self.alpha_n_spectrum
-        else:
-            raise ValueError(f"Unknown background_type '{background_type}' "
-                             "(expected 'fission_n' or 'alpha_n').")
-
-        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], 'neutron')
-
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, "neutron")
-
-        all_recoil_spectra = {}
-
-        fragment_spectra = {frag: np.zeros(len(RECOIL_ENERGY_BINS_MEV) - 1) for frag in all_fragments}
-
-        for i in range(len(energy_bins_gev) - 1):
-            e_min = energy_bins_gev[i]
-            e_max = energy_bins_gev[i+1]
-
-            N_E = 50
-            e_vals = np.linspace(e_min, e_max, N_E)
-
-            flux_grid = flux_interpolator(e_vals)
-
-            weight = np.trapezoid(flux_grid, e_vals)
-
-            filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_min:.6f}.txt")
-            if not os.path.exists(filepath): continue
-
-            try:
-                df = pd.read_csv(filepath, sep=r'\s+', header=None, usecols=[0, 2],
-                                names=['name', 'rec_e'], dtype={'name': str, 'rec_e': float})
-                names = normalize_fragment_names(df['name'].values)
-                rec_energies = df['rec_e'].values
-            except pd.errors.EmptyDataError:
+        emission = {'fission_n': self.radiogenic_spectrum, 'alpha_n': self.alpha_n_spectrum}.get(source)
+        if emission is None:
+            raise ValueError(f"Unknown radiogenic neutron source '{source}' (expected 'fission_n' or 'alpha_n').")
+        edges = self._energy_edges('neutron', edges=energy_bins_gev)
+        run_dir = os.path.join(self.data_path, "Geant4_data", self.name, "neutron")
+        fragments = {}
+        for e_lo, e_hi in zip(edges[:-1], edges[1:]):
+            hist = _mineral_run_histograms(os.path.join(run_dir, f"outNuclei_{e_lo:.6f}.txt"))
+            if hist is None:
                 continue
-
-            valid_mask = np.isin(names, list(fragment_spectra.keys()))
-            valid_names = names[valid_mask]
-            valid_rec = rec_energies[valid_mask]
-
-            unique_frags = np.unique(valid_names)
-
-            for frag in unique_frags:
-                frag_mask = (valid_names == frag)
-                frag_rec_energies = valid_rec[frag_mask]
-
-                counts, _ = np.histogram(frag_rec_energies, bins=RECOIL_ENERGY_BINS_MEV)
-                fragment_spectra[frag] += counts * weight
-
-        all_recoil_spectra.update(fragment_spectra)
-
-        bin_widths_mev = np.diff(RECOIL_ENERGY_BINS_MEV)
-        norm_factor = (bin_widths_mev * total_simulated_particles * KYR_PER_SECOND)
-
-        normalized_spectra = {}
-        for name, spectrum in all_recoil_spectra.items():
-            normalized_spectra[name] = np.divide(spectrum, norm_factor, out=np.zeros_like(spectrum), where=norm_factor!=0)
-
-        return {
-            'Er_bins': RECOIL_ENERGY_BINS_MEV,
-            **normalized_spectra,
-        }
+            e_vals = np.linspace(e_lo, e_hi, 50)
+            weight = np.trapezoid(emission(e_vals), e_vals)
+            for frag, counts in sorted(hist['all'].items()):
+                _accumulate_into(fragments, frag, counts * weight)
+        norm = total_simulated_particles * KYR_PER_SECOND
+        return _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragments.items()})
 
 
-    def calculate_background_neutron_spectrum(self,
-        x_bins=None,
-        energy_bins_gev=None,
-        background_types=('fission_n', 'alpha_n'),
-        total_simulated_particles=1e4,
-        nucleus=DEFAULT_TRACK_SUM,
-        ):
-        """Track-length rate from radiogenic neutrons.
+    def _fission_fragments(self):
+        """Kinetic energies of the two fragments of each U-238 spontaneous-fission event of U238.dat.
 
-        Args:
-            x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
-                None (DEFAULT_INTEGRATION_X_BINS_NM).
-            energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            background_types (tuple[str], optional): Sources to include.
-                Defaults to ('fission_n', 'alpha_n').
-            total_simulated_particles (float, optional): Primaries per Geant4 run.
-                Defaults to 1e4.
-            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key.
-                Defaults to 'total_no_light_ions'.
+        Two-body kinematics with masses from BindingEne.txt, fragments taken before neutron emission (A1 + A2 = 238;
+        a warning is printed otherwise). Events with a fragment missing from BindingEne.txt are skipped (warning).
+        Called by _fission_track_density and _fission_fragment_recoils, so both observables use the same events.
 
         Returns:
-            np.ndarray or dict: dR/dx summed over sources [tracks per mg per kyr per nm] (a dict of the track
-            groups and both sums for nucleus='groups').
-        """
-        x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
-
-        x_mids = x_bins[:-1] + np.diff(x_bins) / 2.0
-
-        sum_drdx = np.zeros_like(x_mids)
-        if nucleus == TRACK_GROUPS_KEY:
-            sum_drdx = {k: np.zeros_like(x_mids) for k in (*TRACK_GROUPS, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)}
-        found = False
-
-        for background_type in background_types:
-            if self.verbose > 0:
-                print(f"Processing background neutron tracks from {background_type}")
-
-            recoil_data = self._process_background_neutron_geant4_data(background_type, energy_bins_gev, total_simulated_particles)
-
-            drdx = self._convert_recoil_to_track_spectrum(recoil_data, x_bins=x_bins, energy_bins_gev=energy_bins_gev, species='neutron')
-
-            if nucleus == TRACK_GROUPS_KEY:
-                for k in sum_drdx:
-                    sum_drdx[k] += drdx[k]
-                found = True
-            elif nucleus in drdx:                                    # a fragment may be absent from one source
-                sum_drdx += drdx[nucleus]
-                found = True
-
-        if not found:
-            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, '{TRACK_GROUPS_KEY}' or a "
-                             "fragment key.")
-        return sum_drdx
-
-
-    def integrate_background_neutron_spectrum(
-        self,
-        x_bins=None,
-        energy_bins_gev=None,
-        background_types=('fission_n', 'alpha_n'),
-        total_simulated_particles=1e4,
-        x_grid=TRACK_LENGTH_BINS_NM,
-        nucleus=DEFAULT_TRACK_SUM,
-        annealing=None,
-        annealing_r_min=0.0,
-        ):
-        """Track counts from radiogenic neutrons over the sample age.
-
-        Args:
-            x_bins (np.ndarray, optional): Output track-length bin edges [nm].
-                Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
-            energy_bins_gev (np.ndarray, optional): Neutron energy bin edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            background_types (tuple[str], optional): Sources to include.
-                Defaults to ('fission_n', 'alpha_n').
-            total_simulated_particles (float, optional): Primaries per Geant4 run.
-                Defaults to 1e4.
-            x_grid (np.ndarray, optional): Fine track-length grid used for the
-                calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
-            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key.
-                Defaults to 'total_no_light_ions'.
-            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
-                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
-                (proportional shortening, as in fission-track annealing models). A number (same r for every
-                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
-                times, linear in between, constant outside), or a law with a geotherm, e.g.
-                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
-                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
-                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
-                track is followed from its formation to the present through the temperature given by the
-                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
-            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
-                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
-
-        Returns:
-            tuple[np.ndarray, np.ndarray]: x_bins, and tracks per mg in each bin
-            accumulated over total_age_kyr (after annealing, if given).
-        """
-        x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, 'neutron')
-
-        sum_drdx = self.calculate_background_neutron_spectrum(
-            x_grid,
-            energy_bins_gev,
-            background_types,
-            total_simulated_particles,
-            nucleus=nucleus,
-            )
-
-        total_tracks_g = _map_track_result(
-            lambda d: _rebin_density(self._age_integrated(x_grid, d, annealing, annealing_r_min), x_grid, x_bins),
-            sum_drdx,
-        )
-
-        return x_bins, total_tracks_g
-
-    def calculate_fission_spectrum(self, x_bins=TRACK_LENGTH_BINS_NM):
-        """Track-length rate from U-238 spontaneous fission.
-
-        For each fission event in U238.dat, the kinetic energies of the two fragments
-        follow from two-body kinematics with masses from BindingEne.txt; each energy
-        is converted to a range with the mineral's dE/dx tables and the track length
-        is the sum of the two ranges. The fragments are taken before neutron
-        emission (A1 + A2 = 238; a warning is printed otherwise), and the rate is
-        _fission_rate_per_g_kyr, the same as for the SF neutrons.
-
-        Args:
-            x_bins (np.ndarray, optional): Track-length bin edges [nm].
-                Defaults to TRACK_LENGTH_BINS_NM.
-
-        Returns:
-            np.ndarray: dR/dx [tracks per g per kyr per nm].
+            list[tuple]: (z1, a1, Ek1_MeV, z2, a2, Ek2_MeV) of each event used.
 
         Raises:
             ValueError: If no event has binding energies for both fragments.
         """
-        if self.verbose>0:
-            print("Calculating spontaneous fission background...")
-
         Z_fission, A_fission, _ = self._load_nuclear_data("U238.dat")
         Z_bind, A_bind, B_bind = self._load_nuclear_data("BindingEne.txt")
         binding_map = {(int(z), int(a)): b for z, a, b in zip(Z_bind, A_bind, B_bind)}
-
-        fission_rate_factor = self._fission_rate_per_g_kyr()
-
-        range_dir = os.path.join(self.data_path, "Geant4_data", self.name, "Range")
         M0 = 92 * PROTON_MASS_MEV + (238 - 92) * NEUTRON_MASS_MEV - B0_U238 * 238
-        range_cache = {}
 
-        def energy_to_range_nm(z, a):
-            """Range-energy interpolator of fragment (z, a), loaded once.
-
-            Args:
-                z (int): Atomic number.
-                a (int): Mass number.
-
-            Returns:
-                scipy.interpolate.interp1d: Kinetic energy [MeV] -> CSDA range [nm].
-            """
-            if (z, a) not in range_cache:
-                e_mev, _, _, length_um = np.loadtxt(
-                    os.path.join(range_dir, f"DEDX_Z{z}_A{a}.txt"), skiprows=1, unpack=True
-                )
-                range_cache[(z, a)] = interp1d(e_mev, length_um * 1e3,
-                                               bounds_error=False, fill_value=0.0)
-            return range_cache[(z, a)]
-
-        total_track_lengths_nm = []
+        events = []
         num_events = len(Z_fission) // 3
         n_skipped = 0
         n_not_238 = 0
-
         for i in range(num_events):
             z1, a1 = int(Z_fission[3*i + 1]), int(A_fission[3*i + 1])
             z2, a2 = int(Z_fission[3*i + 2]), int(A_fission[3*i + 2])
@@ -1124,13 +870,9 @@ class Paleodetector:
 
             Ek1_MeV = (M0**2 + m1**2 - m2**2) / (2 * M0) - m1
             Ek2_MeV = (M0**2 + m2**2 - m1**2) / (2 * M0) - m2
+            events.append((z1, a1, Ek1_MeV, z2, a2, Ek2_MeV))
 
-            track1 = energy_to_range_nm(z1, a1)(Ek1_MeV)
-            track2 = energy_to_range_nm(z2, a2)(Ek2_MeV)
-            total_track_lengths_nm.append(track1 + track2)
-
-        n_used = num_events - n_skipped
-        if n_used == 0:
+        if not events:
             raise ValueError("No fission event with binding energies for both fragments.")
         if n_not_238 and self.verbose > 0:
             print(f"Warning: {n_not_238}/{num_events} fission events with A1 + A2 != 238; "
@@ -1138,67 +880,137 @@ class Paleodetector:
         if n_skipped and self.verbose > 0:
             print(f"Warning: {n_skipped}/{num_events} fission events skipped "
                   "(fragment missing from BindingEne.txt).")
-
-        counts, bin_edges = np.histogram(total_track_lengths_nm, bins=x_bins)
-        bin_widths = np.diff(bin_edges)
-
-        # normalised to the events actually used, so skipped events do not count as zero-length tracks
-        dRdx = (counts / n_used) * fission_rate_factor / bin_widths
-
-        return dRdx
+        return events
 
 
-    def integrate_fission_spectrum(self, x_bins=None, x_grid=TRACK_LENGTH_BINS_NM, annealing=None,
-                                  annealing_r_min=0.0, nucleus=DEFAULT_TRACK_SUM, fission_group='heavy'):
-        """Track counts from spontaneous fission over the sample age.
+    def _fission_track_density(self, x_grid, fission_key='heavier'):
+        """Track-length density of U-238 spontaneous fission: one track per fission, filed under one key.
+
+        The two fragments fly apart back to back from the same point, so a fission makes a single track whose length
+        is the sum of the two fragment ranges (kinetic energies from _fission_fragments, CSDA ranges from the
+        mineral's range tables). This is why fission tracks do not go through _recoils_to_track_density, which makes
+        one track per recoil (it would give two half-length tracks per fission). The rate is _fission_rate_per_g_kyr,
+        the same as for the SF neutrons. Called by integrate_radiogenic (observable='tracks').
 
         Args:
-            x_bins (np.ndarray, optional): Output track-length bin edges [nm].
-                Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
-            x_grid (np.ndarray, optional): Fine track-length grid used for the
-                calculation [nm]. Defaults to TRACK_LENGTH_BINS_NM.
-            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
-                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
-                (proportional shortening, as in fission-track annealing models). A number (same r for every
-                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
-                times, linear in between, constant outside), or a law with a geotherm, e.g.
-                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
-                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
-                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
-                track is followed from its formation to the present through the temperature given by the
-                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
-            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
-                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
-
-            nucleus (str, optional): 'total_no_light_ions' or 'total' (the same array: fission fragments are never
-                light) or 'groups' (dict: every track in fission_group, the other groups zero, both sums).
-                Defaults to 'total_no_light_ions'.
-            fission_group (str, optional): Track group of the fission fragments with nucleus='groups'. Defaults
-                to 'heavy'.
+            x_grid (np.ndarray): Fine track-length grid [nm].
+            fission_key (str, optional): Key of each track: 'heavier' (fragment with the larger A; the first of
+                U238.dat if equal), 'lighter', or 'pair' ('<heavier>+<lighter>', e.g. 'Sn133+Mo105'). Defaults to
+                'heavier'.
 
         Returns:
-            tuple[np.ndarray, np.ndarray or dict]: x_bins, and tracks per mg in each bin
-            accumulated over total_age_kyr (after annealing, if given).
+            dict: {key: dR/dx [tracks per mg per kyr per nm] on x_grid}.
+
+        Raises:
+            ValueError: If fission_key is unknown.
         """
-        x_bins = _resolve_x_bins(x_bins)
+        if fission_key not in FISSION_KEYS:
+            raise ValueError(f"fission_key must be one of {FISSION_KEYS}, got {fission_key!r}.")
+        events = self._fission_fragments()
+        range_dir = os.path.join(self.data_path, "Geant4_data", self.name, "Range")
 
-        drdx = self._age_integrated(x_grid, self.calculate_fission_spectrum(x_grid), annealing, annealing_r_min)
+        range_of = {}
 
-        total_tracks_g = _rebin_density(drdx, x_grid, x_bins)
+        def range_nm(z, a, e_mev):
+            if (z, a) not in range_of:
+                e_tab, _, _, length_um = _range_table(os.path.join(range_dir, f"DEDX_Z{z}_A{a}.txt"))
+                range_of[(z, a)] = interp1d(e_tab, length_um * 1e3, bounds_error=False, fill_value=0.0)
+            return float(range_of[(z, a)](e_mev))
 
-        total_tracks_mg = total_tracks_g * 1e-3
+        lengths, keys = [], []
+        for z1, a1, e1, z2, a2, e2 in events:
+            lengths.append(range_nm(z1, a1, e1) + range_nm(z2, a2, e2))
+            heavy, light = ((z1, a1), (z2, a2)) if a1 >= a2 else ((z2, a2), (z1, a1))
+            heavy, light = f"{_element_symbol(heavy[0])}{heavy[1]}", f"{_element_symbol(light[0])}{light[1]}"
+            keys.append({'heavier': heavy, 'lighter': light, 'pair': f"{heavy}+{light}"}[fission_key])
+        lengths, keys = np.asarray(lengths), np.asarray(keys)
+        per_track = self._fission_rate_per_g_kyr() / len(events) * 1e-3          # per mg per kyr
+        widths = np.diff(x_grid)
+        return {str(k): np.histogram(lengths[keys == k], bins=x_grid)[0] * per_track / widths
+                for k in np.unique(keys)}
 
-        if nucleus == TRACK_GROUPS_KEY:
-            if fission_group not in TRACK_GROUPS:
-                raise ValueError(f"fission_group must be one of {TRACK_GROUPS}, got {fission_group!r}.")
-            out = {g: (total_tracks_mg if g == fission_group else np.zeros_like(total_tracks_mg))
-                   for g in TRACK_GROUPS}
-            out[TOTAL_ALL_FRAGMENTS] = total_tracks_mg
-            out[TOTAL_NO_LIGHT_IONS] = total_tracks_mg if fission_group != 'light' else np.zeros_like(total_tracks_mg)
-            return x_bins, out
-        if nucleus not in TRACK_SUMS:
-            raise ValueError(f"nucleus for fission must be one of {TRACK_SUMS} or '{TRACK_GROUPS_KEY}'.")
-        return x_bins, total_tracks_mg
+
+    def _fission_fragment_recoils(self):
+        """Recoils of the U-238 spontaneous-fission fragments: two per fission, each under its own nuclide.
+
+        Kinetic energies from _fission_fragments, at the rate _fission_rate_per_g_kyr per fission. Called by
+        integrate_radiogenic (observable='recoil_energy'; for tracks see _fission_track_density).
+
+        Returns:
+            dict: Recoil spectra (_recoil_spectra), constant in time.
+        """
+        events = self._fission_fragments()
+        per_fragment = self._fission_rate_per_g_kyr() / len(events)
+        energies = {}
+        for z1, a1, e1, z2, a2, e2 in events:
+            for z, a, e in ((z1, a1, e1), (z2, a2, e2)):
+                energies.setdefault(f"{_element_symbol(z)}{a}", []).append(e)
+        return _recoil_spectra({name: np.histogram(e, bins=RECOIL_ENERGY_BINS_MEV)[0] * per_fragment
+                                for name, e in sorted(energies.items())})
+
+
+    def integrate_radiogenic(
+        self, x_bins=None, sources=RADIOGENIC_SOURCES, energy_bins_gev=None, total_simulated_particles=1e4,
+        x_grid=TRACK_LENGTH_BINS_NM, nucleus=DEFAULT_TRACK_SUM, observable=OBSERVABLE_TRACKS,
+        fission_key='heavier', fission_group='heavy',
+    ):
+        """Track counts (or recoil counts per recoil-energy bin) from the radiogenic sources over the sample age.
+
+        The backgrounds of the uranium in the mineral, all constant in time (accumulated over the whole age, with no
+        exposure window), one entry each, as the species of integrate_all_particles:
+
+        * 'fission_fragments': U-238 spontaneous fission. Tracks: one per fission, the two fragment ranges summed
+          (_fission_track_density), filed under fission_key. Recoil energies: each fragment is a recoil (two per
+          fission) under its own nuclide (_fission_fragment_recoils). Every key is in fission_group.
+        * 'fission_n': recoils made by the spontaneous-fission neutrons (Watt spectrum, same fission rate).
+        * 'alpha_n': recoils made by the (alpha,n) neutrons.
+
+        Args:
+            x_bins (np.ndarray, optional): Output bin edges: track lengths [nm] (default DEFAULT_INTEGRATION_X_BINS_NM)
+                or recoil energies [MeV] (default RECOIL_ENERGY_BINS_MEV).
+            sources (tuple[str], optional): Sources to compute, from RADIOGENIC_SOURCES. Defaults to all three.
+            energy_bins_gev (np.ndarray, optional): Neutron energy cell edges [GeV] of the neutron sources. Defaults
+                to None (all the neutron runs).
+            total_simulated_particles (float, optional): Neutrons per Geant4 run. Defaults to 1e4.
+            x_grid (np.ndarray, optional): Fine track-length grid [nm] (ignored for recoil energies). Defaults to
+                TRACK_LENGTH_BINS_NM.
+            nucleus (str, optional): As in integrate_particle_signal_spectrum. A fragment key missing from a source
+                gives zeros for that source (an error only if no source has it). Defaults to 'total_no_light_ions'.
+            observable (str, optional): 'tracks' or 'recoil_energy'. Defaults to 'tracks'.
+            fission_key (str, optional): Key of the fission tracks: 'heavier', 'lighter' or 'pair' (see
+                _fission_track_density). Not used for recoil energies. Defaults to 'heavier'.
+            fission_group (str, optional): Track group of every fission fragment. Defaults to 'heavy'.
+
+        Returns:
+            tuple[np.ndarray, dict]: x_bins, and {source: tracks (or recoils) per mg in each bin, ..., 'total': sum}.
+
+        Raises:
+            ValueError: If a source, fission_key or fission_group is unknown, or nucleus is in no source.
+        """
+        x_bins, grid = _output_axes(observable, x_bins, x_grid)
+        unknown = [src for src in sources if src not in RADIOGENIC_SOURCES]
+        if unknown:
+            raise ValueError(f"Unknown radiogenic sources {unknown} (use {RADIOGENIC_SOURCES}).")
+        if fission_group not in TRACK_GROUPS:
+            raise ValueError(f"fission_group must be one of {TRACK_GROUPS}, got {fission_group!r}.")
+
+        results = {}
+        for source in sources:
+            if source == 'fission_fragments':
+                density = (self._fission_track_density(grid, fission_key) if observable == OBSERVABLE_TRACKS else
+                           self._recoil_density(self._fission_fragment_recoils(), observable, grid, source))
+                group = fission_group
+            else:
+                spectra = self._radiogenic_neutron_recoils(source, energy_bins_gev, total_simulated_particles)
+                density, group = self._recoil_density(spectra, observable, grid, source), None
+            results[source] = self._density_to_counts(density, grid, x_bins, None, 'all', source, group)
+        results['total'] = _combine_track_results(results.values())
+
+        self._select_nucleus(results['total'], nucleus, 'the radiogenic sources')      # raises if in no source
+        zeros = np.zeros(len(x_bins) - 1)
+        return x_bins, {k: (self._select_nucleus(r, nucleus, k)
+                            if nucleus in r or nucleus in ('all', TRACK_GROUPS_KEY) else zeros)
+                        for k, r in results.items()}
 
 
     def _geant4_geometry(self, data_dir):
@@ -1235,20 +1047,6 @@ class Paleodetector:
 
         self._geometry_cache[data_dir] = geo
         return geo
-
-
-    def _geant4_depth_reference_m(self, data_dir):
-        """z coordinate of the target top face of a Geant4 output directory.
-
-        Depth below the top face is depth_reference_z_m - z_mm * 1e-3.
-
-        Args:
-            data_dir (str): Geant4 output directory.
-
-        Returns:
-            float: z of the target top face [m].
-        """
-        return self._geant4_geometry(data_dir)["depth_reference_z_m"]
 
 
     def _load_depth_interpolators(self, species='mu-'):
@@ -1811,35 +1609,14 @@ class Paleodetector:
         return Y.reshape(n_t, n_c, n_b, n_k), delta, offsets
 
 
-    def _get_all_fragments(self, energy_names_gev, species='mu-'):
-        """Lists the fragments present in a mineral's Geant4 output.
-
-        Args:
-            energy_names_gev (array_like): Energies [GeV] of the files to scan.
-            species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
-
-        Returns:
-            list[str]: Sorted fragment keys (see normalize_fragment_name).
-        """
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
-        all_fragments = set()
-
-        for energy_name in energy_names_gev:
-            filepath = os.path.join(geant4_input_dir, f"outNuclei_{energy_name:.6f}.txt")
-            hist = _mineral_run_histograms(filepath)
-            if hist is not None:
-                all_fragments.update(hist['all'])
-        return sorted(list(all_fragments))
-
-
-    def _process_geant4_data(
+    def _primary_recoils(
         self,
         t_kyr_array,
         energy_bins_gev=None,
         total_simulated_particles=1e4,
         species='mu-',
     ):
-        """Recoil spectra in the sample slab from cosmic-ray primaries.
+        """Recoils in the sample slab made by one primary cosmic-ray species (mu-, mu+, neutron, proton).
 
         For each primary-energy bin, the flux is integrated over energy and zenith
         angle, weighted by the probability of an interaction in the slab
@@ -1848,7 +1625,7 @@ class Paleodetector:
         For mu-, captures use a single energy-independent capture spectrum (averaged
         over runs with E0 <= CAPTURE_SPECTRUM_MAX_E0_GEV) times the total stopping
         probability in the slab. All timesteps are processed at once; each file is
-        read once.
+        read once. Called by integrate_particle_signal_spectrum (also through integrate_all_particles).
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
@@ -1859,15 +1636,12 @@ class Paleodetector:
             species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
 
         Returns:
-            dict: 't_kyr' (T,), 'depth_mwe' (T,), 'Er_bins' (recoil energy edges
-            [MeV]) and, for each fragment, dR/dEr [recoils per g per kyr per MeV],
-            shape (T, n_recoil_bins).
+            dict: Recoil spectra (see _recoil_spectra), shape (T, n_recoil_bins) per fragment.
 
         Raises:
             ValueError: If flux_history or the depth tables are not initialised.
         """
-        energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
-
+        energy_bins_gev = self._energy_edges(species, edges=energy_bins_gev)
         if self.flux_history is None:
             raise ValueError(
                 "flux_history not initialized: use set_flux_history() or an integrate_* function."
@@ -1885,18 +1659,12 @@ class Paleodetector:
         depth_mwe_array = self._overburden_interpolator(t_kyr_array)
         t_kyr_flux_array = self._flux_time_kyr(t_kyr_array)
 
-
-        all_fragments = self._get_all_fragments(energy_bins_gev[:-1], species)
         geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
-
-        n_recoil_bins = len(RECOIL_ENERGY_BINS_MEV) - 1
-        fragment_spectra = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
-
+        fragment_spectra = {}
         target_thickness_mwe = target_thickness_cm * 0.01 * self.config['density_g_cm3']
 
         if species == 'mu-':
-            capture_counts = {frag: np.zeros(n_recoil_bins) for frag in all_fragments}
-            per_file_peak = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
+            capture_counts, per_file_peak = {}, {}
             n_capture_files = 0
             weight_peak_total_t = np.zeros(n_t)
 
@@ -1951,53 +1719,33 @@ class Paleodetector:
                 if use_for_capture:
                     n_capture_files += 1
 
-            for frag in sorted(f for f in hist['all'] if f in fragment_spectra):
+            for frag in sorted(hist['all']):
                 if species == 'mu-':
                     counts_peak = hist['peak'][frag]
                     if counts_peak is not None:
-                        per_file_peak[frag] += np.outer(weight_peak_t, counts_peak)
+                        _accumulate_into(per_file_peak, frag, np.outer(weight_peak_t, counts_peak))
                         if use_for_capture:
-                            capture_counts[frag] += counts_peak
+                            _accumulate_into(capture_counts, frag, counts_peak)
 
                     counts_elastic = hist['elastic'][frag]
                     if counts_elastic is not None:
-                        fragment_spectra[frag] += np.outer(weight_elastic_t, counts_elastic)
+                        _accumulate_into(fragment_spectra, frag, np.outer(weight_elastic_t, counts_elastic))
                 else:
-                    fragment_spectra[frag] += np.outer(weight_elastic_t, hist['all'][frag])
+                    _accumulate_into(fragment_spectra, frag, np.outer(weight_elastic_t, hist['all'][frag]))
 
         if species == 'mu-':
             if n_capture_files > 0:
-                # mean capture counts per run (each run has total_simulated_particles muons)
-                for frag in all_fragments:
-                    fragment_spectra[frag] += np.outer(
-                        weight_peak_total_t, capture_counts[frag] / n_capture_files
-                    )
+                for frag, counts in capture_counts.items():
+                    _accumulate_into(fragment_spectra, frag, np.outer(weight_peak_total_t, counts / n_capture_files))
             else:
                 if self.verbose > 0:
                     print(f"Warning: no mu- run with E0 <= {CAPTURE_SPECTRUM_MAX_E0_GEV} GeV; "
                           "using the per-energy capture spectra.")
-                for frag in all_fragments:
-                    fragment_spectra[frag] += per_file_peak[frag]
+                for frag, spectrum in per_file_peak.items():
+                    _accumulate_into(fragment_spectra, frag, spectrum)
 
-        bin_widths_mev = np.diff(RECOIL_ENERGY_BINS_MEV)
-        norm_factor = (
-            bin_widths_mev * target_thickness_cm * self.config['density_g_cm3']
-            * total_simulated_particles * KYR_PER_SECOND
-        )
-
-        normalized_spectra = {}
-        for name, spectrum in fragment_spectra.items():
-            normalized_spectra[name] = np.divide(
-                spectrum, norm_factor[None, :], out=np.zeros_like(spectrum),
-                where=norm_factor[None, :] != 0,
-            )
-
-        return {
-            't_kyr': t_kyr_array,
-            'depth_mwe': depth_mwe_array,
-            'Er_bins': RECOIL_ENERGY_BINS_MEV,
-            **normalized_spectra,
-        }
+        norm = target_thickness_cm * self.config['density_g_cm3'] * total_simulated_particles * KYR_PER_SECOND
+        return _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragment_spectra.items()}, t_kyr_array)
 
 
     def _secondary_products(self):
@@ -2046,11 +1794,13 @@ class Paleodetector:
         return grids, windows
 
 
-    def _process_secondary_geant4_data(
+    def _secondary_recoils(
         self, t_kyr_array, product_bins_gev=None,
         total_simulated_particles=1e4, secondary_sources=SECONDARY_SOURCES, energy_windows=None,
     ):
-        """Recoil spectra in the sample slab from the secondary neutrons and protons, all products at once.
+        """Recoils in the sample slab made by the atmospheric secondary neutrons and protons, all products at once.
+
+        Called by _integrate_secondary_species (one solve of the cascade for every secondary species requested).
 
         Products born in the window above the sample (see _secondary_yield, which follows all generations and
         cross-generations) travel along the primary's direction to the slab. For a product of type q born
@@ -2064,7 +1814,7 @@ class Paleodetector:
             w_m(t) = int dc sum_b Y[t, c, b, m] P_b(E_m, c),
 
         and the recoils per product of the mineral run of q at the lower edge E_m of each cell are applied with
-        the normalisation of _process_geant4_data.
+        the normalisation of _primary_recoils.
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
@@ -2077,7 +1827,7 @@ class Paleodetector:
                 (the cascade is unchanged). Defaults to None (all cells).
 
         Returns:
-            dict: {product: recoil data, same structure as _process_geant4_data}.
+            dict: {product: recoil spectra (see _recoil_spectra), shape (T, n_recoil_bins) per fragment}.
         """
         if product_bins_gev is None:
             product_bins_gev = self._secondary_grids()[0]
@@ -2089,7 +1839,6 @@ class Paleodetector:
         target_thickness_mwe = target_thickness_cm * 0.01 * rho
 
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
-        n_t = len(t_kyr_array)
         depth_mwe_array = np.atleast_1d(self._overburden_interpolator(t_kyr_array))
 
         c_vals = np.linspace(0.01, 1.0, 50)
@@ -2103,18 +1852,11 @@ class Paleodetector:
         z_d0 = np.broadcast_to(d0[None, :], (len(c_vals), n_b))
         z_tau = np.broadcast_to(tau[:, None], (len(c_vals), n_b))
 
-        bin_widths_mev = np.diff(RECOIL_ENERGY_BINS_MEV)
-        norm_factor = (
-            bin_widths_mev * target_thickness_cm * rho
-            * total_simulated_particles * KYR_PER_SECOND
-        )
-        n_recoil_bins = len(RECOIL_ENERGY_BINS_MEV) - 1
-
+        norm = target_thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
         out = {}
         for product, energy_bins_gev in product_bins_gev.items():
             n_e = len(energy_bins_gev) - 1
             e_cells = energy_bins_gev[:-1]
-            all_fragments = self._get_all_fragments(e_cells, species=product)
             geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
 
             # bin-averaged slab probability, shape (N_C, n_b, n_e)
@@ -2137,250 +1879,218 @@ class Paleodetector:
                 outside = (energy_bins_gev[:-1] * tol < lo) | (energy_bins_gev[1:] > hi * tol)
                 weight_t[:, outside] = 0.0
 
-            fragment_spectra = {frag: np.zeros((n_t, n_recoil_bins)) for frag in all_fragments}
+            fragment_spectra = {}
             for m in range(n_e):
-                filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_cells[m]:.6f}.txt")
-                hist = _mineral_run_histograms(filepath)
+                hist = _mineral_run_histograms(os.path.join(geant4_input_dir, f"outNuclei_{e_cells[m]:.6f}.txt"))
                 if hist is None:
                     continue
-                for frag in sorted(f for f in hist['all'] if f in fragment_spectra):
-                    fragment_spectra[frag] += np.outer(weight_t[:, m], hist['all'][frag])
-
-            normalized_spectra = {}
-            for name, spectrum in fragment_spectra.items():
-                normalized_spectra[name] = np.divide(
-                    spectrum, norm_factor[None, :], out=np.zeros_like(spectrum),
-                    where=norm_factor[None, :] != 0,
-                )
-            out[product] = {
-                't_kyr': t_kyr_array,
-                'depth_mwe': depth_mwe_array,
-                'Er_bins': RECOIL_ENERGY_BINS_MEV,
-                **normalized_spectra,
-            }
+                for frag in sorted(hist['all']):
+                    _accumulate_into(fragment_spectra, frag, np.outer(weight_t[:, m], hist['all'][frag]))
+            out[product] = _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragment_spectra.items()},
+                                           t_kyr_array)
         return out
 
-    def _report_missing_range_tables(self, recoil_data, er_bins, fragments, missing, species):
+    def _report_missing_range_tables(self, spectra, missing, label):
         """Warns, once per mineral and fragment, about recoils skipped for lack of a range table, with their share.
 
-        Purpose: _convert_recoil_to_track_spectrum skips fragments whose DEDX_Z<z>_A<a>.txt is not in
-        <mineral>/Range (export_all_stopping_powers only exports isotopes known to mendeleev, so unbound fragments
-        such as Be4 or He5, occasionally emitted by the Geant4 de-excitation models, have none). The share of the
-        recoils they carry tells whether that is harmless (a tiny fraction) or a real gap (a missing table of a common
-        nucleus, which would need export_all_stopping_powers again).
+        Called by _recoils_to_track_density, which skips fragments whose DEDX_Z<z>_A<a>.txt is not in <mineral>/Range
+        (export_all_stopping_powers only exports isotopes known to mendeleev, so unbound fragments such as Be4 or He5,
+        occasionally emitted by the Geant4 de-excitation models, have none). The share of the recoils they carry tells
+        whether that is harmless (a tiny fraction) or a real gap (a missing table of a common nucleus, which would
+        need export_all_stopping_powers again). The recoil-energy observable needs no table and keeps them.
         """
         reported = self.__dict__.setdefault('_missing_range_reported', set())
         new = [f for f in missing if f not in reported]
         if not new:
             return
         reported.update(new)
-        widths = np.diff(er_bins)
+        fragments = spectra['fragments']
 
         def n_recoils(f):
-            return float(np.sum(np.atleast_2d(recoil_data[f]).mean(axis=0) * widths))
+            return float(np.sum(np.atleast_2d(fragments[f]).mean(axis=0)))
 
-        total = sum(n_recoils(f) for f in fragments if f in recoil_data and f != 'neutron')
+        total = sum(n_recoils(f) for f in fragments)
         shares = ", ".join(f"{f} {100 * n_recoils(f) / total:.2g}%" if total > 0 else f for f in new)
-        print(f"Warning: {self.name}/Range has no table for {shares} of the {species} recoils; skipped "
+        print(f"Warning: {self.name}/Range has no table for {shares} of the {label} recoils; skipped "
               f"(export_all_stopping_powers exports only the isotopes known to mendeleev).")
 
-    def _convert_recoil_to_track_spectrum(self, recoil_data, x_bins=None, energy_bins_gev=None, species='mu-',
-                                          fragments=None):
-        """Converts recoil-energy spectra into track-length spectra.
 
-        For each fragment, dR/dx = dR/dEr(E(x)) * dE/dx(x), where E(x) inverts the
-        CSDA range of the mineral's dE/dx table and dE/dx is the total (electronic +
-        nuclear) stopping power. Neutrons are skipped.
+    def _recoils_to_track_density(self, spectra, x_grid, label):
+        """Track-length density of each recoiling fragment: one track per recoil. Called by _recoil_density.
+
+        For each fragment, dR/dx = dR/dEr(E(x)) * dE/dx(x), where E(x) inverts the CSDA range of the mineral's range
+        table of the fragment and dE/dx is the total (electronic + nuclear) stopping power, both from
+        <mineral>/Range/DEDX_Z<z>_A<a>.txt; dR/dEr is the recoil spectrum divided by the bin widths, interpolated
+        between bin centres. Fragments without a range table are skipped (_report_missing_range_tables).
 
         Args:
-            recoil_data (dict): Output of one of the _process_* methods; fragment
-                entries have shape (n_recoil_bins,) or (T, n_recoil_bins).
-            x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
-                None (DEFAULT_INTEGRATION_X_BINS_NM).
-            energy_bins_gev (np.ndarray, optional): Energy bin edges [GeV], used to
-                list the fragments. Defaults to None (all the Geant4 files of the species).
-            species (str, optional): Species of the Geant4 runs ('mu-', 'mu+',
-                'neutron', 'proton', 'secondary_neutron' or 'secondary_proton'). Defaults to 'mu-'.
-            fragments (list[str], optional): Fragments to convert. Defaults to None (those found in the Geant4 files
-                of the species; energy_bins_gev and species are then used only for this).
+            spectra (dict): Recoil spectra (_recoil_spectra).
+            x_grid (np.ndarray): Fine track-length grid [nm].
+            label (str): Source name, for the warning.
 
         Returns:
-            dict: dR/dx per fragment, the sums 'total' and 'total_no_light_ions' and one per track group
-            (TRACK_GROUPS, see set_track_groups) [tracks per mg per kyr per nm], shape (T, n_x), or (n_x,) if the
-            input was 1-D.
+            dict: {fragment: dR/dx [tracks per mg per kyr per nm] on x_grid}, shape (T, n_x), or (n_x,) for a constant
+            source.
         """
-        x_bins = _resolve_x_bins(x_bins)
+        er_bins = RECOIL_ENERGY_BINS_MEV
+        widths = np.diff(er_bins)
+        er_mid_mev = er_bins[:-1] + widths / 2.0
+        x_mid_nm = x_grid[:-1] + np.diff(x_grid) / 2.0
+        range_dir = os.path.join(self.data_path, "Geant4_data", self.name, "Range")
 
-        er_bins = recoil_data['Er_bins']
-        er_mid_mev = er_bins[:-1] + np.diff(er_bins) / 2.0
-
-        if fragments is None:
-            energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
-            tab_species = DERIVED_SPECIES.get(species, species)
-            all_fragments = self._get_all_fragments(energy_bins_gev[:-1], tab_species)
-        else:
-            all_fragments = sorted(fragments)
-
-        x_mid_nm = x_bins[:-1] + np.diff(x_bins) / 2.0
-
-        sample_frag = next((f for f in all_fragments if f in recoil_data and f != 'neutron'), None)
-
-        input_was_1d = sample_frag is not None and np.asarray(recoil_data[sample_frag]).ndim == 1
-
-        n_t = recoil_data[sample_frag].shape[0] if sample_frag is not None and recoil_data[sample_frag].ndim == 2 else 1
-
-        dRdx_by_nucleus = {}
-        dRdx_total = np.zeros((n_t, len(x_bins) - 1))
-        dRdx_no_light = np.zeros((n_t, len(x_bins) - 1))
-        dRdx_groups = {g: np.zeros((n_t, len(x_bins) - 1)) for g in TRACK_GROUPS}
-
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, "Range")
-        missing_tables = []
-
-        for nuclide_name in all_fragments:
-            if nuclide_name not in recoil_data or nuclide_name == 'neutron':
-                continue
-
-            dRdEr_mev = np.atleast_2d(recoil_data[nuclide_name])  # (T, n_recoil_bins)
-
-            dRdEr_interp = interp1d(
-                er_mid_mev, dRdEr_mev, axis=-1, bounds_error=False, fill_value=0.0
-            )
-
-            corr_nuclide_name = _LIGHT_ION_SYMBOLS.get(nuclide_name, nuclide_name)
-            nucleus_name = ''.join(filter(str.isalpha, corr_nuclide_name))
-            ion_z = _atomic_number(nucleus_name)
-            ion_a = int(''.join(filter(str.isdigit, corr_nuclide_name)))
-
-            filepath = os.path.join(geant4_input_dir, f"DEDX_Z{ion_z}_A{ion_a}.txt")
+        out, missing = {}, []
+        for name, counts in sorted(spectra['fragments'].items()):
+            symbol_a = _LIGHT_ION_SYMBOLS.get(name, name)
+            ion_z = _atomic_number(''.join(filter(str.isalpha, symbol_a)))
+            ion_a = int(''.join(filter(str.isdigit, symbol_a)))
+            filepath = os.path.join(range_dir, f"DEDX_Z{ion_z}_A{ion_a}.txt")
             if not os.path.exists(filepath):
-                missing_tables.append(nuclide_name)
+                missing.append(name)
                 continue
+            e_mev, dee_dx_mev_um, den_dx_mev_um, length_um = _range_table(filepath)
+            order = np.argsort(length_um)
+            e_at_x = np.interp(x_mid_nm, length_um[order] * 1e3, e_mev[order], left=0.0, right=0.0)
+            dedx_at_x = np.interp(x_mid_nm, length_um[order] * 1e3,
+                                  (dee_dx_mev_um[order] + den_dx_mev_um[order]) * 1e-3, left=0.0, right=0.0)
+            dRdEr = interp1d(er_mid_mev, np.asarray(counts, dtype=float) / widths, axis=-1, bounds_error=False,
+                             fill_value=0.0)
+            out[name] = dRdEr(e_at_x) * dedx_at_x * 1e-3                     # per g -> per mg
+        if missing and self.verbose > 0:
+            self._report_missing_range_tables(spectra, missing, label)
+        return out
 
-            e_MeV, dee_dx_mev_um, den_dx_mev_um, length_um = _range_table(filepath)
 
-            sorted_indices = np.argsort(length_um)
-            x_to_e_func = interp1d(length_um[sorted_indices] * 1e3, e_MeV[sorted_indices],
-                                    bounds_error=False, fill_value=0.0)
-            x_to_dedx_func = interp1d(length_um[sorted_indices] * 1e3,
-                                    (dee_dx_mev_um[sorted_indices] + den_dx_mev_um[sorted_indices]) * 1e-3,
-                                    bounds_error=False, fill_value=0.0)
+    def _recoil_density(self, spectra, observable, grid, label):
+        """Density of the observable for each recoiling fragment, the second step of every source.
 
-            e_at_x = x_to_e_func(x_mid_nm)
+        tracks: _recoils_to_track_density (one track per recoil). recoil_energy: the recoil spectrum per MeV, on its own
+        grid RECOIL_ENERGY_BINS_MEV. Called by _recoils_to_counts and integrate_radiogenic.
 
-            dRdx_nucleus = dRdEr_interp(e_at_x) * x_to_dedx_func(x_mid_nm)[None, :]
+        Args:
+            spectra (dict): Recoil spectra (_recoil_spectra).
+            observable (str): 'tracks' or 'recoil_energy'.
+            grid (np.ndarray): Fine grid of the observable (from _output_axes).
+            label (str): Source name, for warnings.
 
-            dRdx_nucleus_mg = dRdx_nucleus * 1e-3
+        Returns:
+            dict: {fragment: density [per mg per kyr per nm, or per MeV]}, shape (T, n_grid) or (n_grid,).
+        """
+        if observable == OBSERVABLE_RECOIL_ENERGY:
+            widths = np.diff(RECOIL_ENERGY_BINS_MEV)
+            return {k: np.asarray(v, dtype=float) / widths * 1e-3 for k, v in sorted(spectra['fragments'].items())}
+        return self._recoils_to_track_density(spectra, grid, label)
 
-            dRdx_by_nucleus[nuclide_name] = dRdx_nucleus_mg
-            dRdx_total += dRdx_nucleus_mg
-            if not is_light_ion(nuclide_name):
-                dRdx_no_light += dRdx_nucleus_mg
-            dRdx_groups[track_group(ion_z, self.track_groups)] += dRdx_nucleus_mg
 
-        if missing_tables and self.verbose > 0:
-            self._report_missing_range_tables(recoil_data, er_bins, all_fragments, missing_tables, species)
+    def _with_track_sums(self, counts, n_bins, group=None):
+        """Adds the sums 'total', 'total_no_light_ions' and one entry per track group to a dict of counts per key.
 
-        dRdx_by_nucleus[TOTAL_ALL_FRAGMENTS] = dRdx_total
-        dRdx_by_nucleus[TOTAL_NO_LIGHT_IONS] = dRdx_no_light
-        dRdx_by_nucleus.update(dRdx_groups)
+        Called by _density_to_counts, for every source. Each key is placed in its group by its Z (track_group, with
+        the thresholds of set_track_groups) and counted as light if it is H or He (is_light_ion), unless group is
+        given: then every key goes to that group (the fission fragments, whose keys can be pairs) and is light only
+        if group is 'light'.
 
-        if input_was_1d:
-            dRdx_by_nucleus = {name: arr[0] for name, arr in dRdx_by_nucleus.items()}
+        Args:
+            counts (dict): {fragment key: counts per output bin}, shape (n_bins,).
+            n_bins (int): Number of output bins.
+            group (str, optional): Group of every key. Defaults to None (by Z).
 
-        return dRdx_by_nucleus
+        Returns:
+            dict: counts plus the sums and the groups.
+        """
+        total, no_light = np.zeros(n_bins), np.zeros(n_bins)
+        groups = {g: np.zeros(n_bins) for g in TRACK_GROUPS}
+        for key, c in sorted(counts.items()):
+            total += c
+            if group is None:
+                if not is_light_ion(key):
+                    no_light += c
+                groups[self.fragment_track_group(key)] += c
+            else:
+                if group != 'light':
+                    no_light += c
+                groups[group] += c
+        return {**counts, TOTAL_ALL_FRAGMENTS: total, TOTAL_NO_LIGHT_IONS: no_light, **groups}
 
 
     @staticmethod
-    def _select_nucleus(dRdx_by_fragment, nucleus, label):
-        """Picks the requested track sum or fragment from the output of _convert_recoil_to_track_spectrum.
-
-        Shared by every integration path (primaries, atmospheric secondaries, neutrinos).
+    def _select_nucleus(result, nucleus, label):
+        """Picks the requested sum, group set or fragment from a full result (_with_track_sums), as the last step of
+        every integrate_* function.
 
         Args:
-            dRdx_by_fragment (dict): Output of _convert_recoil_to_track_spectrum.
+            result (dict): Counts per fragment, sums and groups.
             nucleus (str): 'total_no_light_ions', 'total', 'groups' (dict of the track groups and both sums), 'all'
                 (the whole dict) or a fragment key.
-            label (str): Species name, for the error message.
+            label (str): Source name, for the error message.
 
         Returns:
-            np.ndarray or dict: The selected rate, or a dict for 'groups' and 'all'.
+            np.ndarray or dict: The selected counts, or a dict for 'groups' and 'all'.
 
         Raises:
             ValueError: If nucleus is not in the dict.
         """
         if nucleus == "all":
-            return dRdx_by_fragment
+            return result
         if nucleus == TRACK_GROUPS_KEY:
-            return {k: dRdx_by_fragment[k] for k in (*TRACK_GROUPS, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)}
-        if nucleus not in dRdx_by_fragment:
-            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, 'all' or a fragment of "
-                             f"{label} ({sorted(k for k in dRdx_by_fragment if k not in TRACK_SUMS)}).")
-        return dRdx_by_fragment[nucleus]
+            return {k: result[k] for k in (*TRACK_GROUPS, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS)}
+        if nucleus not in result:
+            raise ValueError(f"nucleus '{nucleus}' not found: use one of {TRACK_SUMS}, '{TRACK_GROUPS_KEY}', 'all' or "
+                             f"a fragment of {label} ({sorted(k for k in result if k not in TRACK_SUMS + TRACK_GROUPS)}).")
+        return result[nucleus]
 
 
-    def calculate_particle_signal_spectrum(
-        self,  t_kyr_array, x_bins=None,
-        energy_bins_gev=None, total_simulated_particles=1e4,
-        species='mu-', nucleus=DEFAULT_TRACK_SUM,
-    ):
+    def _density_to_counts(self, density, grid, x_bins, t_kyr, nucleus, label, group=None):
+        """Counts per mg in the output bins from densities on the fine grid: the last step of every source.
 
-        """Track-length rate from one cosmic-ray species at given times.
+        Each density is integrated over time (trapezoid on t_kyr, or times total_age_kyr for a constant source,
+        t_kyr None) and rebinned to x_bins through its cumulative distribution (_rebin_density, exact for a density
+        constant in each grid bin; counts outside the grid are zero). Then the sums and groups are added
+        (_with_track_sums) and nucleus is selected (_select_nucleus).
 
         Args:
-            t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
-            x_bins (np.ndarray, optional): Track-length bin edges [nm]. Defaults to
-                None (DEFAULT_INTEGRATION_X_BINS_NM).
-            energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            total_simulated_particles (float, optional): Primaries per Geant4 run.
-                Defaults to 1e4.
-            species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
-                'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'. For a secondary species the
-                whole neutron + proton cascade is computed (cross-generations need both); energy_bins_gev then
-                selects the cells of its own product that are reported (see _secondary_grids).
-            nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He, see
-                LIGHT_ION_MAX_Z), 'total' (all fragments), 'groups' (dict of the track groups and both sums, see
-                set_track_groups), 'all' (dict of every fragment, the groups and both sums) or a fragment key.
-                Defaults to 'total_no_light_ions'.
+            density (dict): {key: density on grid}, shape (T, n_grid) or (n_grid,).
+            grid (np.ndarray): Fine grid edges.
+            x_bins (np.ndarray): Output bin edges.
+            t_kyr (np.ndarray or None): Times of the rows [kyr], or None for a constant source.
+            nucleus (str): See _select_nucleus.
+            label (str): Source name, for the error message.
+            group (str, optional): See _with_track_sums. Defaults to None.
 
         Returns:
-            np.ndarray or dict: dR/dx [tracks per mg per kyr per nm], shape (T, n_x).
+            np.ndarray or dict: Counts per mg in each bin of x_bins.
         """
-        x_bins = _resolve_x_bins(x_bins)
+        counts = {}
+        for key, d in density.items():
+            accumulated = d * self.total_age_kyr if t_kyr is None else np.trapezoid(d, t_kyr, axis=0)
+            counts[key] = _rebin_density(accumulated, grid, x_bins)
+        return self._select_nucleus(self._with_track_sums(counts, len(x_bins) - 1, group), nucleus, label)
 
-        if species in DERIVED_SPECIES:
-            product = DERIVED_SPECIES[species]
-            bins, windows = self._secondary_grids({product: energy_bins_gev})
-            recoil_data = self._process_secondary_geant4_data(
-                t_kyr_array, bins, total_simulated_particles, energy_windows=windows,
-            )[product]
-            energy_bins_gev = bins[product]
-        else:
-            energy_bins_gev = self._resolve_energy_bins(energy_bins_gev, species)
-            recoil_data = self._process_geant4_data(
-                t_kyr_array, energy_bins_gev, total_simulated_particles, species,
-            )
 
-        dRdx_at_depth = self._convert_recoil_to_track_spectrum(recoil_data, x_bins, energy_bins_gev, species)
-        return self._select_nucleus(dRdx_at_depth, nucleus, species)
+    def _recoils_to_counts(self, spectra, observable, x_bins, grid, nucleus, label):
+        """Recoil spectra -> counts per mg in the output bins (_recoil_density, then _density_to_counts).
+
+        Called by integrate_particle_signal_spectrum, _integrate_secondary_species and integrate_atmospheric_neutrinos.
+        """
+        density = self._recoil_density(spectra, observable, grid, label)
+        return self._density_to_counts(density, grid, x_bins, spectra['t_kyr'], nucleus, label)
 
 
     def integrate_particle_signal_spectrum(
         self, x_bins=None, energy_bins_gev=None,
         exposure_window_kyr=None, total_simulated_particles=1e4,
         x_grid=TRACK_LENGTH_BINS_NM, species='mu-', nucleus=DEFAULT_TRACK_SUM, e_range=None,
-        annealing=None, annealing_r_min=0.0,
+        observable=OBSERVABLE_TRACKS,
     ):
-        """Track counts from one cosmic-ray species over an exposure window.
+        """Track counts (or recoil counts per recoil-energy bin) from one cosmic-ray species over an exposure
+        window.
 
-        The rate is computed on a time grid and integrated with the trapezoidal
-        rule; the fine-grid spectrum is then rebinned to x_bins through its
-        cumulative distribution (_integrate_rate_over_window).
+        The recoils are computed on the time grid of the window (_window_grid; _primary_recoils, or
+        _integrate_secondary_species for a secondary species) and turned into counts by _recoils_to_counts. Called by
+        integrate_all_particles (one worker per primary species), which is the usual entry point.
 
         Args:
-            x_bins (np.ndarray, optional): Output track-length bin edges [nm].
-                Defaults to None (DEFAULT_INTEGRATION_X_BINS_NM).
+            x_bins (np.ndarray, optional): Output bin edges: track lengths [nm] (default DEFAULT_INTEGRATION_X_BINS_NM)
+                or recoil energies [MeV] (default RECOIL_ENERGY_BINS_MEV).
             energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
                 Defaults to None (all the Geant4 files of the species).
             exposure_window_kyr (float or list[float], optional): Window in local
@@ -2388,130 +2098,75 @@ class Paleodetector:
                 ([0, total_age_kyr]).
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
-            x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to
+            x_grid (np.ndarray, optional): Fine track-length grid [nm] (ignored for recoil energies). Defaults to
                 TRACK_LENGTH_BINS_NM.
             species (str, optional): 'mu-', 'mu+', 'neutron', 'proton',
                 'secondary_neutron' or 'secondary_proton'. Defaults to 'mu-'.
-            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key (see
-                calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
+            nucleus (str, optional): 'total_no_light_ions' (all fragments except H and He), 'total', 'groups' (dict of
+                the track groups and both sums, see set_track_groups), 'all' (dict of every fragment, the groups and
+                both sums) or a fragment key. Defaults to 'total_no_light_ions'.
             e_range (tuple[float, float], optional): (E_min, E_max) [GeV]: use only the Geant4 files whose bins
                 lie inside it (see _energy_edges). Ignored if energy_bins_gev is given. Defaults to None (all).
-            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
-                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
-                (proportional shortening, as in fission-track annealing models). A number (same r for every
-                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
-                times, linear in between, constant outside), or a law with a geotherm, e.g.
-                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
-                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
-                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
-                track is followed from its formation to the present through the temperature given by the
-                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
-            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
-                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
+            observable (str, optional): 'tracks', or 'recoil_energy': the same recoils binned in their kinetic
+                energy at creation [MeV] instead of their track length, with the same keys. Defaults to 'tracks'.
 
         Returns:
-            np.ndarray: Tracks per mg in each bin of x_bins (after annealing, if given).
+            tuple[np.ndarray, np.ndarray or dict]: x_bins, and tracks (or recoils) per mg in each bin.
         """
-        x_bins = _resolve_x_bins(x_bins)
-        energy_bins_gev = (self._energy_edges(species, e_range) if energy_bins_gev is None
-                           else np.asarray(energy_bins_gev, dtype=float))
+        x_bins, grid = _output_axes(observable, x_bins, x_grid)
+        energy_bins_gev = self._energy_edges(species, e_range, energy_bins_gev)
 
         if species in DERIVED_SPECIES:
-            return self._integrate_secondary_species(
+            return x_bins, self._integrate_secondary_species(
                 [species], {species: energy_bins_gev}, x_bins=x_bins, exposure_window_kyr=exposure_window_kyr,
                 total_simulated_particles=total_simulated_particles, x_grid=x_grid, nucleus=nucleus,
-                annealing=annealing, annealing_r_min=annealing_r_min,
+                observable=observable,
             )[species]
 
         t_kyr_array = self._window_grid(self._exposure_window(exposure_window_kyr))
-
-        dRdx_array = self.calculate_particle_signal_spectrum(
-            t_kyr_array, x_bins=x_grid, energy_bins_gev=energy_bins_gev,
-            total_simulated_particles=total_simulated_particles,
-            species=species, nucleus=nucleus
-        )
-        return self._integrate_rate_over_window(dRdx_array, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
+        spectra = self._primary_recoils(t_kyr_array, energy_bins_gev, total_simulated_particles, species)
+        return x_bins, self._recoils_to_counts(spectra, observable, x_bins, grid, nucleus, species)
 
 
     def _integrate_secondary_species(
         self, secondary_species, energy_bins_gev=None, x_bins=None, exposure_window_kyr=None,
         total_simulated_particles=1e4, x_grid=TRACK_LENGTH_BINS_NM, nucleus=DEFAULT_TRACK_SUM,
-        annealing=None, annealing_r_min=0.0,
+        observable=OBSERVABLE_TRACKS,
     ):
-        """Track counts of several atmospheric secondary species from one solve of the cascade.
+        """Track (or recoil-energy) counts of several atmospheric secondary species from one solve of the cascade.
 
         The neutron + proton cascade (_secondary_yield) is computed once, with every followable product on its
         full grid, and each requested secondary species takes its own product from it (restricted to its energy
-        range, if given, without changing the cascade: see _secondary_grids).
+        range, if given, without changing the cascade: see _secondary_grids). Called by integrate_all_particles
+        (one worker for all the secondary species) and integrate_particle_signal_spectrum.
 
         Args:
             secondary_species (list[str]): Keys of DERIVED_SPECIES ('secondary_neutron', 'secondary_proton').
             energy_bins_gev (dict, optional): {secondary species: energy cell edges [GeV]} of its product.
                 Defaults to None (full grids).
-            x_bins, exposure_window_kyr, total_simulated_particles, x_grid, nucleus, annealing, annealing_r_min:
-                See integrate_particle_signal_spectrum.
+            x_bins, exposure_window_kyr, total_simulated_particles, x_grid, nucleus, observable: See
+                integrate_particle_signal_spectrum.
 
         Returns:
-            dict: {secondary species: tracks per mg in each bin of x_bins}.
+            dict: {secondary species: tracks (or recoils) per mg in each bin of x_bins}.
         """
-        x_bins = _resolve_x_bins(x_bins)
+        x_bins, grid = _output_axes(observable, x_bins, x_grid)
         energy_bins_gev = dict(energy_bins_gev or {})
         bins, windows = self._secondary_grids({DERIVED_SPECIES[s]: energy_bins_gev.get(s) for s in secondary_species})
         t_kyr_array = self._window_grid(self._exposure_window(exposure_window_kyr))
-        recoils = self._process_secondary_geant4_data(t_kyr_array, bins, total_simulated_particles,
-                                                      energy_windows=windows)
-        out = {}
-        for s in secondary_species:
-            product = DERIVED_SPECIES[s]
-            dRdx = self._select_nucleus(
-                self._convert_recoil_to_track_spectrum(recoils[product], x_grid, bins[product], s), nucleus, s
-            )
-            out[s] = self._integrate_rate_over_window(dRdx, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
-        return out
-
-
-    def _integrate_rate_over_window(self, dRdx_array, t_kyr_array, x_bins, x_grid, annealing=None,
-                                    annealing_r_min=0.0):
-        """Tracks accumulated over a window from a time-dependent rate, rebinned to the output bins.
-
-        Shared by integrate_particle_signal_spectrum and integrate_atmospheric_neutrinos. The tracks formed at
-        each time are shortened by annealing (if given), the rate is integrated over time with the trapezoidal
-        rule, and the fine-grid spectrum is rebinned to x_bins through its cumulative distribution.
-
-        Args:
-            dRdx_array (np.ndarray or dict): Rate [tracks per mg per kyr per nm] on x_grid, shape
-                (T, len(x_grid) - 1), or a dict of them (nucleus='groups' or 'all'): each is integrated.
-            t_kyr_array (np.ndarray): Times of the rows [kyr], shape (T,).
-            x_bins (np.ndarray): Output track-length bin edges [nm].
-            x_grid (np.ndarray): Fine track-length grid [nm].
-            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
-
-        Returns:
-            np.ndarray or dict: Tracks per mg in each bin of x_bins (a dict for a dict input).
-        """
-        if isinstance(dRdx_array, dict):
-            return {k: self._integrate_rate_over_window(v, t_kyr_array, x_bins, x_grid, annealing, annealing_r_min)
-                    for k, v in dRdx_array.items()}
-        if annealing is not None:
-            r = self._annealing_ratio(t_kyr_array, annealing)
-            dRdx_array = _shorten_tracks(dRdx_array, x_grid, r, annealing_r_min)
-
-        total_drdx_g = np.trapezoid(dRdx_array, t_kyr_array, axis=0)
-
-        internal_bin_widths = np.diff(x_grid)
-        cumulative_counts = np.concatenate(([0], np.cumsum(total_drdx_g * internal_bin_widths)))
-        cdf_interp = interp1d(x_grid, cumulative_counts, kind='linear', bounds_error=False,
-                            fill_value=(0, cumulative_counts[-1]))
-        return cdf_interp(x_bins[1:]) - cdf_interp(x_bins[:-1])
+        recoils = self._secondary_recoils(t_kyr_array, bins, total_simulated_particles, energy_windows=windows)
+        return {s: self._recoils_to_counts(recoils[DERIVED_SPECIES[s]], observable, x_bins, grid, nucleus, s)
+                for s in secondary_species}
 
 
     def integrate_all_particles(
         self,  x_bins=None, e_range=None,
         exposure_window_kyr=None,
         total_simulated_particles=1e4, species_list=None, nucleus=DEFAULT_TRACK_SUM,
-        annealing=None, annealing_r_min=0.0, flux_history=None
+        flux_history=None, observable=OBSERVABLE_TRACKS,
     ):
-        """Track counts from several cosmic-ray species, computed in parallel.
+        """Track counts (or recoil counts per recoil-energy bin) from several cosmic-ray species, computed in
+        parallel.
 
         Args:
             x_bins (np.ndarray, optional): Output track-length bin edges [nm].
@@ -2524,24 +2179,14 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4 run.
                 Defaults to 1e4.
             species_list (tuple[str], optional): Species to compute. Defaults to None (available_species()).
-            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key (see
-                calculate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
-            annealing (float or dict, optional): Reduced track length r = L_today / L_formed of a track formed
-                at time t (0 < r <= 1): every track formed at t is shortened to r(t) times its length
-                (proportional shortening, as in fission-track annealing models). A number (same r for every
-                formation time), a table {'law': 'table', 't_kyr': [...], 'r': [...]} (r at those formation
-                times, linear in between, constant outside), or a law with a geotherm, e.g.
-                {'law': 'fanning_curvilinear', 'C0': ..., 'C1': ..., 'C2': ..., 'C3': ..., 'alpha': ...,
-                'beta': ..., 'time_unit_s': ..., 'T_surface_C': 15, 'gradient_C_per_km': 25,
-                'rock_density_g_cm3': 2.16} or {'law': 'first_order', 'A_per_kyr': ..., 'Ea_eV': ...}: then each
-                track is followed from its formation to the present through the temperature given by the
-                overburden history (see _annealing_law and _annealing_from_law). Defaults to None (no shortening).
-            annealing_r_min (float, optional): Tracks with r below this value are removed (segmented, no longer
-                etchable; ~0.4-0.55 for apatite). Defaults to 0 (none removed).
+            nucleus (str, optional): 'total_no_light_ions', 'total', 'groups', 'all' or a fragment key (see
+                integrate_particle_signal_spectrum). Defaults to 'total_no_light_ions'.
             flux_history (FluxHistory, optional): Flux history to set for the integration. Defaults to None
+            observable (str, optional): 'tracks' or 'recoil_energy' (x_bins then in MeV, default
+                RECOIL_ENERGY_BINS_MEV; see integrate_particle_signal_spectrum). Defaults to 'tracks'.
 
         Returns:
-            tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each
+            tuple[np.ndarray, dict]: x_bins, and tracks (or recoils) per mg in each bin for each
             species plus 'total'.
 
         Raises:
@@ -2550,7 +2195,7 @@ class Paleodetector:
         if flux_history is not None:
             self.set_flux_history(flux_history)
 
-        x_bins = _resolve_x_bins(x_bins)
+        x_bins, _ = _output_axes(observable, x_bins, TRACK_LENGTH_BINS_NM)
         species_list = self.available_species() if species_list is None else list(species_list)
         e_range = dict(e_range or {})
         unknown = set(e_range) - set(species_list)
@@ -2559,15 +2204,10 @@ class Paleodetector:
                              f"(computed: {species_list}).")
         edges = {s: self._energy_edges(s, e_range.get(s)) for s in species_list}
 
-        # caches shared by every species, built before the workers start so that they inherit them
-        if isinstance(annealing, dict):
-            self._annealing_ratio(self._master_time_grid(), annealing)
-
         shared_kwargs = dict(
             x_bins=x_bins,
             exposure_window_kyr=exposure_window_kyr,
-            total_simulated_particles=total_simulated_particles, nucleus=nucleus,
-            annealing=annealing, annealing_r_min=annealing_r_min,
+            total_simulated_particles=total_simulated_particles, nucleus=nucleus, observable=observable,
         )
 
         # one task per primary species; the secondary species share one task (one solve of the cascade)
@@ -2676,6 +2316,21 @@ class Paleodetector:
 
 
     def _read_recoils_and_products(self, filepath, product_edges):
+        """Cached form of _read_recoils_and_products_uncached (see there): the result depends only on the file and
+        on the product cells, so each file is read once per session (shared cache, see _FILE_CACHE)."""
+        stamp = _file_stamp(filepath)
+        key = ('recoils_products', stamp, tuple((p, np.asarray(e, dtype=float).tobytes())
+                                                for p, e in product_edges.items()), RECOIL_ENERGY_BINS_MEV.tobytes())
+        hit, value = _cache_get(key)
+        if hit:
+            return value
+        value = self._read_recoils_and_products_uncached(filepath, product_edges)
+        if stamp is not None:
+            _cache_put(key, value)
+        return value
+
+
+    def _read_recoils_and_products_uncached(self, filepath, product_edges):
         """Reads one mineral run file: recoils, produced particles by energy cell, and interaction vertices.
 
         Purpose: a neutrino run gives both the recoils made by the neutrino and the particles it produces (muons,
@@ -2840,9 +2495,9 @@ class Paleodetector:
         self, x_bins=None, e_range=None, exposure_window_kyr=None,
         total_simulated_particles=1e4, neutrino_bias=None, species_list=None,
         secondaries=True, product_simulated_particles=None, nucleus=DEFAULT_TRACK_SUM,
-        annealing=None, annealing_r_min=0.0, x_grid=TRACK_LENGTH_BINS_NM,
+        x_grid=TRACK_LENGTH_BINS_NM,
         solid_angle_factor=NEUTRINO_SOLID_ANGLE_FACTOR, flux_history=None,
-        secondary_medium='auto', stdrock_neutrino_bias=None,
+        secondary_medium='auto', stdrock_neutrino_bias=None, observable=OBSERVABLE_TRACKS,
     ):
         """Track counts from atmospheric neutrinos: their own interactions in the sample and those of the
         particles they produce in the surrounding rock.
@@ -2850,7 +2505,7 @@ class Paleodetector:
         Differences from integrate_all_particles:
 
         * No overburden. Neutrinos are not attenuated by any realistic overburden, so the depth tables and the
-          overburden history play no role; the rate changes in time only through the flux history (and annealing).
+          overburden history play no role; the rate changes in time only through the flux history.
         * All directions. The sample sees neutrinos from the whole sphere, through the Earth too: the rate per unit
           volume is solid_angle_factor times the template flux (see NEUTRINO_SOLID_ANGLE_FACTOR).
         * Biased runs. The interaction probability per primary is uniform along the target (no depletion while the
@@ -2897,7 +2552,6 @@ class Paleodetector:
                 the mineral). Defaults to None (total_simulated_particles).
             nucleus (str, optional): 'total_no_light_ions', 'total', 'groups' (dict of the track groups, see set_track_groups) or a fragment key. Defaults to
                 'total_no_light_ions'.
-            annealing, annealing_r_min: See integrate_particle_signal_spectrum.
             x_grid (np.ndarray, optional): Fine track-length grid [nm]. Defaults to TRACK_LENGTH_BINS_NM.
             solid_angle_factor (float, optional): Rate per unit volume / template flux. Defaults to
                 NEUTRINO_SOLID_ANGLE_FACTOR (4: isotropic, from all directions).
@@ -2907,9 +2561,11 @@ class Paleodetector:
                 'mineral' (see above). Defaults to 'auto'.
             stdrock_neutrino_bias (float, dict, callable or None, optional): Bias of the StdRock neutrino runs, same
                 forms as neutrino_bias. Defaults to None (from their geometry.json).
+            observable (str, optional): 'tracks' or 'recoil_energy' (x_bins then in MeV, default
+                RECOIL_ENERGY_BINS_MEV; see integrate_particle_signal_spectrum). Defaults to 'tracks'.
 
         Returns:
-            tuple[np.ndarray, dict]: x_bins, and tracks per mg in each bin for each neutrino species, each
+            tuple[np.ndarray, dict]: x_bins, and tracks (or recoils) per mg in each bin for each neutrino species, each
             'nu_secondary_<product>' (summed over the neutrino species) and 'total'.
 
         Raises:
@@ -2918,7 +2574,7 @@ class Paleodetector:
         """
         if flux_history is not None:
             self.set_flux_history(flux_history)
-        x_bins = _resolve_x_bins(x_bins)
+        x_bins, x_grid = _output_axes(observable, x_bins, x_grid)
         species_list = self.available_neutrino_species() if species_list is None else list(species_list)
         bad = [s for s in species_list if s not in NEUTRINO_SPECIES]
         if bad:
@@ -2934,7 +2590,7 @@ class Paleodetector:
 
         rho = self.config['density_g_cm3']
         t_kyr = self._window_grid(self._exposure_window(exposure_window_kyr))
-        n_t, n_r = t_kyr.size, len(RECOIL_ENERGY_BINS_MEV) - 1
+        n_t = t_kyr.size
 
         products = [p for p in NEUTRINO_PRODUCTS if p in self.energy_bins] if secondaries else []
         if secondaries and self.verbose > 0 and len(products) < len(NEUTRINO_PRODUCTS):
@@ -3025,18 +2681,10 @@ class Paleodetector:
                               f"neutrinos lie outside the {p} runs ({below / (made + below + above):.2g} below "
                               f"{product_edges[p][0]:.4g} GeV): their recoils are missing.")
 
-        # --- recoil rates -> tracks, integrated over the window ---
-        to_per_kyr_mev = 1.0 / (np.diff(RECOIL_ENERGY_BINS_MEV)[None, :] * KYR_PER_SECOND)
-        if isinstance(annealing, dict):
-            self._annealing_ratio(self._master_time_grid(), annealing)
         results = {}
-        for key, spec in recoils.items():
-            recoil_data = {'Er_bins': RECOIL_ENERGY_BINS_MEV, 't_kyr': t_kyr,
-                           **{frag: arr * to_per_kyr_mev for frag, arr in spec.items()}}
-            dRdx = self._select_nucleus(
-                self._convert_recoil_to_track_spectrum(recoil_data, x_grid, fragments=list(spec)), nucleus, key
-            )
-            results[key] = self._integrate_rate_over_window(dRdx, t_kyr, x_bins, x_grid, annealing, annealing_r_min)
+        for key, spec in recoils.items():                                   # per g per s -> per g per kyr
+            spectra = _recoil_spectra({frag: arr / KYR_PER_SECOND for frag, arr in spec.items()}, t_kyr)
+            results[key] = self._recoils_to_counts(spectra, observable, x_bins, x_grid, nucleus, key)
 
         results['total'] = _combine_track_results(results.values())
         return x_bins, results
@@ -3068,5 +2716,5 @@ def _species_worker(self_and_args):
         species = kwargs.pop('species')
         if self.verbose > 1:
             print(f"Processing species: {species}")
-        result = [(species, self.integrate_particle_signal_spectrum(species=species, **kwargs))]
+        result = [(species, self.integrate_particle_signal_spectrum(species=species, **kwargs)[1])]
     return result, {key: _FILE_CACHE[key] for key in _FILE_CACHE if key not in known}
