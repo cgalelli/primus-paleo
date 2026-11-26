@@ -14,7 +14,8 @@ Repository layout (editable install, `pip install -e .` from the repository root
             Geant4_data/<material>/Range/        stopping-power tables
 
 Data root, first match wins:
-    1. an explicit argument (data_path_prefix=, data_path=, template_dir=, ...);
+    1. an explicit data_dir= argument (Paleodetector and the functions here; FluxHistory takes the template folder
+       itself, template_dir=);
     2. set_data_path(...) called in the session;
     3. the environment variable PRIMUS_DATA;
     4. <repository>/Data, when the package is installed from the repository (editable install);
@@ -24,11 +25,12 @@ Geant4 application folder (the folder that contains build/Run), first match wins
     1. an explicit argument (geant4_dir=);
     2. set_geant4_path(...);
     3. the environment variable PRIMUS_GEANT4;
-    4. <repository>/geant4, if it contains build/Run;
-    5. <data root>/Geant4_data, if it contains build/Run (the layout before the package);
-    6. <repository>/geant4 (or <data root>/Geant4_data when there is no repository), even if not compiled yet.
+    4. <repository>/geant4 (whether compiled yet or not); without a repository, ./geant4.
 """
 import os
+
+__all__ = ['repository_root', 'set_data_path', 'data_path', 'set_geant4_path', 'geant4_app_path',
+           'flux_template_dir', 'mineral_library_path', 'load_mineral_library', 'mineral_config', 'describe']
 
 _DATA_PATH = None
 _GEANT4_PATH = None
@@ -48,10 +50,10 @@ def set_data_path(path):
     return data_path()
 
 
-def data_path(path=None):
-    """Absolute data root: `path` if given, else set_data_path, PRIMUS_DATA, <repository>/Data, ./Data."""
-    if path is not None:
-        return os.path.abspath(os.path.expanduser(path))
+def data_path(data_dir=None):
+    """Absolute data root: data_dir if given, else set_data_path, PRIMUS_DATA, <repository>/Data, ./Data."""
+    if data_dir is not None:
+        return os.path.abspath(os.path.expanduser(data_dir))
     if _DATA_PATH is not None:
         return _DATA_PATH
     env = os.environ.get("PRIMUS_DATA")
@@ -70,50 +72,45 @@ def set_geant4_path(path):
     return geant4_app_path()
 
 
-def geant4_app_path(path=None, data=None):
+def geant4_app_path(geant4_dir=None):
     """Absolute folder of the Geant4 application, the one that contains build/Run (see the module docstring)."""
-    if path is not None:
-        return os.path.abspath(os.path.expanduser(path))
+    if geant4_dir is not None:
+        return os.path.abspath(os.path.expanduser(geant4_dir))
     if _GEANT4_PATH is not None:
         return _GEANT4_PATH
     env = os.environ.get("PRIMUS_GEANT4")
     if env:
         return os.path.abspath(os.path.expanduser(env))
     root = repository_root()
-    legacy = os.path.join(data_path(data), "Geant4_data")
-    candidates = ([os.path.join(root, "geant4")] if root else []) + [legacy]
-    for c in candidates:
-        if os.path.exists(os.path.join(c, "build", "Run")):
-            return c
-    return candidates[0]
+    return os.path.join(root, "geant4") if root else os.path.abspath("geant4")
 
 
-def flux_template_dir(data=None):
+def flux_template_dir(data_dir=None):
     """Folder of the flux templates: <data root>/flux_data."""
-    return os.path.join(data_path(data), "flux_data")
+    return os.path.join(data_path(data_dir), "flux_data")
 
 
-def mineral_library_path(data=None):
+def mineral_library_path(data_dir=None):
     """The mineral library: <data root>/mineral_library.yaml."""
-    return os.path.join(data_path(data), "mineral_library.yaml")
+    return os.path.join(data_path(data_dir), "mineral_library.yaml")
 
 
-def load_mineral_library(data=None):
+def load_mineral_library(data_dir=None):
     """All materials of the mineral library, as a dict {name: properties}."""
     import yaml
-    with open(mineral_library_path(data)) as f:
+    with open(mineral_library_path(data_dir)) as f:
         return yaml.safe_load(f) or {}
 
 
-def mineral_config(name, data=None):
+def mineral_config(name, data_dir=None):
     """Properties of one material of the mineral library (the mineral_config of Paleodetector).
 
     Raises:
         KeyError: If the material is not in the library.
     """
-    library = load_mineral_library(data)
+    library = load_mineral_library(data_dir)
     if name not in library:
-        raise KeyError(f"{name} is not in {mineral_library_path(data)} (available: {sorted(library)}).")
+        raise KeyError(f"{name} is not in {mineral_library_path(data_dir)} (available: {sorted(library)}).")
     return library[name]
 
 

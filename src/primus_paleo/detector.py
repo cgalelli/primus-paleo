@@ -330,7 +330,7 @@ class Paleodetector:
         verbose (int): 0 silent, 1 warnings and summaries (default), 2 progress details (see _log).
     """
 
-    def __init__(self, mineral_config, total_age_kyr, overburden_history=None, flux_history=None, data_path_prefix=None):
+    def __init__(self, mineral_config, total_age_kyr, overburden_history=None, flux_history=None, data_dir=None):
         """Initialises the detector and builds the depth-probability tables.
 
         Args:
@@ -347,14 +347,14 @@ class Paleodetector:
                 time total_age_kyr (present) to 0. If None, a baseline-only history is
                 used. To change it later use set_flux_history (the only other way to
                 set it). Defaults to None.
-            data_path_prefix (str, optional): Root of the data directory. Defaults to None (config.data_path():
+            data_dir (str, optional): Root of the data directory. Defaults to None (config.data_path():
                 set_data_path, PRIMUS_DATA, <repository>/Data or ./Data).
         """
         if isinstance(mineral_config, str):
-            mineral_config = dict(config.mineral_config(mineral_config, data_path_prefix), name=mineral_config)
+            mineral_config = dict(config.mineral_config(mineral_config, data_dir), name=mineral_config)
         self.config = mineral_config
         self.name = mineral_config['name']
-        self.data_path = config.data_path(data_path_prefix)
+        self.data_path = config.data_path(data_dir)
 
         self.verbose = 1
 

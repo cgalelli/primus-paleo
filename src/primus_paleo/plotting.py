@@ -1,24 +1,25 @@
-"""Plots: track-length (or recoil-energy) spectra split by track group, and diagnostics of a Paleodetector.
+"""Plots: track-length (or recoil-energy) spectra split into components, and diagnostics of a Paleodetector.
 
-Spectra split by track group (heavy, medium_heavy, medium_light, light): plot_track_groups.
-Diagnostics of the inputs of a detector: interaction_profiles (interaction depth profiles of its StdRock depth
-tables) and plot_secondary_production (where and by whom the atmospheric secondaries are made).
+Spectra split into components (track groups by default; nuclides, species or sources with keys=...):
+plot_track_groups. Diagnostics of the inputs of a detector: interaction_profiles (interaction depth profiles of its
+StdRock depth tables) and plot_secondary_production (where and by whom the atmospheric secondaries are made).
 
-plot_track_groups:
+plot_track_groups
+-----------------
+Each curve (a scenario, a species, a sample...) gets one colour family; its components are shades of that family,
+darkest for the first (for the track groups: the heaviest). Three layouts, chosen by `style`:
 
-Each curve (a scenario, a species, a sample...) gets one colour family; its track groups are shades of that family,
-darkest for the heaviest group. Three layouts, chosen by `style`:
-
-  'stack'   one curve: the groups stacked as filled areas, the total as an outline. Shows the composition of a
-            spectrum at a glance (which group makes the tracks at each length).
-  'lines'   a few curves (2-3): every group of every curve as a line, shade = group, colour family = curve, the
-            total as a thick line. Compares curves group by group in one panel.
-  'panels'  many curves: one panel per group (plus one for the total), every curve in its own colour in each panel.
-            The clearest when the groups differ by orders of magnitude or more than three curves are compared.
+  'stack'   one curve: the components stacked as filled areas, the total as an outline. Shows the composition of a
+            spectrum at a glance (which component makes the tracks at each length).
+  'lines'   a few curves (2-3): every component of every curve as a line, shade (and line style) = component, colour
+            family = curve, the total as a thick line. Compares curves component by component in one panel.
+  'panels'  many curves: one panel per component (plus one for the total), every curve in its own colour in each
+            panel. The clearest when the components differ by orders of magnitude or more than three curves are
+            compared.
 
 'auto' picks 'stack' for one curve, 'lines' for two or three, 'panels' beyond.
 
-Input: the dicts returned with nucleus='groups', e.g.
+Input: the dicts of the integrate_* functions, e.g. with nucleus='groups'
 
     x_bins, cr = det.integrate_all_particles(nucleus='groups')
     _, nu = det.integrate_atmospheric_neutrinos(x_bins=x_bins, nucleus='groups')
@@ -26,8 +27,10 @@ Input: the dicts returned with nucleus='groups', e.g.
     plot_track_groups({'cosmic rays': cr['total'], 'neutrinos': nu['total'],
                        'radiogenic n': rad['fission_n'], 'fission': rad['fission_fragments']}, x_bins)
 
-Recoil-energy spectra (observable='recoil_energy' in the integrate_* functions) are plotted the same way with
-observable='recoil_energy' here, which sets the axis labels and a logarithmic energy axis.
+or any other breakdown, through keys: the species of one run (keys=['mu-', 'neutron', ...], total='total', on the
+whole output dict of integrate_all_particles with the default nucleus) or the nuclides (nucleus='all',
+keys=['Na23', 'Cl35', ...]). Recoil-energy spectra (observable='recoil_energy' in the integrate_* functions) are
+plotted the same way with observable='recoil_energy' here, which sets the axis labels and a logarithmic energy axis.
 """
 
 import numpy as np
@@ -38,6 +41,8 @@ from ._core import (MUON_SPECIES, SECONDARY_SOURCES, TOTAL_ALL_FRAGMENTS, TOTAL_
 __all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS',
            'interaction_profiles', 'plot_secondary_production']
 
+# Labels, shades (position in the colour map, 1 = darkest end of a sequential map) and line styles of the track
+# groups and totals. Other keys get their own name as label, evenly spaced shades and cycling line styles.
 GROUP_LABELS = {
     'heavy': 'heavy',
     'medium_heavy': 'medium heavy',
@@ -46,10 +51,10 @@ GROUP_LABELS = {
     TOTAL_NO_LIGHT_IONS: 'total (no H, He)',
     TOTAL_ALL_FRAGMENTS: 'total',
 }
-# position in the colour map of each group (1 = darkest end of a sequential map)
 GROUP_SHADES = {'heavy': 0.95, 'medium_heavy': 0.75, 'medium_light': 0.55, 'light': 0.35}
 TOTAL_SHADE = 1.0
 GROUP_LINESTYLES = {'heavy': '-', 'medium_heavy': '-', 'medium_light': '--', 'light': ':'}
+OTHER_LINESTYLES = ('-', '--', ':', '-.')
 # sequential matplotlib colour maps, one family per curve
 DEFAULT_COLORMAPS = ('Blues', 'Oranges', 'Greens', 'Purples', 'Reds', 'Greys', 'YlOrBr', 'PuRd')
 # default axes of each observable of the integrate_* functions
@@ -59,52 +64,232 @@ _AXES = {
 }
 
 
+def _shades(keys):
+    """Colour-map position of each key: GROUP_SHADES for the track groups, else evenly spaced, darkest first."""
+    if all(k in GROUP_SHADES for k in keys):
+        return {k: GROUP_SHADES[k] for k in keys}
+    return dict(zip(keys, np.linspace(0.95, 0.35, len(keys)) if len(keys) > 1 else [0.75]))
+
+
+def _linestyle(key, keys):
+    """Line style of a key in the 'lines' layout: GROUP_LINESTYLES for the track groups, else cycling."""
+    return GROUP_LINESTYLES.get(key, OTHER_LINESTYLES[list(keys).index(key) % len(OTHER_LINESTYLES)])
+
+
 def group_colors(cmap, groups=TRACK_GROUPS):
-    """Shades of one colour family for the track groups (and the total).
+    """Shades of one colour family for the components (and the total) of a curve.
 
     Args:
         cmap (str or matplotlib colormap): A sequential colour map, e.g. 'Blues'.
-        groups (tuple[str], optional): Groups to colour. Defaults to TRACK_GROUPS.
+        groups (tuple[str], optional): Components to colour (track groups or any keys). Defaults to TRACK_GROUPS.
 
     Returns:
-        dict: group -> RGBA colour, plus 'total' for the total.
+        dict: component -> RGBA colour, plus 'total' for the total.
     """
     import matplotlib
     cm = matplotlib.colormaps[cmap] if isinstance(cmap, str) else cmap
-    colors = {g: cm(GROUP_SHADES.get(g, 0.6)) for g in groups}
+    colors = {k: cm(shade) for k, shade in _shades(tuple(groups)).items()}
     colors['total'] = cm(TOTAL_SHADE)
     return colors
 
 
 def _as_curves(curves):
-    """{label: group dict}: accepts that, a list of (label, group dict), or a single group dict."""
-    if isinstance(curves, dict) and any(g in curves for g in TRACK_GROUPS):
+    """{label: {key: counts}}: accepts that, a list of (label, dict) pairs, or one {key: counts} dict alone (whose
+    values are arrays, not dicts)."""
+    if isinstance(curves, dict) and curves and not isinstance(next(iter(curves.values())), dict):
         return {'': curves}
-    if isinstance(curves, dict):
-        return dict(curves)
     return dict(curves)
 
 
-def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=TOTAL_NO_LIGHT_IONS, ax=None,
+def _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormaps, show_light, xlim, xlabel, ylabel,
+                observable):
+    """What every layout of plot_track_groups needs, worked out once: the curves, the keys drawn, the scaling, the
+    colours, the axes ranges and labels (see plot_track_groups for the arguments).
+
+    Returns:
+        dict: 'curves', 'x_bins', 'style', 'keys' (components), 'total', 'drawn' (components and total), 'scale'
+        (counts -> plotted values), 'families' ({curve: colours}), 'labels' ({key: label}), 'xlim', 'logx', 'logy',
+        'xlabel', 'ylabel'.
+
+    Raises:
+        ValueError: If style or observable is unknown, or a curve lacks a key.
+    """
+    curves = _as_curves(curves)
+    x_bins = np.asarray(x_bins, dtype=float)
+    keys = tuple(k for k in keys if show_light or k != 'light')
+    drawn = (*keys, *([total] if total else []))
+    for label, c in curves.items():
+        missing = [k for k in drawn if k not in c]
+        if missing:
+            raise ValueError(f"curve {label!r} has no {missing} (track groups: compute with nucleus='groups'; "
+                             f"nuclides: nucleus='all').")
+    if style == 'auto':
+        style = 'stack' if len(curves) == 1 else 'lines' if len(curves) <= 3 else 'panels'
+    if style not in _LAYOUTS:
+        raise ValueError(f"style must be 'auto' or one of {tuple(_LAYOUTS)}, got {style!r}.")
+    if observable not in _AXES:
+        raise ValueError(f"observable must be one of {tuple(_AXES)}, got {observable!r}.")
+    axis = _AXES[observable]
+    logx = axis['logx'] if logx is None else logx
+    widths = np.diff(x_bins)
+    scale = (lambda v: np.asarray(v, dtype=float) / widths) if per_nm else (lambda v: np.asarray(v, dtype=float))
+
+    x_lo = x_bins[0] if not logx else x_bins[x_bins > 0][0]
+    x_hi = x_bins[-1]
+    if isinstance(xlim, str) and xlim == 'auto':
+        values = [scale(c[k]) for c in curves.values() for k in drawn]
+        peak = max(float(np.max(v)) for v in values)
+        last = max((int(np.nonzero(v > 1e-6 * peak)[0][-1]) for v in values if np.any(v > 1e-6 * peak)),
+                   default=len(widths) - 1)
+        margin = x_bins[last + 1] * 1.5 if logx else x_bins[last + 1] + 0.1 * (x_bins[last + 1] - x_lo)
+        x_hi = min(x_bins[-1], margin)
+    elif xlim is not None:
+        x_lo, x_hi = xlim
+
+    return {
+        'curves': curves, 'x_bins': x_bins, 'style': style, 'keys': keys, 'total': total, 'drawn': drawn,
+        'scale': scale, 'families': {label: group_colors(colormaps[i % len(colormaps)], keys)
+                                     for i, label in enumerate(curves)},
+        'labels': {k: GROUP_LABELS.get(k, k) for k in drawn},
+        'xlim': (x_lo, x_hi), 'logx': logx, 'logy': (style != 'stack') if logy is None else logy,
+        'xlabel': axis['xlabel'] if xlabel is None else xlabel,
+        'ylabel': (f"{axis['counts']} / mg / {axis['unit'] if per_nm else 'bin'}" if ylabel is None else ylabel),
+    }
+
+
+def _finish_axes(a, p, top, y_decades):
+    """Scales and limits of one axes; with a log y axis and y_decades, y from top / 10**y_decades to 2 * top, top
+    being the largest value drawn on it."""
+    a.set_xscale('log' if p['logx'] else 'linear')
+    a.set_yscale('log' if p['logy'] else 'linear')
+    a.set_xlim(*p['xlim'])
+    if p['logy'] and y_decades and top > 0:
+        a.set_ylim(top * 10 ** (-y_decades), top * 2)
+
+
+def _plot_stack(p, ax, y_decades, legend):
+    """'stack' layout: the components of each curve stacked as filled areas (first at the bottom), the total as an
+    outline."""
+    import matplotlib.pyplot as plt
+    fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
+    x, top = p['x_bins'], 0.0
+    for label, c in p['curves'].items():
+        colors = p['families'][label]
+        bottom = np.zeros(len(x) - 1)
+        for k in p['keys']:
+            upper = bottom + p['scale'](c[k])
+            ax.stairs(upper, x, baseline=bottom, fill=True, color=colors[k], linewidth=0,
+                      label=f"{label} {p['labels'][k]}".strip())
+            bottom = upper
+        top = max(top, float(np.max(bottom)))
+        if p['total']:
+            total = p['scale'](c[p['total']])
+            ax.stairs(total, x, color=colors['total'], linewidth=1.2,
+                      label=f"{label} {p['labels'][p['total']]}".strip())
+            top = max(top, float(np.max(total)))
+    _finish_axes(ax, p, top, y_decades)
+    ax.set_xlabel(p['xlabel'])
+    ax.set_ylabel(p['ylabel'])
+    if legend:
+        ax.legend(frameon=False, fontsize=8)
+    return fig, ax
+
+
+def _plot_lines(p, ax, y_decades, legend):
+    """'lines' layout: every component of every curve as a line (shade and line style = component, colour family =
+    curve), the total as a thick line; two legends, one for the curves and one for the components."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
+    x, keys, top = p['x_bins'], p['keys'], 0.0
+    for label, c in p['curves'].items():
+        colors = p['families'][label]
+        for k in keys:
+            values = p['scale'](c[k])
+            ax.stairs(values, x, color=colors[k], linestyle=_linestyle(k, keys), linewidth=1.2)
+            top = max(top, float(np.max(values)))
+        if p['total']:
+            values = p['scale'](c[p['total']])
+            ax.stairs(values, x, color=colors['total'], linewidth=2.4)
+            top = max(top, float(np.max(values)))
+    _finish_axes(ax, p, top, y_decades)
+    ax.set_xlabel(p['xlabel'])
+    ax.set_ylabel(p['ylabel'])
+    if legend:
+        curve_handles = [Patch(color=p['families'][label][keys[0]], label=label or 'spectrum') for label in p['curves']]
+        grey = group_colors('Greys', keys)
+        key_handles = [Line2D([], [], color=grey[k], linestyle=_linestyle(k, keys), linewidth=1.2,
+                              label=p['labels'][k]) for k in keys]
+        if p['total']:
+            key_handles.insert(0, Line2D([], [], color=grey['total'], linewidth=2.4, label=p['labels'][p['total']]))
+        first = ax.legend(handles=curve_handles, frameon=False, fontsize=8, loc='upper left',
+                          bbox_to_anchor=(1.01, 1.0))
+        ax.add_artist(first)
+        ax.legend(handles=key_handles, frameon=False, fontsize=8, loc='lower left', bbox_to_anchor=(1.01, 0.0))
+    return fig, ax
+
+
+def _plot_panels(p, ax, y_decades, legend):
+    """'panels' layout: one panel per component (the total first), every curve in its own colour family in each;
+    x labels on the lowest visible panel of each column. ax is ignored (a new figure)."""
+    import matplotlib.pyplot as plt
+    shown = ([p['total']] if p['total'] else []) + list(p['keys'])
+    n = len(shown)
+    ncols = 2 if n > 2 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.2 * nrows), sharex=True, squeeze=False)
+    for i, (a, k) in enumerate(zip(axes.flat, shown)):
+        top = 0.0
+        for label, c in p['curves'].items():
+            family = p['families'][label]
+            values = p['scale'](c[k])
+            a.stairs(values, p['x_bins'], color=family['total'] if k == p['total'] else family[p['keys'][0]],
+                     linewidth=1.4, label=label or None)
+            top = max(top, float(np.max(values)))
+        a.set_title(p['labels'][k], fontsize=10)
+        _finish_axes(a, p, top, y_decades)
+        if i % ncols == 0:
+            a.set_ylabel(p['ylabel'])
+    for a in axes.flat[n:]:
+        a.set_visible(False)
+    for col in range(ncols):
+        visible = [axes[row, col] for row in range(nrows) if row * ncols + col < n]
+        if visible:
+            visible[-1].set_xlabel(p['xlabel'])
+            visible[-1].xaxis.set_tick_params(labelbottom=True)
+    if legend and any(p['curves']):
+        axes.flat[0].legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    return fig, axes
+
+
+_LAYOUTS = {'stack': _plot_stack, 'lines': _plot_lines, 'panels': _plot_panels}
+
+
+def plot_track_groups(curves, x_bins, style='auto', keys=TRACK_GROUPS, total=TOTAL_NO_LIGHT_IONS, ax=None,
                       per_nm=False, logx=None, logy=None, colormaps=DEFAULT_COLORMAPS, show_light=True,
                       xlim='auto', y_decades=None, xlabel=None, ylabel=None, legend=True, observable='tracks'):
-    """Plots track-length (or recoil-energy) spectra split by track group.
+    """Plots track-length (or recoil-energy) spectra split into components: the track groups, or any keys.
+
+    Works out the common settings once (_plot_setup), then draws with the layout of `style` (_plot_stack,
+    _plot_lines, _plot_panels; see the module docstring).
 
     Args:
-        curves (dict): {label: dict with the track groups and the totals} (nucleus='groups' output), or one such
-            dict alone.
+        curves (dict): {label: dict of counts per key} (e.g. a nucleus='groups' output), or one such dict alone.
         x_bins (np.ndarray): Bin edges of the spectra [nm, or MeV for recoil energies].
         style (str, optional): 'auto', 'stack', 'lines' or 'panels' (see the module docstring). Defaults to 'auto'.
-        groups (tuple[str], optional): Groups to show, heaviest first. Defaults to TRACK_GROUPS.
-        total (str or None, optional): Total drawn with the groups: 'total_no_light_ions', 'total' or None.
-            Defaults to 'total_no_light_ions'.
+        keys (tuple[str], optional): Components to show, in order (the first gets the darkest shade). Defaults to
+            TRACK_GROUPS (heaviest first); any keys of the curves work, e.g. nuclides or species.
+        total (str or None, optional): Key of the total drawn with the components, or None. Defaults to
+            'total_no_light_ions'.
         ax (matplotlib Axes, optional): Axes for 'stack' and 'lines' (a new figure if None). Ignored by 'panels'.
         per_nm (bool, optional): Plot counts per unit of the x axis (counts / bin width: per nm, or per MeV for
             recoil energies) instead of counts per bin. Defaults to False.
         logx (bool, optional): Logarithmic x axis. Defaults to None: False for tracks, True for recoil energies.
         logy (bool, optional): Logarithmic y axis. Defaults to None: False for 'stack', True otherwise.
         colormaps (tuple, optional): Colour families of the curves, in order. Defaults to DEFAULT_COLORMAPS.
-        show_light (bool, optional): Include the 'light' group. Defaults to True.
+        show_light (bool, optional): Include the 'light' key if present in keys. Defaults to True.
         xlim (tuple or str or None, optional): x range; 'auto' ends it a little after the last bin above 1e-6 of
             the maximum of any curve; None uses the whole x_bins. Defaults to 'auto'.
         y_decades (float or None, optional): With a log y axis, limit the y range of each axes to this many
@@ -120,130 +305,11 @@ def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=T
         tuple: (fig, axes), axes being one Axes or, for 'panels', an array of them.
 
     Raises:
-        ValueError: If style or observable is unknown, or a curve lacks a group.
+        ValueError: If style or observable is unknown, or a curve lacks a key.
     """
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-
-    curves = _as_curves(curves)
-    x_bins = np.asarray(x_bins, dtype=float)
-    groups = tuple(g for g in groups if show_light or g != 'light')
-    for label, c in curves.items():
-        missing = [g for g in (*groups, *([total] if total else [])) if g not in c]
-        if missing:
-            raise ValueError(f"curve {label!r} has no {missing}: compute it with nucleus='groups'.")
-    if style == 'auto':
-        style = 'stack' if len(curves) == 1 else 'lines' if len(curves) <= 3 else 'panels'
-    if style not in ('stack', 'lines', 'panels'):
-        raise ValueError(f"style must be 'auto', 'stack', 'lines' or 'panels', got {style!r}.")
-    if logy is None:
-        logy = style != 'stack'
-    if observable not in _AXES:
-        raise ValueError(f"observable must be one of {tuple(_AXES)}, got {observable!r}.")
-    axis = _AXES[observable]
-    if logx is None:
-        logx = axis['logx']
-    if xlabel is None:
-        xlabel = axis['xlabel']
-    widths = np.diff(x_bins)
-    scale = (lambda v: np.asarray(v, dtype=float) / widths) if per_nm else (lambda v: np.asarray(v, dtype=float))
-    if ylabel is None:
-        ylabel = f"{axis['counts']} / mg / {axis['unit'] if per_nm else 'bin'}"
-    families = {label: group_colors(colormaps[i % len(colormaps)], groups) for i, label in enumerate(curves)}
-
-    x_lo = x_bins[0] if not logx else x_bins[x_bins > 0][0]
-    x_hi = x_bins[-1]
-    if isinstance(xlim, str) and xlim == 'auto':
-        peak = max(float(np.max(scale(c[k]))) for c in curves.values() for k in (*groups, *([total] if total else [])))
-        above = [np.nonzero(scale(c[k]) > 1e-6 * peak)[0] for c in curves.values()
-                 for k in (*groups, *([total] if total else []))]
-        last = max((int(i[-1]) for i in above if i.size), default=len(widths) - 1)
-        x_hi = min(x_bins[-1], x_bins[last + 1] * (1.5 if logx else 1.0) + (0.0 if logx else 0.1 * (x_bins[last + 1] - x_lo)))
-    elif xlim is not None:
-        x_lo, x_hi = xlim
-
-    def finish(a):
-        a.set_xscale('log' if logx else 'linear')
-        a.set_yscale('log' if logy else 'linear')
-        a.set_xlim(x_lo, x_hi)
-        if logy and y_decades:
-            top = max((float(np.max(line.get_data()[0])) for line in a.patches if hasattr(line, 'get_data')),
-                      default=None)
-            if top and top > 0:
-                a.set_ylim(top * 10 ** (-y_decades), top * 2)
-
-    if style == 'stack':
-        fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
-        for label, c in curves.items():
-            colors = families[label]
-            bottom = np.zeros(len(widths))
-            for g in groups:                                   # heaviest at the bottom
-                top = bottom + scale(c[g])
-                ax.stairs(top, x_bins, baseline=bottom, fill=True, color=colors[g], linewidth=0,
-                          label=f"{label} {GROUP_LABELS[g]}".strip())
-                bottom = top
-            if total:
-                ax.stairs(scale(c[total]), x_bins, color=colors['total'], linewidth=1.2,
-                          label=f"{label} {GROUP_LABELS[total]}".strip())
-        finish(ax)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        if legend:
-            ax.legend(frameon=False, fontsize=8)
-        return fig, ax
-
-    if style == 'lines':
-        fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
-        for label, c in curves.items():
-            colors = families[label]
-            for g in groups:
-                ax.stairs(scale(c[g]), x_bins, color=colors[g], linestyle=GROUP_LINESTYLES.get(g, '-'),
-                          linewidth=1.2)
-            if total:
-                ax.stairs(scale(c[total]), x_bins, color=colors['total'], linewidth=2.4)
-        finish(ax)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        if legend:
-            # two legends: colour family = curve, shade and line style = group
-            curve_handles = [Patch(color=families[label][groups[0]], label=label or 'spectrum') for label in curves]
-            grey = group_colors('Greys', groups)
-            group_handles = [Line2D([], [], color=grey[g], linestyle=GROUP_LINESTYLES.get(g, '-'), linewidth=1.2,
-                                    label=GROUP_LABELS[g]) for g in groups]
-            if total:
-                group_handles.insert(0, Line2D([], [], color=grey['total'], linewidth=2.4,
-                                               label=GROUP_LABELS[total]))
-            first = ax.legend(handles=curve_handles, frameon=False, fontsize=8, loc='upper left',
-                              bbox_to_anchor=(1.01, 1.0))
-            ax.add_artist(first)
-            ax.legend(handles=group_handles, frameon=False, fontsize=8, loc='lower left', bbox_to_anchor=(1.01, 0.0))
-        return fig, ax
-
-    shown = ([total] if total else []) + list(groups)
-    n = len(shown)
-    ncols = 2 if n > 2 else 1
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.2 * nrows), sharex=True, squeeze=False)
-    for k, (a, g) in enumerate(zip(axes.flat, shown)):
-        for label, c in curves.items():
-            color = families[label]['total'] if g == total else families[label][groups[0]]
-            a.stairs(scale(c[g]), x_bins, color=color, linewidth=1.4, label=label or None)
-        a.set_title(GROUP_LABELS.get(g, g), fontsize=10)
-        finish(a)
-        if k % ncols == 0:
-            a.set_ylabel(ylabel)
-    for a in axes.flat[n:]:
-        a.set_visible(False)
-    for col in range(ncols):                                     # x labels on the lowest visible panel of each column
-        visible = [axes[row, col] for row in range(nrows) if row * ncols + col < n]
-        if visible:
-            visible[-1].set_xlabel(xlabel)
-            visible[-1].xaxis.set_tick_params(labelbottom=True)
-    if legend and any(curves):
-        axes.flat[0].legend(frameon=False, fontsize=8)
-    fig.tight_layout()
-    return fig, axes
+    p = _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormaps, show_light, xlim, xlabel,
+                    ylabel, observable)
+    return _LAYOUTS[p['style']](p, ax, y_decades, legend)
 
 
 # --- Diagnostics of a Paleodetector ----------------------------------------------------------------------------------

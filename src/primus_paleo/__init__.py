@@ -19,8 +19,9 @@ Modules:
     plotting        spectra split by track group, diagnostics of a detector (depth profiles, secondary production)
     _core           constants, binnings, species tables, track groups, depth-table maths (internal)
 
-Every public name of these modules is available here. Other names (private helpers, the live value of
-DEFAULT_INTEGRATION_X_BINS_NM changed by set_integration_x_bins_nm) are looked up in the modules at access time.
+Every name in the __all__ of these modules is available here (each module lists its own public names). Other
+names (private helpers, the live value of DEFAULT_INTEGRATION_X_BINS_NM changed by set_integration_x_bins_nm) are
+looked up in the modules at access time.
 Assigning a name here (pp.X = ...) does not change the modules: edit _core.py for constants.
 """
 from importlib.metadata import PackageNotFoundError, version as _version
@@ -31,21 +32,23 @@ except PackageNotFoundError:                                  # running from the
     __version__ = "0+unknown"
 
 from . import config, _core, flux, detector, geant4_runs, observables, plotting
-from .config import (set_data_path, data_path, set_geant4_path, geant4_app_path, flux_template_dir,
-                     mineral_library_path, load_mineral_library, mineral_config, describe)
-from .flux import FluxHistory, FluxTemplate, MCEQ_SPECIES, list_flux_models
+
+# Every module lists its public names in __all__; those are re-exported here and make up the package's __all__.
+# _MODULES is also where __getattr__ looks up the other names, in this order.
+_MODULES = (_core, detector, flux, geant4_runs, observables, plotting, config)
+for _module in _MODULES:
+    if not hasattr(_module, '__all__'):
+        raise ImportError(f"{_module.__name__} defines no __all__: list its public names there.")
+
+from .config import *
+from .flux import *
 from ._core import *
 from .detector import *
 from .geant4_runs import *
 from .observables import *
 from .plotting import *
 
-__all__ = (['config', 'set_data_path', 'data_path', 'set_geant4_path', 'geant4_app_path', 'flux_template_dir',
-            'mineral_library_path', 'load_mineral_library', 'mineral_config', 'describe',
-            'FluxHistory', 'FluxTemplate', 'MCEQ_SPECIES', 'list_flux_models']
-           + _core.__all__ + detector.__all__ + geant4_runs.__all__ + observables.__all__ + plotting.__all__)
-
-_MODULES = (_core, detector, flux, geant4_runs, observables, plotting, config)
+__all__ = ['config'] + [name for _module in _MODULES for name in _module.__all__]
 
 
 def __getattr__(name):
