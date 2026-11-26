@@ -384,7 +384,6 @@ class Paleodetector:
         self.set_flux_history(flux_history)
 
         self._nuclear_data_cache = {}
-        self._depth_interpolators = {}
         self._geometry_cache = {}
         self._depth_tables = {}
 
@@ -393,7 +392,7 @@ class Paleodetector:
         for species in COMPUTABLE_SPECIES:
             if species in self.energy_bins:
                 try:
-                    self._load_depth_interpolators(species=species)
+                    self._depth_table(species)
                 except (FileNotFoundError, ValueError) as err:
                     if self.verbose > 0:
                         print(f"Warning: {species} cannot be computed, no usable StdRock depth table ({err}).")
@@ -515,7 +514,7 @@ class Paleodetector:
         lines = [f"Created paleo-detector {self.name}, species available for computation:"]
         for species, info in self._geant4_runs.items():
             e = info['edges']
-            note = ("" if species in self._depth_interpolators else
+            note = ("" if self._has_depth_table(species) else
                     ("  (integrate_atmospheric_neutrinos; secondaries made in "
                      + ("StdRock)" if _list_geant4_energy_files(os.path.join(self.data_path, "Geant4_data", "StdRock",
                                                                              species)) else "the mineral: no StdRock runs)"))
@@ -542,7 +541,7 @@ class Paleodetector:
             list[str]: Computable species with mineral runs and a StdRock depth table, plus the secondary species
             whose product is among them.
         """
-        out = [s for s in COMPUTABLE_SPECIES if s in self.energy_bins and s in self._depth_interpolators]
+        out = [s for s in COMPUTABLE_SPECIES if s in self.energy_bins and self._has_depth_table(s)]
         out += [d for d, src in DERIVED_SPECIES.items() if src in out]
         return out
 
@@ -1100,53 +1099,35 @@ class Paleodetector:
         return geo
 
 
-    def _load_depth_interpolators(self, species='mu-'):
-        """Sets up the depth-probability model of a species from the StdRock runs.
+    def _depth_table(self, species):
+        """Depth table of a species from its StdRock runs, built on first use and cached in _depth_tables.
 
-        Muons (mu- and mu+ share the mu- table) use the empirical distribution of the
-        stopping depth R. It gives the capture probability in a slab (mu- only),
-        F(z_max) - F(z_min), and the normal-interaction probability, with interaction
-        density proportional to P(R > z): (G(z_max) - G(z_min)) / E[R].
+        Muons (mu- and mu+ share the mu- table) use the empirical distribution of the stopping depth R (rows with
+        remaining primary energy 0); hadrons (StdRock/neutron, StdRock/proton) the distribution of all interaction
+        depths up to the NEUTRON_TAIL_P quantile, with an exponential tail beyond it (maximum-likelihood length:
+        mean excess beyond the last node). For protons the interactions stop where the proton stops, which the
+        empirical distribution contains. Every outNuclei_<E>.txt in the StdRock directory is used, so a denser
+        energy grid is picked up automatically. Energies with fewer than MIN_DEPTH_SAMPLES depths, or whose depths
+        reach TRUNCATION_FRACTION of the StdRock target (the particle may have left it), are skipped with a warning.
 
-        Hadrons (neutron, proton: StdRock/<species>) use the empirical distribution of the
-        interaction depths up to the NEUTRON_TAIL_P quantile, with an exponential tail
-        beyond it; the probability of an interaction in a slab is F(z_max) - F(z_min).
-        For protons the interactions stop where the proton stops, which the empirical
-        distribution contains.
-
-        Every outNuclei_<E>.txt in the StdRock directory is used, so a denser energy
-        grid is picked up automatically.
+        Built for every computable species by __init__ (a species whose table cannot be built is not computable,
+        see available_species); read by _depth_rows, _slab_interaction_probabilities and _secondary_window_mwe.
 
         Args:
-            species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
-        """
-        tab_species = 'mu-' if species in MUON_SPECIES else species
-        if tab_species not in self._depth_tables:
-            self._depth_tables[tab_species] = self._build_depth_table(tab_species)
-
-        self._depth_interpolators[species] = {'table': tab_species}
-
-
-    def _build_depth_table(self, tab_species):
-        """Builds the depth quantile table of one StdRock species.
-
-        Energies with fewer than MIN_DEPTH_SAMPLES depths, or whose depths reach
-        TRUNCATION_FRACTION of the StdRock target (the particle may have left the
-        target), are skipped with a warning.
-
-        Args:
-            tab_species (str): 'mu-' (stopping depths, rows with remaining primary
-                energy 0) or a hadron, 'neutron' or 'proton' (all interaction depths).
+            species (str): 'mu-', 'mu+', 'neutron' or 'proton'.
 
         Returns:
-            dict: 'energies' [GeV], 'p' (node probabilities), 'q' (quantile nodes
-            [m.w.e.], shape (n_energies, n_nodes)) and, for hadrons, 'tail_lambda'
-            (exponential-tail length per energy [m.w.e.]).
+            dict: 'energies' [GeV], 'p' (node probabilities), 'q' (quantile nodes [m.w.e.], shape (n_energies,
+            n_nodes)) and, for hadrons, 'tail_lambda' (exponential-tail length per energy [m.w.e.]).
 
         Raises:
             FileNotFoundError: If the StdRock directory has no output files.
             ValueError: If fewer than two energies are usable.
         """
+        tab_species = 'mu-' if species in MUON_SPECIES else species
+        if tab_species in self._depth_tables:
+            return self._depth_tables[tab_species]
+
         data_dir = os.path.join(self.data_path, "Geant4_data", f"StdRock/{tab_species}")
         is_muon = tab_species == 'mu-'
 
@@ -1200,86 +1181,75 @@ class Paleodetector:
         table = {'energies': np.array(energies), 'p': p_nodes, 'q': np.array(rows)}
         if not is_muon:
             table['tail_lambda'] = np.array(tails)
+        self._depth_tables[tab_species] = table
         return table
 
 
-    def _depth_quantiles(self, energies_gev, tab_species='mu-'):
-        """Depth quantile nodes at arbitrary energies.
+    def _has_depth_table(self, species):
+        """Whether the depth table of a species (the mu- table for mu+) has been built (see _depth_table)."""
+        return ('mu-' if species in MUON_SPECIES else species) in self._depth_tables
 
-        Interpolated in log-log between the tabulated energies, then forced
-        non-decreasing along the nodes.
+
+    def _depth_rows(self, species, energies_gev):
+        """Depth quantile nodes (and, for hadrons, exponential-tail lengths) at arbitrary energies.
+
+        Interpolated in log-log between the tabulated energies of _depth_table (_loglog_interp_rows); the nodes are
+        then forced non-decreasing. Called by _slab_interaction_probabilities (primaries) and _secondary_recoils
+        (products of the secondary cascade).
 
         Args:
+            species (str): 'mu-', 'mu+', 'neutron' or 'proton'.
             energies_gev (array_like): Energies [GeV], shape (n,).
-            tab_species (str, optional): 'mu-' (stopping depths), 'neutron' or 'proton'
-                (interaction depths). Defaults to 'mu-'.
 
         Returns:
-            np.ndarray: Quantile nodes [m.w.e.], shape (n, n_nodes).
+            tuple[np.ndarray, np.ndarray or None]: Quantile nodes [m.w.e.], shape (n, n_nodes), and tail lengths
+            [m.w.e.], shape (n,) (None for muons).
         """
-        table = self._depth_tables[tab_species]
-        q = _loglog_interp_rows(energies_gev, table['energies'], table['q'])
-        return np.maximum.accumulate(q, axis=-1)
+        table = self._depth_table(species)
+        q = np.maximum.accumulate(_loglog_interp_rows(energies_gev, table['energies'], table['q']), axis=-1)
+        if 'tail_lambda' not in table:
+            return q, None
+        return q, _loglog_interp_rows(energies_gev, table['energies'], table['tail_lambda'])[:, 0]
 
 
-    def _muon_depth_probabilities(self, e_vals, z_min_grid, z_max_grid):
-        """Muon interaction probabilities in a slab.
+    def _slab_interaction_probabilities(self, species, e_vals, z_min_grid, z_max_grid):
+        """Probability that a primary of each energy interacts in the sample slab, per category of recoils.
+
+        The categories are those of the recoil histograms of the mineral runs (_mineral_run_histograms), so that
+        _primary_recoils weights each histogram with its own probability:
+
+        * mu-: 'elastic' (the interactions along the path, with density proportional to P(R > z):
+          (G(z_max) - G(z_min)) / E[R]) and 'peak' (the stop, followed by capture: F(z_max) - F(z_min)), R being the
+          stopping depth (_piecewise_cdf_and_integral gives F and G).
+        * mu+: 'all', the interactions along the path (as 'elastic' above; the stop gives no capture).
+        * neutron, proton: 'all', the interaction depth inside the slab, F(z_max) - F(z_min) (_slab_probability).
+
+        Called by _primary_recoils.
 
         Args:
-            e_vals (np.ndarray): Muon energies [GeV], shape (n_E,), along the last
-                axis of the z grids.
+            species (str): 'mu-', 'mu+', 'neutron' or 'proton'.
+            e_vals (np.ndarray): Energies [GeV], shape (n_E,), along the last axis of the z grids.
             z_min_grid (np.ndarray): Slab top along the path [m.w.e.], shape (..., n_E).
             z_max_grid (np.ndarray): Slab bottom along the path [m.w.e.], same shape.
 
         Returns:
-            tuple[np.ndarray, np.ndarray]:
-                prob_tail: normal interactions, (G(z_max) - G(z_min)) / E[R].
-                prob_peak: stopping (capture for mu-), F(z_max) - F(z_min).
+            dict: {category: probability, same shape as z_min_grid}.
         """
-        q_rows = self._depth_quantiles(e_vals, 'mu-')
-        p = self._depth_tables['mu-']['p']
-        prob_tail = np.empty_like(z_min_grid, dtype=float)
-        prob_peak = np.empty_like(z_min_grid, dtype=float)
+        q_rows, tails = self._depth_rows(species, e_vals)
+        p = self._depth_table(species)['p']
+        if species not in MUON_SPECIES:
+            return {'all': _slab_probability(q_rows, p, z_min_grid, z_max_grid, tails)}
+        path = np.empty_like(z_min_grid, dtype=float)
+        stop = np.empty_like(z_min_grid, dtype=float)
         for j in range(len(e_vals)):
             F_lo, G_lo = _piecewise_cdf_and_integral(z_min_grid[..., j], q_rows[j], p)
             F_hi, G_hi = _piecewise_cdf_and_integral(z_max_grid[..., j], q_rows[j], p)
             _, mean_range = _piecewise_cdf_and_integral(np.inf, q_rows[j], p)
-            prob_tail[..., j] = (G_hi - G_lo) / mean_range
-            prob_peak[..., j] = F_hi - F_lo
-        return prob_tail, prob_peak
-
-
-    def _hadron_depth_probability(self, e_vals, z_min_grid, z_max_grid, tab_species='neutron'):
-        """Probability that a hadron interacts in a slab.
-
-        Args:
-            e_vals (np.ndarray): Hadron energies [GeV], shape (n_E,), along the last
-                axis of the z grids.
-            z_min_grid (np.ndarray): Slab top along the path [m.w.e.], shape (..., n_E).
-            z_max_grid (np.ndarray): Slab bottom along the path [m.w.e.], same shape.
-            tab_species (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
-
-        Returns:
-            np.ndarray: F(z_max) - F(z_min), same shape as z_min_grid.
-        """
-        table = self._depth_tables[tab_species]
-        q_rows = self._depth_quantiles(e_vals, tab_species)
-        tail_lambdas = self._hadron_tail_lambdas(e_vals, tab_species)
-        return _slab_probability(q_rows, table['p'], z_min_grid, z_max_grid, tail_lambdas)
-
-
-    def _hadron_tail_lambdas(self, energies_gev, tab_species='neutron'):
-        """Exponential-tail length of a hadron depth distribution.
-
-        Args:
-            energies_gev (array_like): Energies [GeV], shape (n,).
-            tab_species (str, optional): 'neutron' or 'proton'. Defaults to 'neutron'.
-
-        Returns:
-            np.ndarray: Tail length [m.w.e.], shape (n,), log-log interpolated.
-        """
-        table = self._depth_tables[tab_species]
-        return _loglog_interp_rows(energies_gev, table['energies'], table['tail_lambda'])[:, 0]
+            path[..., j] = (G_hi - G_lo) / mean_range
+            stop[..., j] = F_hi - F_lo
+        if species == 'mu-':
+            return {'elastic': path, 'peak': stop}
+        return {'all': path}
 
 
     def _flux_time_kyr(self, t_kyr):
@@ -1311,7 +1281,7 @@ class Paleodetector:
         Returns:
             float: Window width along the path [m.w.e.].
         """
-        table = self._depth_tables[product]
+        table = self._depth_table(product)
         survive_last = 1.0 - table['p'][-1]
         depth = table['q'][:, -1] + table['tail_lambda'] * np.log(
             survive_last / SECONDARY_WINDOW_SURVIVAL
@@ -1652,135 +1622,99 @@ class Paleodetector:
         return Y.reshape(n_t, n_c, n_b, n_k), delta, offsets
 
 
-    def _primary_recoils(
-        self,
-        t_kyr_array,
-        energy_bins_gev=None,
-        total_simulated_particles=1e4,
-        species='mu-',
-    ):
+    def _primary_recoils(self, t_kyr_array, energy_bins_gev=None, total_simulated_particles=1e4, species='mu-'):
         """Recoils in the sample slab made by one primary cosmic-ray species (mu-, mu+, neutron, proton).
 
-        For each primary-energy bin, the flux is integrated over energy and zenith
-        angle, weighted by the probability of an interaction in the slab
-        [overburden, overburden + slab thickness] (along the slanted path), and
-        multiplied by the recoils per primary of the mineral run at that energy.
-        For mu-, captures use a single energy-independent capture spectrum (averaged
-        over runs with E0 <= CAPTURE_SPECTRUM_MAX_E0_GEV) times the total stopping
-        probability in the slab. All timesteps are processed at once; each file is
-        read once. The flux does not depend on the zenith, so it is evaluated once on the energy nodes of every cell
-        (_energy_cell_nodes) and broadcast over cos(zenith) (COS_ZENITH_NODES). Called by
-        integrate_particle_signal_spectrum (also through integrate_all_particles).
+        The sample is a slab [X, X + thickness] at overburden X(t), seen along each slanted path (both divided by
+        cos(zenith)); its thickness is that of a 1 mg cube. For each energy cell of the mineral runs, the flux is
+        integrated over the cell (_energy_cell_nodes) and over cos(zenith) (COS_ZENITH_NODES) times the probability
+        of an interaction in the slab, one per category of recoils (_slab_interaction_probabilities), and multiplied
+        by the recoils per primary of the run at the lower edge of the cell in that category
+        (_mineral_run_histograms): 'all' for mu+ and hadrons, 'elastic' and 'peak' for mu-.
+
+        mu- captures ('peak', the muon stops in the slab) use one capture spectrum for every energy: the mean of the
+        peak recoils of the runs with E0 <= CAPTURE_SPECTRUM_MAX_E0_GEV (a stopped muon does not remember its initial
+        energy, and the low-energy runs have the most stops), times the total stopping probability in the slab
+        summed over all cells. Without such runs each run's own peak recoils are used (warning).
+
+        All times are processed at once and each file is read once. Called by integrate_particle_signal_spectrum
+        (also through integrate_all_particles).
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
-            energy_bins_gev (np.ndarray, optional): Primary energy bin edges [GeV].
-                Defaults to None (all the Geant4 files of the species).
-            total_simulated_particles (float, optional): Primaries per Geant4 run.
-                Defaults to 1e4.
+            energy_bins_gev (np.ndarray, optional): Primary energy cell edges [GeV]. Defaults to None (all the
+                Geant4 files of the species).
+            total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
             species (str, optional): 'mu-', 'mu+', 'neutron' or 'proton'. Defaults to 'mu-'.
 
         Returns:
             dict: Recoil spectra (see _recoil_spectra), shape (T, n_recoil_bins) per fragment.
 
         Raises:
-            ValueError: If flux_history or the depth tables are not initialised.
+            ValueError: If flux_history is not set or the species has no depth table.
         """
         energy_bins_gev = self._energy_edges(species, edges=energy_bins_gev)
         if self.flux_history is None:
-            raise ValueError(
-                "flux_history not initialized: use set_flux_history() or an integrate_* function."
-            )
-        if not self._depth_interpolators.get(species):
-            raise ValueError(f"Depth interpolators not initialized for species {species}.")
+            raise ValueError("flux_history not initialized: use set_flux_history() or an integrate_* function.")
+        if not self._has_depth_table(species):
+            raise ValueError(f"No StdRock depth table for {species}: it cannot be computed (see available_species).")
 
-        target_volume_cm3 = 1.e-3/self.config['density_g_cm3']
-
-        target_thickness_cm = np.power(target_volume_cm3, 1/3)
-
+        rho = self.config['density_g_cm3']
+        thickness_cm = np.power(1.e-3 / rho, 1 / 3)
+        thickness_mwe = thickness_cm * 0.01 * rho
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
-        n_t = t_kyr_array.shape[0]
-
-        depth_mwe_array = self._overburden_interpolator(t_kyr_array)
-        t_kyr_flux_array = self._flux_time_kyr(t_kyr_array)
-
-        geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
-        fragment_spectra = {}
-        target_thickness_mwe = target_thickness_cm * 0.01 * self.config['density_g_cm3']
+        n_t = t_kyr_array.size
+        depth_mwe = self._overburden_interpolator(t_kyr_array)
 
         c_vals = COS_ZENITH_NODES
         e_nodes, e_weights = _energy_cell_nodes(energy_bins_gev)
-        flux_nodes = self.flux_history.get_map(species, t_kyr_flux_array, e_nodes)[2].reshape(n_t, *e_nodes.shape)
+        flux_nodes = self.flux_history.get_map(species, self._flux_time_kyr(t_kyr_array), e_nodes)[2].reshape(
+            n_t, *e_nodes.shape)
+        run_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
 
-        def over_energy_and_zenith(integrand, i):
-            """Integral over cell i (last axis, _energy_cell_nodes) and over cos(zenith) (trapezoid on c_vals)."""
-            return np.trapezoid(np.sum(integrand * e_weights[i], axis=-1), c_vals, axis=-1)
+        fragment_spectra = {}
+        peak_per_run, capture_counts = {}, {}             # mu- only
+        stop_weight_total, n_capture_runs = np.zeros(n_t), 0
+        for i, e_lo in enumerate(energy_bins_gev[:-1]):
+            E_grid, C_grid = np.meshgrid(e_nodes[i], c_vals)
+            z_min_grid = depth_mwe[:, None, None] / C_grid[None, :, :]
+            z_max_grid = z_min_grid + thickness_mwe / C_grid[None, :, :]
+            flux_grid = np.broadcast_to(flux_nodes[:, None, i, :], (n_t, *E_grid.shape))
+            probabilities = self._slab_interaction_probabilities(species, e_nodes[i], z_min_grid, z_max_grid)
+            weights = {category: np.trapezoid(np.sum(flux_grid * prob * e_weights[i], axis=-1), c_vals, axis=-1)
+                       for category, prob in probabilities.items()}                   # (T,) per category
+            if 'peak' in weights:
+                stop_weight_total += weights['peak']
 
-        if species == 'mu-':
-            capture_counts, per_file_peak = {}, {}
-            n_capture_files = 0
-            weight_peak_total_t = np.zeros(n_t)
-
-        for i in range(len(energy_bins_gev) - 1):
-            e_min = energy_bins_gev[i]
-
-            e_vals = e_nodes[i]
-            E_grid, C_grid = np.meshgrid(e_vals, c_vals)
-
-            z_min_grid = depth_mwe_array[:, None, None] / C_grid[None, :, :]
-            z_max_grid = z_min_grid + target_thickness_mwe / C_grid[None, :, :]
-            flux_grid_gev_cm2_s_sr = np.broadcast_to(flux_nodes[:, None, i, :], (n_t, *E_grid.shape))
-
-            if species in ('mu-', 'mu+'):
-                prob_tail_grid, prob_peak_grid = self._muon_depth_probabilities(
-                    e_vals, z_min_grid, z_max_grid
-                )
-                weight_elastic_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_tail_grid, i)
-                if species == 'mu-':
-                    weight_peak_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_peak_grid, i)
-                    weight_peak_total_t += weight_peak_t
-            else:
-                prob_attenuation_grid = self._hadron_depth_probability(
-                    e_vals, z_min_grid, z_max_grid, self._depth_interpolators[species]['table']
-                )
-                weight_elastic_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_attenuation_grid, i)
-
-            filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_min:.6f}.txt")
-            hist = _mineral_run_histograms(filepath)
+            hist = _mineral_run_histograms(os.path.join(run_dir, f"outNuclei_{e_lo:.6f}.txt"))
             if hist is None:
                 continue
-
-            if species == 'mu-':
-                use_for_capture = e_min <= CAPTURE_SPECTRUM_MAX_E0_GEV
-                if use_for_capture:
-                    n_capture_files += 1
-
+            for_capture = 'peak' in weights and e_lo <= CAPTURE_SPECTRUM_MAX_E0_GEV
+            n_capture_runs += for_capture
             for frag in sorted(hist['all']):
-                if species == 'mu-':
-                    counts_peak = hist['peak'][frag]
-                    if counts_peak is not None:
-                        _accumulate_into(per_file_peak, frag, np.outer(weight_peak_t, counts_peak))
-                        if use_for_capture:
-                            _accumulate_into(capture_counts, frag, counts_peak)
-
-                    counts_elastic = hist['elastic'][frag]
-                    if counts_elastic is not None:
-                        _accumulate_into(fragment_spectra, frag, np.outer(weight_elastic_t, counts_elastic))
-                else:
-                    _accumulate_into(fragment_spectra, frag, np.outer(weight_elastic_t, hist['all'][frag]))
+                for category, w in weights.items():
+                    counts = hist[category][frag]
+                    if counts is None:
+                        continue
+                    if category == 'peak':
+                        _accumulate_into(peak_per_run, frag, np.outer(w, counts))
+                        if for_capture:
+                            _accumulate_into(capture_counts, frag, counts)
+                    else:
+                        _accumulate_into(fragment_spectra, frag, np.outer(w, counts))
 
         if species == 'mu-':
-            if n_capture_files > 0:
+            if n_capture_runs > 0:
                 for frag, counts in capture_counts.items():
-                    _accumulate_into(fragment_spectra, frag, np.outer(weight_peak_total_t, counts / n_capture_files))
+                    _accumulate_into(fragment_spectra, frag, np.outer(stop_weight_total, counts / n_capture_runs))
             else:
                 if self.verbose > 0:
                     print(f"Warning: no mu- run with E0 <= {CAPTURE_SPECTRUM_MAX_E0_GEV} GeV; "
                           "using the per-energy capture spectra.")
-                for frag, spectrum in per_file_peak.items():
+                for frag, spectrum in peak_per_run.items():
                     _accumulate_into(fragment_spectra, frag, spectrum)
 
-        norm = target_thickness_cm * self.config['density_g_cm3'] * total_simulated_particles * KYR_PER_SECOND
+        norm = thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
         return _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragment_spectra.items()}, t_kyr_array)
 
 
@@ -1896,9 +1830,8 @@ class Paleodetector:
             geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
 
             # bin-averaged slab probability, shape (N_C, n_b, n_e)
-            table = self._depth_tables[product]
-            q_rows = self._depth_quantiles(e_cells, product)
-            tails = self._hadron_tail_lambdas(e_cells, product)
+            table = self._depth_table(product)
+            q_rows, tails = self._depth_rows(product, e_cells)
             prob = np.empty((len(c_vals), n_b, n_e))
             for m in range(n_e):
                 def H(z):
