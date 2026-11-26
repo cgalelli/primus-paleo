@@ -13,7 +13,8 @@
 Modules:
     config          where the data root and the Geant4 application are (set_data_path, PRIMUS_DATA, ...)
     detector        the Paleodetector class
-    flux            cosmic-ray flux templates and histories (FluxHistory)
+    flux            cosmic-ray flux templates and histories (FluxTemplate, FluxHistory), built with MCEq
+    primaries       primary cosmic-ray fluxes: spec kinds, model registry (register_flux_model), tabulated fluxes
     geant4_runs     running the Geant4 application (materials, runs, stopping-power tables)
     observables     what is measured: etch pits, etched spectra, microscope resolution, rebinning
     plotting        spectra split by track group, diagnostics of a detector (depth profiles, secondary production)
@@ -31,17 +32,18 @@ try:
 except PackageNotFoundError:                                  # running from the sources without installing
     __version__ = "0+unknown"
 
-from . import config, _core, flux, detector, geant4_runs, observables, plotting
+from . import config, _core, flux, detector, geant4_runs, observables, plotting, primaries
 
 # Every module lists its public names in __all__; those are re-exported here and make up the package's __all__.
 # _MODULES is also where __getattr__ looks up the other names, in this order.
-_MODULES = (_core, detector, flux, geant4_runs, observables, plotting, config)
+_MODULES = (_core, detector, flux, primaries, geant4_runs, observables, plotting, config)
 for _module in _MODULES:
     if not hasattr(_module, '__all__'):
         raise ImportError(f"{_module.__name__} defines no __all__: list its public names there.")
 
 from .config import *
 from .flux import *
+from .primaries import *
 from ._core import *
 from .detector import *
 from .geant4_runs import *
