@@ -8,6 +8,9 @@ from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.special import erfc, roots_jacobi
 
 from . import config
+from ._core import SECONDS_PER_YEAR
+
+__all__ = ['FluxHistory', 'FluxTemplate', 'MCEQ_SPECIES', 'list_flux_models', 'register_flux_model']
 
 def _hemisphere_gauss_legendre(n_angles):
     """
@@ -475,7 +478,6 @@ except ImportError:
 # Time grids are fixed per model (log-spaced; keys t_min_yr, t_max_yr, n_times; 'tcut' = t_max_yr): the detector
 # refines its own time grid around the template times.
 
-SECONDS_PER_YEAR = 3.156e7
 CM_PER_PC = 3.086e18
 SPEED_OF_LIGHT_CM_S = 2.998e10
 MASS_GROUP_IDS = {'H': 14, 'p': 14, 'proton': 14, 'He': 402, 'CNO': 1206, 'MgAlSi': 2814, 'Fe': 5626}
@@ -738,6 +740,19 @@ _TABLE_AXES = {
     'energy_per_nucleon_gev': ('flux_cm2_s_sr_gev', 'A'),
     'rigidity_gv': ('flux_cm2_s_sr_gv', 'Z'),
 }
+
+
+def _normalised_composition(composition):
+    """Fractions of a composition {nucleus: fraction} normalised to sum to 1. Called by _legacy_tabulated (an array
+    flux split among nuclei, primary_spectrum_spec).
+
+    Raises:
+        ValueError: If the fractions do not add up to more than 0.
+    """
+    total = float(sum(composition.values()))
+    if total <= 0:
+        raise ValueError("composition fractions must add up to more than 0.")
+    return {k: float(v) / total for k, v in composition.items()}
 
 
 def _tabulated_data(spec):

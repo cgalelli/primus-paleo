@@ -5,8 +5,7 @@ Layout (see config for how the two roots are found):
   <data>/mineral_library.yaml                 materials (density_g_cm3, nuclei, stoich)
   <data>/Geant4_data/<material>/<particle>/   outNuclei_<E>.txt + geometry.json, read by Paleodetector
   <data>/Geant4_data/<material>/Range/        DEDX_Z<z>_A<a>.txt stopping-power tables
-  <app>/build/Run                             compiled Geant4 application (<app> = <repository>/geant4, or
-                                              <data>/Geant4_data in the layout before the package)
+  <app>/build/Run                             compiled Geant4 application (<app> = <repository>/geant4)
   <app>/build/materials.mac, run.in, *.log    generated macros and logs
   <app>/build/output/                         where Run writes outNuclei_<i>.txt (i = run index)
 The application is always started from <app>, so the relative paths it uses internally (build/output) do not depend
@@ -42,14 +41,14 @@ GEANT4_NEUTRINO_REGION = "TargetRegion"           # region of the biased neutrin
 NEUTRINO_TARGET_INTERACTION_FRACTION = 0.05       # biased interactions per primary aimed at by suggested_neutrino_bias
 
 
-def geant4_paths(data_path=None, geant4_dir=None):
+def geant4_paths(data_dir=None, geant4_dir=None):
     """Absolute paths of the Geant4 layout above.
 
     Purpose: the single place where the Geant4 folders are built, so that the run functions work from any working
     directory (notebook, script, other folder).
 
     Args:
-        data_path (str, optional): Data root. Defaults to None (config.data_path()).
+        data_dir (str, optional): Data root. Defaults to None (config.data_path()).
         geant4_dir (str, optional): Folder of the application, the one containing build/Run. Defaults to None
             (config.geant4_app_path()).
 
@@ -58,8 +57,8 @@ def geant4_paths(data_path=None, geant4_dir=None):
         (working directory of the application), 'build', 'executable', 'materials_macro', 'output' (raw output of
         the application).
     """
-    data = config.data_path(data_path)
-    app = config.geant4_app_path(geant4_dir, data)
+    data = config.data_path(data_dir)
+    app = config.geant4_app_path(geant4_dir)
     build = os.path.join(app, "build")
     return {
         'data': data,
@@ -73,13 +72,13 @@ def geant4_paths(data_path=None, geant4_dir=None):
     }
 
 def add_material(name, nuclei, stoich, density_g_cm3,
-                 uranium_concentration_g_g=2.8e-6, an_coeff_n_alpha=1, data_path=None):
+                 uranium_concentration_g_g=2.8e-6, an_coeff_n_alpha=1, data_dir=None):
     """
     Adds a new material to mineral_library
     """
     import yaml
 
-    file_path = config.mineral_library_path(data_path)
+    file_path = config.mineral_library_path(data_dir)
 
     with open(file_path, "r") as file:
         data = yaml.safe_load(file) or {}
@@ -152,16 +151,16 @@ def geant4_environment():
     return env
 
 
-def write_materials_macro(data_path=None, yaml_path=None, out_path=None, verbose=True):
+def write_materials_macro(data_dir=None, yaml_path=None, out_path=None, verbose=True):
     """Writes the Geant4 macro defining every material of the mineral library.
 
     One /testhadr/defineMaterial command per material: "<name> <density_g_cm3> <El1> <n1> ...", stoich being relative
     atom counts (DetectorConstruction converts them to mass fractions).
 
     Args:
-        data_path (str, optional): Data root. Defaults to None (config.data_path()).
+        data_dir (str, optional): Data root. Defaults to None (config.data_path()).
         yaml_path (str, optional): Mineral library. Defaults to <data>/mineral_library.yaml.
-        out_path (str, optional): Macro written. Defaults to <data>/Geant4_data/build/materials.mac.
+        out_path (str, optional): Macro written. Defaults to <app>/build/materials.mac (geant4_paths).
         verbose (bool, optional): Print what was written. Defaults to True.
 
     Returns:
@@ -172,7 +171,7 @@ def write_materials_macro(data_path=None, yaml_path=None, out_path=None, verbose
     """
     import yaml
 
-    paths = geant4_paths(data_path)
+    paths = geant4_paths(data_dir)
     yaml_path = paths['library'] if yaml_path is None else os.path.abspath(yaml_path)
     out_path = paths['materials_macro'] if out_path is None else os.path.abspath(out_path)
     with open(yaml_path) as f:
@@ -193,12 +192,12 @@ def write_materials_macro(data_path=None, yaml_path=None, out_path=None, verbose
     return sorted(library)
 
 
-def material_density_g_cm3(mineral_name, data_path=None, yaml_path=None):
+def material_density_g_cm3(mineral_name, data_dir=None, yaml_path=None):
     """Density used for a material in Geant4 [g/cm^3], or None if unknown.
 
     Args:
         mineral_name (str): Material name (library key, or a material hardcoded in DetectorConstruction).
-        data_path (str, optional): Data root. Defaults to None (config.data_path()).
+        data_dir (str, optional): Data root. Defaults to None (config.data_path()).
         yaml_path (str, optional): Mineral library. Defaults to <data>/mineral_library.yaml.
 
     Returns:
@@ -208,7 +207,7 @@ def material_density_g_cm3(mineral_name, data_path=None, yaml_path=None):
 
     if mineral_name in GEANT4_HARDCODED_DENSITIES_G_CM3:
         return GEANT4_HARDCODED_DENSITIES_G_CM3[mineral_name]
-    yaml_path = geant4_paths(data_path)['library'] if yaml_path is None else yaml_path
+    yaml_path = geant4_paths(data_dir)['library'] if yaml_path is None else yaml_path
     with open(yaml_path) as f:
         library = yaml.safe_load(f)
     entry = library.get(mineral_name)
@@ -301,7 +300,7 @@ def _update_geometry_json(path, geometry, energies_gev, n_events, biases=None, v
 
 def run_geant4_simulation(mineral_name, particle_type, n_events, energies_gev, ion_type=None,
                           target_length_m=None, target_radius_m=GEANT4_TARGET_RADIUS_M, neutrino_bias=None,
-                          production_cut_mm=GEANT4_PRODUCTION_CUT_MM, data_path=None, geant4_dir=None, verbose=True):
+                          production_cut_mm=GEANT4_PRODUCTION_CUT_MM, data_dir=None, geant4_dir=None, verbose=True):
     """Runs the Geant4 application for one material and primary at a list of energies, and files the output.
 
     For each energy E, n_events primaries are shot along the axis of the target cylinder (from its top face) and the
@@ -328,7 +327,7 @@ def run_geant4_simulation(mineral_name, particle_type, n_events, energies_gev, i
         target_radius_m (float, optional): Target radius [m]. Defaults to GEANT4_TARGET_RADIUS_M.
         neutrino_bias (float, sequence, callable or None, optional): Neutrino cross-section bias (see above).
         production_cut_mm (float, optional): Geant4 production cut [mm]. Defaults to GEANT4_PRODUCTION_CUT_MM.
-        data_path (str, optional): Data root (Paleodetector's data_path_prefix). Defaults to None (config.data_path()).
+        data_dir (str, optional): Data root (as Paleodetector's data_dir). Defaults to None (config.data_path()).
         geant4_dir (str, optional): Folder of the application (containing build/Run). Defaults to None
             (config.geant4_app_path()).
         verbose (bool, optional): Print progress. Defaults to True.
@@ -344,7 +343,7 @@ def run_geant4_simulation(mineral_name, particle_type, n_events, energies_gev, i
     import shutil
     import subprocess
 
-    paths = geant4_paths(data_path, geant4_dir)
+    paths = geant4_paths(data_dir, geant4_dir)
     if not os.path.exists(paths['executable']):
         raise FileNotFoundError(f"Geant4 application not found: {paths['executable']} (compile it in {paths['build']}).")
     energies_gev = np.atleast_1d(np.asarray(energies_gev, dtype=float))
@@ -362,8 +361,8 @@ def run_geant4_simulation(mineral_name, particle_type, n_events, energies_gev, i
     final_output_dir = os.path.join(paths['geant4'], mineral_name, folder)
     os.makedirs(paths['output'], exist_ok=True)
     os.makedirs(final_output_dir, exist_ok=True)
-    write_materials_macro(data_path, out_path=paths['materials_macro'], verbose=False)
-    density = material_density_g_cm3(mineral_name, data_path)
+    write_materials_macro(data_dir, out_path=paths['materials_macro'], verbose=False)
+    density = material_density_g_cm3(mineral_name, data_dir)
 
     # bias per energy (neutrinos only) and grouping into application runs with one bias each
     is_neutrino = particle_type in NEUTRINO_SPECIES
@@ -466,7 +465,7 @@ def get_all_known_isotopes(max_z=65):
     return sorted(isotopes)
 
 
-def export_all_stopping_powers(mineral_name, max_z=65, data_path=None, geant4_dir=None, verbose=True):
+def export_all_stopping_powers(mineral_name, max_z=65, data_dir=None, geant4_dir=None, verbose=True):
     """Exports the dE/dx and range tables of every known isotope up to max_z in a material.
 
     Runs the Geant4 application in its bypass mode (--export-dedx <material> <Z> <A> <out_dir> <materials macro>)
@@ -476,7 +475,7 @@ def export_all_stopping_powers(mineral_name, max_z=65, data_path=None, geant4_di
     Args:
         mineral_name (str): Material (mineral library key).
         max_z (int, optional): Highest atomic number. Defaults to 65.
-        data_path (str, optional): Data root. Defaults to None (config.data_path()).
+        data_dir (str, optional): Data root. Defaults to None (config.data_path()).
         geant4_dir (str, optional): Folder of the application (containing build/Run). Defaults to None
             (config.geant4_app_path()).
         verbose (bool, optional): Print progress and errors. Defaults to True.
@@ -489,12 +488,12 @@ def export_all_stopping_powers(mineral_name, max_z=65, data_path=None, geant4_di
     """
     import subprocess
 
-    paths = geant4_paths(data_path, geant4_dir)
+    paths = geant4_paths(data_dir, geant4_dir)
     if not os.path.exists(paths['executable']):
         raise FileNotFoundError(f"Geant4 application not found: {paths['executable']} (compile it in {paths['build']}).")
     output_dir = os.path.join(paths['geant4'], mineral_name, "Range")
     os.makedirs(output_dir, exist_ok=True)
-    write_materials_macro(data_path, out_path=paths['materials_macro'], verbose=False)
+    write_materials_macro(data_dir, out_path=paths['materials_macro'], verbose=False)
     env = geant4_environment()
 
     isotopes = get_all_known_isotopes(max_z)
