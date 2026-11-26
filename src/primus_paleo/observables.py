@@ -4,7 +4,7 @@ and diagnostic profiles and plots of a Paleodetector's depth tables and secondar
 import numpy as np
 
 from ._core import (
-    MUON_SPECIES, SECONDARY_SOURCES, _resolve_x_bins,
+    MUON_SPECIES, SECONDARY_SOURCES, _depth_cdf_rows, _resolve_x_bins,
 )
 
 __all__ = [
@@ -15,31 +15,41 @@ __all__ = [
 def interaction_profiles(mineral, energies_gev, z_edges_mwe, species=('neutron', 'proton', 'mu-'), capture=True):
     """Interaction depth profiles from the StdRock depth tables, as used by the integrations.
 
-    Hadrons: dP/dz of the interaction depth, F(z_hi) - F(z_lo) per bin (exponential tail included).
-    Muons:   in-flight interactions only (no capture), (G(z_hi) - G(z_lo)) / E[R] per bin, i.e. interaction
-             density proportional to the survival probability P(R > z); mu+ uses the same mu- table.
+    The same distributions as Paleodetector._slab_interaction_probabilities, on depth bins instead of the sample
+    slab (both from _depth_cdf_rows on the tables of Paleodetector._depth_table):
+
+    * Hadrons: dP/dz of the interaction depth, F(z_hi) - F(z_lo) per bin (exponential tail included).
+    * Muons: the in-flight interactions, (G(z_hi) - G(z_lo)) / E[R] per bin, i.e. an interaction density
+      proportional to the survival probability P(R > z); with capture=True, plus the stops, F(z_hi) - F(z_lo) (the
+      mu- capture peak; for mu+ the stop is a decay, and the detector does not count it). mu+ uses the mu- table.
 
     Args:
-        mineral (Paleodetector): any detector of the mineral (the tables come from StdRock, not from the mineral).
-        energies_gev (array_like): primary energies [GeV].
-        z_edges_mwe (np.ndarray): depth bin edges along the path [m.w.e.].
-        species (tuple[str]): any of 'neutron', 'proton', 'mu-', 'mu+' (with a depth table).
+        mineral (Paleodetector): Any detector of the mineral (the tables come from StdRock, not from the mineral).
+        energies_gev (array_like): Primary energies [GeV].
+        z_edges_mwe (np.ndarray): Depth bin edges along the path [m.w.e.].
+        species (tuple[str], optional): Any of 'neutron', 'proton', 'mu-', 'mu+' (with a depth table). Defaults
+            to ('neutron', 'proton', 'mu-').
+        capture (bool, optional): Add the muon stops to the in-flight interactions. Defaults to True.
 
     Returns:
         dict: species -> dP/dz [1/m.w.e.], shape (n_depth_bins, n_energies).
     """
     E = np.atleast_1d(np.asarray(energies_gev, float))
+    z_edges_mwe = np.asarray(z_edges_mwe, float)
     z_lo = np.broadcast_to(z_edges_mwe[:-1, None], (len(z_edges_mwe) - 1, E.size))
     z_hi = np.broadcast_to(z_edges_mwe[1:, None], z_lo.shape)
     dz = np.diff(z_edges_mwe)[:, None]
     out = {}
     for s in species:
+        q_rows, tails = mineral._depth_rows(s, E)
+        p = mineral._depth_table(s)['p']
+        F_lo, G_lo = _depth_cdf_rows(z_lo, q_rows, p, tails)
+        F_hi, G_hi = _depth_cdf_rows(z_hi, q_rows, p, tails)
         if s in MUON_SPECIES:
-            prob, _capture = mineral._muon_depth_probabilities(E, z_lo, z_hi)   # in flight; _capture = stopping peak
-            if capture:
-                prob += _capture
+            mean_range = _depth_cdf_rows(np.full(E.size, np.inf), q_rows, p)[1]
+            prob = (G_hi - G_lo) / mean_range + ((F_hi - F_lo) if capture else 0.0)
         else:
-            prob = mineral._hadron_depth_probability(E, z_lo, z_hi, s)
+            prob = F_hi - F_lo
         out[s] = prob / dz
     return out
 
@@ -48,7 +58,7 @@ def plot_secondary_production(self, sources=None, products=('neutron', 'proton')
                                 example_species='mu-', example_energy_gev=None, t_kyr=None):
     """Overview of the secondary neutrons and protons produced in the StdRock runs, in three panels.
 
-    Purpose: a diagnostic of the input of the atmospheric secondary cascade (_secondary_yield), straight from the
+    Purpose: a diagnostic of the input of the atmospheric secondary cascade (_secondary_cascade), straight from the
     StdRock rows (_load_stdrock_rows), to see which primaries make the secondaries, where and with what energy.
         (a) Yield: secondaries per primary vs primary energy, one line per source and product.
         (b) Where and with what energy: production depth vs secondary energy (neutrons + protons) for one run.
@@ -221,8 +231,10 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
                         rng=None, x_bins=None, out_bins=None, etch_type="HF"):
     """Monte Carlo of the etched-pit size distribution on the final surface, from a latent track-length spectrum.
 
-    Same population and normalisation as slice_spectrum (tracks per mg -> tracks on sample_area_cm2), with the
-    measured size given by the pit opening of `etch_pit_axes` instead of the projected track length.
+    The latent tracks of counts_mg (tracks per mg) are placed at random in a sample volume of 1 mg (a cube of side
+    (1e-3 / density)^(1/3)), and scaled to sample_area_cm2 of surface: n = area / side^2 x total tracks. Each has a
+    random dip (isotropic, or angular_pdf) and depth; the measured size is the opening of its etch pit
+    (etch_pit_axes).
 
     The latent spectrum and the measured sizes can use different binnings: `x_bins` describes `counts_mg` (e.g. the
     wide bins of the theoretical spectrum) and `out_bins` the returned histogram (e.g. the bins of the descriptor).
@@ -235,7 +247,8 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         removed_nm (float, optional): Bulk layer removed, h = v_B * t [nm]. Default from `etch_type`.
         v_ratio (float, optional): V = v_T / v_B. Default from `etch_type`.
         lateral_ratio (float, optional): See etch_pit_axes (1 isotropic, 0 directional). Default from `etch_type`.
-        angular_pdf (np.ndarray, optional): As in slice_spectrum. Defaults to isotropic.
+        angular_pdf (np.ndarray, optional): Relative probability of the dip angle on a uniform grid from 0 to pi/2
+            (len(angular_pdf) points). Defaults to None (isotropic: sin(dip) uniform).
         min_width_nm (float, optional): Pits with minor axis below this width are not resolved and are dropped
             (optical resolution). Defaults to 1125 nm.
         measure (str, optional): 'major' (what OptimusPrimus reports as length) or 'minor'.

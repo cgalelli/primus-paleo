@@ -9,7 +9,6 @@ from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
-from mendeleev import element
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
@@ -24,8 +23,9 @@ from ._core import (
     SECONDARY_WINDOW_SURVIVAL, STOPPING_P_NODES, TIME_GRID_ATTENUATION_MWE, TIME_GRID_BACKBONE,
     TIME_GRID_FLUX_PROBES, TIME_GRID_MAX_PASSES, TIME_GRID_MAX_POINTS, TIME_GRID_RTOL, TOTAL_ALL_FRAGMENTS,
     TOTAL_NO_LIGHT_IONS, TRACK_GROUPS, TRACK_GROUPS_KEY, TRACK_LENGTH_BINS_NM, TRACK_SUMS, TRUNCATION_FRACTION,
-    U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, atomic_number, predict_track_groups, track_group,
-    WATT_B_PER_MEV, _ENERGY_EDGE_RTOL, _LIGHT_ION_SYMBOLS,
+    U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, fragment_za, predict_track_groups, track_group,
+    WATT_B_PER_MEV, _ENERGY_EDGE_RTOL, OBSERVABLE_TRACKS, OBSERVABLE_RECOIL_ENERGY, OBSERVABLES,
+    RADIOGENIC_SOURCES, FISSION_KEYS, ENERGY_CELL_NODES, COS_ZENITH_NODES, _depth_cdf_rows,
     _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
     _rebin_density, _resolve_x_bins, _restrict_edges,
     is_light_ion, normalize_fragment_names,
@@ -37,19 +37,11 @@ __all__ = [
 
 
 # --- Speed helpers: caches and a compiled loop. None of them changes a number of the results. ------------------------
-# numba is optional: without it _secondary_yield uses its numpy loop instead of _window_source_numba.
+# numba is optional: without it _secondary_cascade uses its numpy loop instead of _window_source_numba.
 
-# mendeleev's element() runs a database query (~0.2 s per call, once per fragment and conversion), so Z is read
-# from the table in _core; unknown symbols still go to mendeleev.
 def _element_symbol(z):
-    """Element symbol of an atomic number."""
+    """Element symbol of an atomic number (names the fission fragments, see _fission_fragment_recoils)."""
     return ELEMENT_SYMBOLS[int(z) - 1]
-
-
-def _atomic_number(symbol):
-    """Atomic number of an element symbol (_core table; mendeleev only for a symbol not in it)."""
-    z = atomic_number(symbol)
-    return z if z is not None else element(symbol).atomic_number
 
 
 # Process-wide cache of what is read from the Geant4 files: per-fragment recoil histograms of the mineral runs, the
@@ -179,7 +171,7 @@ if _numba is not None:
     @_numba.njit(cache=True, parallel=True)
     def _window_source_numba(A, depth, primary_cell, cell, lo_idx, hi_idx, beyond, window_top, phi_cell, weight,
                              delta, n_b, n_q, k0, active):
-        """Compiled form of the (t, c) loop of _secondary_yield: same operations on each row, same order of
+        """Compiled form of the (t, c) loop of _secondary_cascade: same operations on each row, same order of
         summation within each bin (np.bincount adds the weights in row order from 0, then the sum is added to A).
         The times are independent (each writes only A[t]) and run in parallel threads; only those with active[t]."""
         n_t, n_c = lo_idx.shape
@@ -214,17 +206,7 @@ def _combine_track_results(results):
     return {k: sum(r[k] for r in results if k in r) for k in keys}
 
 
-# --- Recoil spectra and observables ------------------------------------------------------------------------------------
-# Every source (cosmic-ray primaries and secondaries, neutrinos, radiogenic neutrons, fission fragments) is first turned
-# into recoil spectra (_recoil_spectra), then into a density of the observable on a fine grid (Paleodetector.
-# _recoil_density: track lengths or recoil energies), then into counts in the output bins (Paleodetector.
-# _density_to_counts: time integral, rebinning, sums and groups, selection). Fission tracks are the one exception to
-# the first step (one track per fission, two fragments: Paleodetector._fission_track_density).
-OBSERVABLE_TRACKS = 'tracks'
-OBSERVABLE_RECOIL_ENERGY = 'recoil_energy'
-OBSERVABLES = (OBSERVABLE_TRACKS, OBSERVABLE_RECOIL_ENERGY)
-RADIOGENIC_SOURCES = ('fission_fragments', 'fission_n', 'alpha_n')
-FISSION_KEYS = ('heavier', 'lighter', 'pair')
+# --- Recoil spectra, observables and quadratures (the constants are in _core: OBSERVABLES, ENERGY_CELL_NODES, ...) ----
 
 
 def _output_axes(observable, x_bins, x_grid):
@@ -267,14 +249,6 @@ def _recoil_spectra(fragments, t_kyr=None):
     return {'t_kyr': t_kyr, 'fragments': {k: v for k, v in fragments.items() if k != 'neutron'}}
 
 
-# Quadrature of the flux integrals: each Geant4 run at the lower edge of an energy cell stands for every particle in
-# the cell, so the flux (or emission spectrum) is integrated over the cell with the trapezoidal rule on
-# ENERGY_CELL_NODES linear points (_energy_cell_nodes); the slab interactions are integrated over cos(zenith) on
-# COS_ZENITH_NODES.
-ENERGY_CELL_NODES = 50
-COS_ZENITH_NODES = np.linspace(0.01, 1.0, 50)
-
-
 def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
     """Nodes and trapezoidal weights for integrals over each energy cell.
 
@@ -298,62 +272,11 @@ def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
     return nodes, weights
 
 
-def _depth_cdf_rows(z, q_rows, p, tail_lambdas=None):
-    """F(z) = P(R <= z) and G(z) = integral_0^z (1 - F) of a depth distribution, for many energies at once.
-
-    The vectorised form of _core._piecewise_cdf_and_integral (see there for the meaning of F and G, the linear
-    interpolation between the quantile nodes and the exponential tail), with the same formulas: row j of q_rows (one
-    energy) applies to z[..., j]. Only the node search runs row by row (each row has its own nodes); everything
-    else is computed for all rows at once. Called by Paleodetector._slab_interaction_probabilities (primaries) and
-    Paleodetector._secondary_recoils (products of the secondary cascade).
-
-    Args:
-        z (array_like): Depths [m.w.e.], shape (..., n_E); the last axis runs over the rows of q_rows. May be inf.
-        q_rows (np.ndarray): Quantile nodes per energy [m.w.e.], non-decreasing along each row, shape (n_E, n).
-        p (np.ndarray): Probabilities of the nodes, shape (n,), p[0] = 0.
-        tail_lambdas (np.ndarray, optional): Exponential-tail length per energy [m.w.e.], shape (n_E,); required
-            when p[-1] < 1. Defaults to None (no tail: F = 1 beyond the last node).
-
-    Returns:
-        tuple[np.ndarray, np.ndarray]: F and G, same shape as z (G(inf) is the mean depth E[R]).
-    """
-    z = np.asarray(z, dtype=float)
-    q_rows = np.asarray(q_rows, dtype=float)
-    n_e, n = q_rows.shape
-    q0, q_last = q_rows[:, 0], q_rows[:, -1]
-    dq = np.diff(q_rows, axis=1)
-    slope_all = np.divide(np.diff(p)[None, :], dq, out=np.zeros_like(dq), where=dq > 0)
-    g_nodes = np.empty_like(q_rows)
-    g_nodes[:, 0] = q0
-    g_nodes[:, 1:] = q0[:, None] + np.cumsum(dq * (1.0 - 0.5 * (p[:-1] + p[1:]))[None, :], axis=1)
-
-    zc = np.clip(z, q0, q_last)
-    row = np.broadcast_to(np.arange(n_e), z.shape)
-    k = np.empty(z.shape, dtype=np.intp)
-    for j in range(n_e):
-        k[..., j] = np.searchsorted(q_rows[j], z[..., j], side='right') - 1
-    k = np.clip(k, 0, n - 2)
-    t = zc - q_rows[row, k]
-    slope, p_k = slope_all[row, k], p[k]
-
-    if tail_lambdas is None:
-        F_beyond, G_beyond = 1.0, g_nodes[:, -1]
-    else:
-        survive = 1.0 - p[-1]
-        decay = np.exp(-np.maximum(z - q_last, 0.0) / tail_lambdas)
-        F_beyond = 1.0 - survive * decay
-        G_beyond = g_nodes[:, -1] + survive * tail_lambdas * (1.0 - decay)
-    F = np.where(z < q0, 0.0, np.where(z >= q_last, F_beyond, p_k + slope * t))
-    G_inside = g_nodes[row, k] + t * (1.0 - p_k) - 0.5 * slope * t**2
-    G = np.where(z < q0, z, np.where(z >= q_last, G_beyond, G_inside))
-    return F, G
-
-
 def _product_axis(product_bins_gev):
     """Layout of the products of a cascade on one flat axis: product p occupies its energy cells at offsets[p].
 
     Shared by the two cascades that follow neutrons, protons (and, for neutrinos, muons) through all their
-    generations: Paleodetector._secondary_yield (atmospheric secondaries) and the neutrino path
+    generations: Paleodetector._secondary_cascade (atmospheric secondaries) and the neutrino path
     (Paleodetector._neutrino_run_pass, _neutrino_product_operator, integrate_atmospheric_neutrinos).
 
     Args:
@@ -525,9 +448,15 @@ class Paleodetector:
 
 
     def fragment_track_group(self, fragment):
-        """Track group ('heavy', 'medium_heavy', 'medium_light' or 'light') of a fragment key, e.g. "Na23"."""
-        corr = _LIGHT_ION_SYMBOLS.get(fragment, fragment)
-        return track_group(_atomic_number(''.join(filter(str.isalpha, corr))), self.track_groups)
+        """Track group ('heavy', 'medium_heavy', 'medium_light' or 'light') of a fragment key, e.g. "Na23".
+
+        Raises:
+            ValueError: If the key is not a nucleus (fragment_za).
+        """
+        za = fragment_za(fragment)
+        if za is None:
+            raise ValueError(f"{fragment!r} is not a nucleus.")
+        return track_group(za[0], self.track_groups)
 
 
     def describe_track_groups(self):
@@ -1509,7 +1438,7 @@ class Paleodetector:
 
         source == product gives the same-type generations, source != product the cross-generations (e.g. neutrons
         from protons). Called by:
-          * _secondary_yield, with a depth binning: C[l, d, m] is the number of products in energy cell m made
+          * _secondary_cascade, with a depth binning: C[l, d, m] is the number of products in energy cell m made
             between d * delta_mwe and (d + 1) * delta_mwe after the entry point, per primary in cell l (products
             beyond n_offsets bins are left out);
           * _neutrino_product_operator (medium 'StdRock'), without: G[l, m] counts the products made anywhere in
@@ -1544,7 +1473,7 @@ class Paleodetector:
     @staticmethod
     def _window_source_shared(A, times, rows, lo_idx, hi_idx, beyond, window_top, phi_cell, delta, n_b, n_q,
                               product_slice):
-        """Source term of _secondary_yield for several times at the same overburden, added to A.
+        """Source term of _secondary_cascade for several times at the same overburden, added to A.
 
         Same window, binning and rows as the per-time loop (see there), but the rows are counted once per direction,
         by primary energy cell i, window bin b and product cell k (N[i, b, k]); each time t then gets
@@ -1576,9 +1505,10 @@ class Paleodetector:
                 len(times), n_b, n_q)
 
 
-    def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
-                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES):
-        """Secondary neutrons and protons born in a window above the sample, per direction, as one cascade.
+    def _secondary_cascade(self, t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
+                           total_simulated_particles=1e4, species_list=SECONDARY_SOURCES):
+        """Secondary neutrons and protons born in a window above the sample, per direction, as one cascade: its source
+        and its response. Called by _secondary_recoils.
 
         For each time t and direction c, the path to the sample has slant depth S = X(t) / c. The window
         [S - W, S] along the path (W: the largest _secondary_window_mwe of the products) is split into
@@ -1600,6 +1530,15 @@ class Paleodetector:
 
             Y_b (I - C[0] / 2) = A_b + sum_{b' < b} Y_b' (C[b - b' - 1] + C[b - b']) / 2
 
+        This recursion is linear and the same at every bin, so its solution is a convolution of the source with
+        response blocks M_d (K x K) that do not depend on time or direction:
+
+            Y_b = sum_{b' <= b} A_b' M_{b - b'},   M_0 = S,   M_d = sum_{d'=1..d} M_{d - d'} T_d' S,
+
+        with S = (I - C[0] / 2)^-1 and T_d = (C[d - 1] + C[d]) / 2. The cascade is returned as (A, M): Y itself, shape
+        (T, N_C, SECONDARY_WINDOW_BINS, K), is never formed, since only its products with the slab probability are
+        needed (see _secondary_recoils).
+
         Secondaries are assumed to keep the direction of the primary. Sources without StdRock runs are skipped;
         a product without StdRock runs makes no further generations (reported).
 
@@ -1620,10 +1559,12 @@ class Paleodetector:
                 Defaults to SECONDARY_SOURCES.
 
         Returns:
-            tuple[np.ndarray, float, dict]:
-                Y: products born in each window bin and cell [cm^-2 s^-1 sr^-1], shape (T, N_C, SECONDARY_WINDOW_BINS, K).
+            tuple[np.ndarray, np.ndarray, float, dict]:
+                A: products made by the primaries in each window bin and cell [cm^-2 s^-1 sr^-1], shape
+                (T, N_C, SECONDARY_WINDOW_BINS, K).
+                M: response blocks, shape (SECONDARY_WINDOW_BINS, K, K).
                 delta: window bin width along the path [m.w.e.].
-                offsets: {product: slice of the last axis of Y}.
+                offsets: {product: slice of the product axis}.
         """
         products = list(product_bins_gev)
         product_bins_gev = {q: np.asarray(e, dtype=float) for q, e in product_bins_gev.items()}
@@ -1702,17 +1643,13 @@ class Paleodetector:
         else:
             self._log("Warning: same-bin secondary multiplication >= 1; ignoring it.")
             same_bin_inv = np.eye(n_k)
-        transfer = [None] + [0.5 * (C[:, k - 1, :] + C[:, k, :]) for k in range(1, n_b + 1)]
+        transfer = [None] + [0.5 * (C[:, k - 1, :] + C[:, k, :]) for k in range(1, n_b)]
 
-        A = A.reshape(n_t * n_c, n_b, n_k)
-        Y = np.zeros_like(A)
-        for b in range(n_b):
-            y = A[:, b, :].copy()
-            for bp in range(b):
-                y += Y[:, bp, :] @ transfer[b - bp]
-            Y[:, b, :] = y @ same_bin_inv
-
-        return Y.reshape(n_t, n_c, n_b, n_k), delta, offsets
+        M = np.empty((n_b, n_k, n_k))
+        M[0] = same_bin_inv
+        for d in range(1, n_b):
+            M[d] = sum(M[d - dp] @ transfer[dp] for dp in range(1, d + 1)) @ same_bin_inv
+        return A, M, delta, offsets
 
 
     def _primary_recoils(self, t_kyr_array, energy_bins_gev=None, total_simulated_particles=1e4, species='mu-'):
@@ -1868,7 +1805,7 @@ class Paleodetector:
 
         Called by _integrate_secondary_species (one solve of the cascade for every secondary species requested).
 
-        Products born in the window above the sample (see _secondary_yield, which follows all generations and
+        Products born in the window above the sample (see _secondary_cascade, which follows all generations and
         cross-generations) travel along the primary's direction to the slab. For a product of type q born
         uniformly in window bin b, at distance d in [d0, d0 + delta] from the slab top, the probability of
         interacting in the slab (path tau = t_slab / c) is averaged over the bin exactly:
@@ -1881,6 +1818,14 @@ class Paleodetector:
 
         and the recoils per product of the mineral run of q at the lower edge E_m of each cell are applied with
         the normalisation of _primary_recoils.
+
+        The cascade comes as its source A and response blocks M (Y_b = sum_{b' <= b} A_b' M_{b - b'}), and P does not
+        depend on time, so the sum over b is done backwards (adjoint form) instead of building Y:
+
+            sum_b Y_b[k] P_b[k] = sum_{b', j} A_b'[j] V_b'[j, k],   V_b'[j, k] = sum_{d >= 0} M_d[j, k] P_{b' + d}[k],
+
+        V once per direction, then one matrix product per direction for all the times. Equal to building Y up to
+        the order of the floating-point additions.
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
@@ -1908,24 +1853,20 @@ class Paleodetector:
         depth_mwe_array = np.atleast_1d(self._overburden_interpolator(t_kyr_array))
 
         c_vals = COS_ZENITH_NODES
-        Y, delta, offsets = self._secondary_yield(
+        A, M, delta, offsets = self._secondary_cascade(
             t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
             total_simulated_particles, secondary_sources,
         )
-        n_b = Y.shape[2]
+        n_t, n_c, n_b, n_k = A.shape
         d0 = (n_b - 1 - np.arange(n_b)) * delta
         tau = target_thickness_mwe / c_vals
-        z_d0 = np.broadcast_to(d0[None, :], (len(c_vals), n_b))
-        z_tau = np.broadcast_to(tau[:, None], (len(c_vals), n_b))
+        z_d0 = np.broadcast_to(d0[None, :], (n_c, n_b))
+        z_tau = np.broadcast_to(tau[:, None], (n_c, n_b))
 
-        norm = target_thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
-        out = {}
+        P = np.empty((n_c, n_b, n_k))
         for product, energy_bins_gev in product_bins_gev.items():
             n_e = len(energy_bins_gev) - 1
-            e_cells = energy_bins_gev[:-1]
-            geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
-
-            q_rows, tails = self._depth_rows(product, e_cells)
+            q_rows, tails = self._depth_rows(product, energy_bins_gev[:-1])
             p = self._depth_table(product)['p']
 
             def H(z):
@@ -1933,9 +1874,22 @@ class Paleodetector:
                 z = np.broadcast_to(z[..., None], (*z.shape, n_e))
                 return z - _depth_cdf_rows(z, q_rows, p, tails)[1]
 
-            prob = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau) - H(z_d0 + delta) + H(z_d0)) / delta
+            P[..., offsets[product]] = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau) - H(z_d0 + delta) + H(z_d0)) / delta
 
-            weight_t = np.trapezoid(np.einsum('tcbm,cbm->tcm', Y[..., offsets[product]], prob), c_vals, axis=1)
+        W = np.empty((n_t, n_c, n_k))
+        for c in range(n_c):
+            V = np.zeros((n_b, n_k, n_k))
+            for d in range(n_b):
+                V[:n_b - d] += M[d][None, :, :] * P[c, d:, None, :]
+            W[:, c, :] = A[:, c].reshape(n_t, n_b * n_k) @ V.reshape(n_b * n_k, n_k)
+
+        norm = target_thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
+        out = {}
+        for product, energy_bins_gev in product_bins_gev.items():
+            n_e = len(energy_bins_gev) - 1
+            e_cells = energy_bins_gev[:-1]
+            geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
+            weight_t = np.trapezoid(W[..., offsets[product]], c_vals, axis=1)
             if product in energy_windows:
                 lo, hi = energy_windows[product]
                 tol = 1 + _ENERGY_EDGE_RTOL
@@ -2003,11 +1957,9 @@ class Paleodetector:
 
         out, missing = {}, []
         for name, counts in sorted(spectra['fragments'].items()):
-            symbol_a = _LIGHT_ION_SYMBOLS.get(name, name)
-            ion_z = _atomic_number(''.join(filter(str.isalpha, symbol_a)))
-            ion_a = int(''.join(filter(str.isdigit, symbol_a)))
-            filepath = os.path.join(range_dir, f"DEDX_Z{ion_z}_A{ion_a}.txt")
-            if not os.path.exists(filepath):
+            za = fragment_za(name)
+            filepath = None if za is None else os.path.join(range_dir, f"DEDX_Z{za[0]}_A{za[1]}.txt")
+            if filepath is None or not os.path.exists(filepath):
                 missing.append(name)
                 continue
             e_mev, dee_dx_mev_um, den_dx_mev_um, length_um = _range_table(filepath)
@@ -2198,7 +2150,7 @@ class Paleodetector:
     ):
         """Track (or recoil-energy) counts of several atmospheric secondary species from one solve of the cascade.
 
-        The neutron + proton cascade (_secondary_yield) is computed once, with every followable product on its
+        The neutron + proton cascade (_secondary_cascade) is computed once, with every followable product on its
         full grid, and each requested secondary species takes its own product from it (restricted to its energy
         range, if given, without changing the cascade: see _secondary_grids). Called by integrate_all_particles
         (one worker for all the secondary species) and integrate_particle_signal_spectrum.
@@ -2358,7 +2310,7 @@ class Paleodetector:
     def _flux_cell_integral(self, species, t_kyr_array, edges_gev):
         """Flux of a species integrated over each energy cell, at local times (_energy_cell_nodes quadrature).
 
-        Called by _secondary_yield (primaries of the StdRock runs) and _neutrino_run_pass (neutrino runs): the run at
+        Called by _secondary_cascade (primaries of the StdRock runs) and _neutrino_run_pass (neutrino runs): the run at
         the lower edge of a cell is weighted by the flux integrated over its cell.
 
         Args:

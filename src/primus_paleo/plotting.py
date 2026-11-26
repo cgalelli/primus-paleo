@@ -1,4 +1,4 @@
-"""Plots of track-length spectra split by track group (heavy, medium_heavy, medium_light, light).
+"""Plots of track-length (or recoil-energy) spectra split by track group (heavy, medium_heavy, medium_light, light).
 
 Each curve (a scenario, a species, a sample...) gets one colour family; its track groups are shades of that family,
 darkest for the heaviest group. Three layouts, chosen by `style`:
@@ -15,11 +15,13 @@ darkest for the heaviest group. Three layouts, chosen by `style`:
 Input: the dicts returned with nucleus='groups', e.g.
 
     x_bins, cr = det.integrate_all_particles(nucleus='groups')
-    _, nu = det.integrate_atmospheric_neutrinos(nucleus='groups')
-    _, rad = det.integrate_background_neutron_spectrum(x_bins=x_bins, nucleus='groups')
-    _, fis = det.integrate_fission_spectrum(x_bins=x_bins, nucleus='groups')
-    plot_track_groups({'cosmic rays': cr['total'], 'neutrinos': nu['total'], 'radiogenic n': rad,
-                       'fission': fis}, x_bins)
+    _, nu = det.integrate_atmospheric_neutrinos(x_bins=x_bins, nucleus='groups')
+    _, rad = det.integrate_radiogenic(x_bins=x_bins, nucleus='groups')
+    plot_track_groups({'cosmic rays': cr['total'], 'neutrinos': nu['total'],
+                       'radiogenic n': rad['fission_n'], 'fission': rad['fission_fragments']}, x_bins)
+
+Recoil-energy spectra (observable='recoil_energy' in the integrate_* functions) are plotted the same way with
+observable='recoil_energy' here, which sets the axis labels and a logarithmic energy axis.
 """
 
 import numpy as np
@@ -42,6 +44,11 @@ TOTAL_SHADE = 1.0
 GROUP_LINESTYLES = {'heavy': '-', 'medium_heavy': '-', 'medium_light': '--', 'light': ':'}
 # sequential matplotlib colour maps, one family per curve
 DEFAULT_COLORMAPS = ('Blues', 'Oranges', 'Greens', 'Purples', 'Reds', 'Greys', 'YlOrBr', 'PuRd')
+# default axes of each observable of the integrate_* functions
+_AXES = {
+    'tracks': {'xlabel': 'Track length [nm]', 'counts': 'Tracks', 'unit': 'nm', 'logx': False},
+    'recoil_energy': {'xlabel': 'Recoil energy [MeV]', 'counts': 'Recoils', 'unit': 'MeV', 'logx': True},
+}
 
 
 def group_colors(cmap, groups=TRACK_GROUPS):
@@ -71,22 +78,22 @@ def _as_curves(curves):
 
 
 def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=TOTAL_NO_LIGHT_IONS, ax=None,
-                      per_nm=False, logx=False, logy=None, colormaps=DEFAULT_COLORMAPS, show_light=True,
-                      xlim='auto', y_decades=None, xlabel='Track length [nm]', ylabel=None, legend=True):
-    """Plots track-length spectra split by track group.
+                      per_nm=False, logx=None, logy=None, colormaps=DEFAULT_COLORMAPS, show_light=True,
+                      xlim='auto', y_decades=None, xlabel=None, ylabel=None, legend=True, observable='tracks'):
+    """Plots track-length (or recoil-energy) spectra split by track group.
 
     Args:
         curves (dict): {label: dict with the track groups and the totals} (nucleus='groups' output), or one such
             dict alone.
-        x_bins (np.ndarray): Bin edges of the spectra [nm].
+        x_bins (np.ndarray): Bin edges of the spectra [nm, or MeV for recoil energies].
         style (str, optional): 'auto', 'stack', 'lines' or 'panels' (see the module docstring). Defaults to 'auto'.
         groups (tuple[str], optional): Groups to show, heaviest first. Defaults to TRACK_GROUPS.
         total (str or None, optional): Total drawn with the groups: 'total_no_light_ions', 'total' or None.
             Defaults to 'total_no_light_ions'.
         ax (matplotlib Axes, optional): Axes for 'stack' and 'lines' (a new figure if None). Ignored by 'panels'.
-        per_nm (bool, optional): Plot tracks per nm (counts / bin width) instead of counts per bin. Defaults to
-            False.
-        logx (bool, optional): Logarithmic track-length axis. Defaults to False.
+        per_nm (bool, optional): Plot counts per unit of the x axis (counts / bin width: per nm, or per MeV for
+            recoil energies) instead of counts per bin. Defaults to False.
+        logx (bool, optional): Logarithmic x axis. Defaults to None: False for tracks, True for recoil energies.
         logy (bool, optional): Logarithmic y axis. Defaults to None: False for 'stack', True otherwise.
         colormaps (tuple, optional): Colour families of the curves, in order. Defaults to DEFAULT_COLORMAPS.
         show_light (bool, optional): Include the 'light' group. Defaults to True.
@@ -95,15 +102,17 @@ def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=T
         y_decades (float or None, optional): With a log y axis, limit the y range of each axes to this many
             decades below its maximum (e.g. 6, to hide far tails). Defaults to None (matplotlib's range, which
             keeps curves many orders of magnitude apart visible).
-        xlabel (str, optional): x-axis label.
-        ylabel (str, optional): y-axis label. Defaults to tracks per mg per bin (or per nm).
+        xlabel (str, optional): x-axis label. Defaults to the track length or the recoil energy.
+        ylabel (str, optional): y-axis label. Defaults to tracks (or recoils) per mg per bin (or per nm, per MeV).
         legend (bool, optional): Draw the legend(s). Defaults to True.
+        observable (str, optional): 'tracks' or 'recoil_energy', as given to the integrate_* function; sets the
+            default labels and x scale. Defaults to 'tracks'.
 
     Returns:
         tuple: (fig, axes), axes being one Axes or, for 'panels', an array of them.
 
     Raises:
-        ValueError: If style is unknown or a curve lacks a group.
+        ValueError: If style or observable is unknown, or a curve lacks a group.
     """
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -122,10 +131,17 @@ def plot_track_groups(curves, x_bins, style='auto', groups=TRACK_GROUPS, total=T
         raise ValueError(f"style must be 'auto', 'stack', 'lines' or 'panels', got {style!r}.")
     if logy is None:
         logy = style != 'stack'
+    if observable not in _AXES:
+        raise ValueError(f"observable must be one of {tuple(_AXES)}, got {observable!r}.")
+    axis = _AXES[observable]
+    if logx is None:
+        logx = axis['logx']
+    if xlabel is None:
+        xlabel = axis['xlabel']
     widths = np.diff(x_bins)
     scale = (lambda v: np.asarray(v, dtype=float) / widths) if per_nm else (lambda v: np.asarray(v, dtype=float))
     if ylabel is None:
-        ylabel = 'Tracks / mg / nm' if per_nm else 'Tracks / mg / bin'
+        ylabel = f"{axis['counts']} / mg / {axis['unit'] if per_nm else 'bin'}"
     families = {label: group_colors(colormaps[i % len(colormaps)], groups) for i, label in enumerate(curves)}
 
     x_lo = x_bins[0] if not logx else x_bins[x_bins > 0][0]
