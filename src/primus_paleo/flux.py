@@ -1,3 +1,33 @@
+"""Cosmic-ray fluxes at the site of a sample: primary fluxes, the atmospheric secondaries MCEq makes from them
+(FluxTemplate) and their history over time (FluxHistory), as read by Paleodetector.
+
+Timeline. FluxHistory works in absolute time [kyr]: 0 is the present, negative values the past (Paleodetector maps
+its local time, 0 = start of exposure, onto it). A baseline holds at all times; an event (a supernova, a boost)
+adds, from its start_time_kyr on, the flux of a transient template, whose own time axis t_since_yr is the time since
+the event in years; a geomagnetic excursion swaps the cutoff of the baseline and events over [start, end).
+
+Specs. A template is described by a spec dict of one of three kinds (see the "Primary fluxes" section):
+  * 'Baseline' (default, {} = Hillas-Gaisser H3a): a steady crflux model, or a steady analytical / tabulated flux;
+  * an analytical model, a function f(E_gev, t_yr, **params) -> {nucleus: flux} registered under a short name
+    (register_flux_model; built in: 'SN', 'Egal'; list_flux_models() shows them), or {'kind': 'Analytical',
+    'function': f};
+  * 'Tabulated': arrays per nucleus, on their own energy grids and a time axis.
+The site, given once to FluxHistory, completes every spec: h_obs_km (altitude, default sea level),
+geomagnetic_cutoff [GV] (default 5) and interaction_model (default DEFAULT_INTERACTION_MODEL).
+
+Solvers. 'response' (default, DEFAULT_SOLVER): MCEq is linear in the primary nucleon fluxes, so a ResponseMatrix of
+the atmosphere (one MCEq solve per primary nucleon type and energy cell, cached as <template_dir>/Response_*.npz) turns
+any primary spectrum into the secondaries by a matrix product. 'direct': one full MCEq solve per spectrum. Below a
+few GeV, where MCEq is not meant for nucleons, the nucleon fluxes are continued by fixed shapes normalised to MCEq
+(LOW_E_SPLICE, scaled with the cutoff by CUTOFF_SCALING) and the neutrinos by a log-normal (NEUTRINO_LOW_E).
+
+Units. A template stores, per species of MCEQ_SPECIES, the zenith-integrated flux crossing a horizontal plane
+[cm^-2 s^-1 GeV^-1] (the zenith quadrature _hemisphere_gauss_legendre has weights summing to pi), and, as 'primary',
+the all-nucleus primary flux at the top of the atmosphere after the cutoff [cm^-2 s^-1 sr^-1 GeV^-1].
+
+Caching. Templates are kept in memory for the session; templates of the 'direct' solver (or all of them, with
+SAVE_RESPONSE_TEMPLATES) are also saved to <template_dir>/<name>.npz (default config.flux_template_dir()).
+"""
 import functools
 import inspect
 import os
@@ -53,21 +83,21 @@ class FluxTemplate:
     A template is either:
       * "steady" (`is_steady=True`): a single energy spectrum, constant in
         time. Used for baselines.
-      * "transient": a 2D (t_since_kyr, energy_gev) grid representing the
+      * "transient": a 2D (t_since_yr, energy_gev) grid representing the
         flux *excess* relative to a baseline, decaying back towards zero
-        as t_since_kyr grows. Used for discrete events.
+        as t_since_yr grows. Used for discrete events.
 
     Templates loaded from disk involve no MCEq / crflux import and are
     essentially instantaneous; only `get_or_build` (on a cache miss) pays
     the MCEq cost.
     """
 
-    def __init__(self, name, energy_gev, species_grids, t_since_kyr=None, meta=None):
+    def __init__(self, name, energy_gev, species_grids, t_since_yr=None, meta=None):
         self.name = name
         self.meta = dict(meta or {})          # site of the template: h_obs_km, geomagnetic_cutoff, interaction_model
         self.energy_gev = np.asarray(energy_gev, dtype=float)
-        self.t_since_kyr = None if t_since_kyr is None else np.asarray(t_since_kyr, dtype=float)
-        self.is_steady = self.t_since_kyr is None
+        self.t_since_yr = None if t_since_yr is None else np.asarray(t_since_yr, dtype=float)
+        self.is_steady = self.t_since_yr is None
 
         self._grids = {}
         self._interp = {}
@@ -85,7 +115,7 @@ class FluxTemplate:
                 bounds_error=False, fill_value='extrapolate',
             )
         return RegularGridInterpolator(
-            (self.t_since_kyr, log_e), log_flux,
+            (self.t_since_yr, log_e), log_flux,
             method='linear', bounds_error=False, fill_value=None,
         )
 
@@ -93,14 +123,14 @@ class FluxTemplate:
     def species(self):
         return list(self._grids.keys())
 
-    def flux(self, species, energy_gev, t_since_kyr=None):
+    def flux(self, species, energy_gev, t_since_yr=None):
         """
         Evaluate this template for one species.
 
         Args:
             species: one of the species stored in this template.
             energy_gev: energies [GeV], array-like.
-            t_since_kyr: required for transient templates (ignored for
+            t_since_yr: required for transient templates (ignored for
                 steady ones); broadcastable against energy_gev.
         """
         energy_gev = np.asarray(energy_gev, dtype=float)
@@ -111,10 +141,10 @@ class FluxTemplate:
         if self.is_steady:
             return np.power(10.0, self._interp[species](log_e))
 
-        if t_since_kyr is None:
-            raise ValueError(f"Template '{self.name}' is transient: t_since_kyr is required.")
+        if t_since_yr is None:
+            raise ValueError(f"Template '{self.name}' is transient: t_since_yr is required.")
 
-        t = np.asarray(t_since_kyr, dtype=float)
+        t = np.asarray(t_since_yr, dtype=float)
 
         t_b, e_b = np.broadcast_arrays(t, log_e)
         pts = np.stack([t_b.ravel(), e_b.ravel()], axis=-1)
@@ -131,8 +161,8 @@ class FluxTemplate:
             energy_gev=self.energy_gev,
             is_steady=np.array(self.is_steady),
         )
-        if self.t_since_kyr is not None:
-            payload['t_since_kyr'] = self.t_since_kyr
+        if self.t_since_yr is not None:
+            payload['t_since_yr'] = self.t_since_yr
         for species, grid in self._grids.items():
             payload[f'species__{species}'] = grid
         for key, value in self.meta.items():
@@ -144,7 +174,8 @@ class FluxTemplate:
         """Load a template previously written with `.save()`. No MCEq needed."""
         with np.load(filepath, allow_pickle=False) as data:
             energy_gev = data['energy_gev']
-            t_since_kyr = data['t_since_kyr'] if 't_since_kyr' in data else None
+            key = next((k for k in ('t_since_yr', 't_since_kyr') if k in data), None)     # 't_since_kyr': old files
+            t_since_yr = data[key] if key else None
             species_grids = {
                 key.split('__', 1)[1]: data[key]
                 for key in data.files if key.startswith('species__')
@@ -152,7 +183,7 @@ class FluxTemplate:
             meta = {key.split('__', 1)[1]: data[key].item() for key in data.files if key.startswith('meta__')}
         meta = {k: (None if v == '' else v) for k, v in meta.items()}
         name = os.path.splitext(os.path.basename(filepath))[0]
-        return cls(name, energy_gev, species_grids, t_since_kyr=t_since_kyr, meta=meta)
+        return cls(name, energy_gev, species_grids, t_since_yr=t_since_yr, meta=meta)
 
     @classmethod
     def get_or_build(cls, params, template_dir=None, force_rebuild=False):
@@ -186,7 +217,7 @@ class FluxTemplate:
             if on_disk and os.path.exists(path):
                 return cls.load(path)
 
-        template = _build_template(name, factory, t_since_kyr=times, interaction_model=interaction_model,
+        template = _build_template(name, factory, t_since_yr=times, interaction_model=interaction_model,
                                    h_obs_km=h_obs_km, geomagnetic_cutoff=geomagnetic_cutoff, solver=solver,
                                    template_dir=template_dir)
         if on_disk:
@@ -211,7 +242,7 @@ class FluxHistory:
     demand. Structurally the flux-side analogue of `overburden_history`:
     a small spec goes in, one object answers every downstream query.
 
-    Timeline: see module docstring -- 0 = present, negative = past.
+    Timeline: 0 = present, negative = past, in kyr (see the module docstring).
     """
 
     def __init__(self, baseline=None, events=None, excursions=None, template_dir=None, h_obs_km=None,
@@ -220,8 +251,7 @@ class FluxHistory:
         Args:
             baseline: a params dict (built on demand; None or {} = H3a, see FluxTemplate.get_or_build), a
                 FluxTemplate or a cached template name (str).
-            events: list of dicts, each with 'start_time_kyr' (or
-                'time_kyr') and 'template' (FluxTemplate / name / params
+            events: list of dicts, each with 'start_time_kyr' and 'template' (FluxTemplate / name / params
                 dict), and optionally 'weight' / 'label'.
             excursions: list of dicts, each with 'start_time_kyr',
                 'end_time_kyr', 'geomagnetic_cutoff', and optionally
@@ -244,8 +274,11 @@ class FluxHistory:
         self.baseline = self._resolve(self._baseline_spec)
         self.events = []
         for event in (events or []):
-            start_time = event.get("start_time_kyr")
-            self.add_event(start_time, event["template"], weight=event.get("weight", 1.0), label=event.get("label"))
+            missing = [k for k in ("start_time_kyr", "template") if k not in event]
+            if missing:
+                raise KeyError(f"flux event {event!r} has no {missing}.")
+            self.add_event(event["start_time_kyr"], event["template"], weight=event.get("weight", 1.0),
+                           label=event.get("label"))
         self.excursions = []
         for excursion in (excursions or []):
             self.add_excursion(
@@ -399,9 +432,8 @@ class FluxHistory:
                 template = event["template"]
             else:
                 template = self._cutoff_variant(event["spec"], event["_cutoff_variants"], geomagnetic_cutoff)
-            t_since = np.asarray(t_kyr, dtype=float) - event["start_time_kyr"]
-            t_since *= 1.e3
-            total = total + event["weight"] * template.flux(species, energy_gev, t_since_kyr=t_since)
+            t_since_yr = (np.asarray(t_kyr, dtype=float) - event["start_time_kyr"]) * 1.e3
+            total = total + event["weight"] * template.flux(species, energy_gev, t_since_yr=t_since_yr)
         return total
 
     def flux(self, species, energy_gev, t_kyr):
@@ -1455,17 +1487,16 @@ class ResponseMatrix:
         return matrix
 
 
-def _build_template(name, model_factory, t_since_kyr=None, interaction_model=DEFAULT_INTERACTION_MODEL,
+def _build_template(name, model_factory, t_since_yr=None, interaction_model=DEFAULT_INTERACTION_MODEL,
                     h_obs_km=None, geomagnetic_cutoff=5.0, solver=None, template_dir=None):
     """
-    Builds a FluxTemplate: the primary model model_factory(t) at each time of t_since_kyr (model_factory(None) once
+    Builds a FluxTemplate: the primary model model_factory(t) at each time of t_since_yr (model_factory(None) once
     for a steady flux) -> MCEq secondaries, zenith-averaged -> _postprocess_secondaries.
 
     Args:
         name (str): Template name.
         model_factory (callable): t [yr] or None -> PrimarySource (see _primary_source).
-        t_since_kyr (np.ndarray, optional): Template times since the event, in YEARS (the name is historical:
-            FluxHistory converts its kyr with *1e3). None for a steady template.
+        t_since_yr (np.ndarray, optional): Template times since the event [yr]. None for a steady template.
         solver (str, optional): 'response' (ResponseMatrix of this atmosphere, built once and cached in
             template_dir) or 'direct' (one MCEq solve per spectrum). Defaults to None: DEFAULT_SOLVER.
         template_dir (str, optional): Where the response matrix is cached. Defaults to None:
@@ -1494,11 +1525,11 @@ def _build_template(name, model_factory, t_since_kyr=None, interaction_model=DEF
             return _corrected_secondaries(mceq_run, model_instance, DEFAULT_ANGLES_DEG,
                                           geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
 
-    if t_since_kyr is None:
+    if t_since_yr is None:
         e_ext, fluxes, primary = solve(model_factory(None))
     else:
         steps, primary = [], []
-        for t_yr in t_since_kyr:
+        for t_yr in t_since_yr:
             e_ext, fluxes_t, primary_t = solve(model_factory(t_yr))
             steps.append(fluxes_t)
             primary.append(primary_t)
@@ -1510,6 +1541,6 @@ def _build_template(name, model_factory, t_since_kyr=None, interaction_model=DEF
             "primary": np.array(primary) * 1e-4,
             **{key: fluxes[key] for key in MCEQ_SPECIES},
         },
-        t_since_kyr=t_since_kyr,
+        t_since_yr=t_since_yr,
         meta={"h_obs_km": h_obs_km, "geomagnetic_cutoff": geomagnetic_cutoff, "interaction_model": interaction_model},
     )

@@ -586,7 +586,7 @@ class Paleodetector:
     def _flux_breakpoints(self, nodes=True):
         """Times [kyr, local] where the flux history changes abruptly (event starts and excursion edges, each with
         a point just before) and, if nodes, the template time nodes on which an event's flux is interpolated (the
-        templates' t_since_kyr axis is in years, hence the factor 1e-3). Called by _master_time_grid."""
+        templates' t_since_yr axis is in years, hence the factor 1e-3). Called by _master_time_grid."""
         if self.flux_history is None:
             return np.zeros(0)
         eps = 1e-9 * self.total_age_kyr
@@ -595,7 +595,7 @@ class Paleodetector:
         for event in self.flux_history.events:
             start = event["start_time_kyr"] + to_local
             points.append([start - eps, start])
-            t_since = getattr(event["template"], "t_since_kyr", None)
+            t_since = getattr(event["template"], "t_since_yr", None)
             if nodes and t_since is not None:
                 points.append(start + np.asarray(t_since, dtype=float) * 1e-3)
         for exc in self.flux_history.excursions:
@@ -1560,7 +1560,7 @@ class Paleodetector:
 
         Returns:
             tuple[np.ndarray, np.ndarray, float, dict]:
-                A: products made by the primaries in each window bin and cell [cm^-2 s^-1 sr^-1], shape
+                A: products made by the primaries in each window bin and cell [cm^-2 s^-1], shape
                 (T, N_C, SECONDARY_WINDOW_BINS, K).
                 M: response blocks, shape (SECONDARY_WINDOW_BINS, K, K).
                 delta: window bin width along the path [m.w.e.].
@@ -2320,8 +2320,8 @@ class Paleodetector:
             edges_gev (np.ndarray): Cell edges [GeV], shape (M,).
 
         Returns:
-            np.ndarray: Template flux integrated over energy [cm^-2 s^-1 sr^-1] (for neutrinos see
-            NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1).
+            np.ndarray: Template flux integrated over energy [cm^-2 s^-1]: the flux crossing a horizontal plane
+            (see the flux module docstring; for neutrinos see NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1).
         """
         t_flux = self._flux_time_kyr(np.atleast_1d(np.asarray(t_kyr_array, dtype=float)))
         nodes, weights = _energy_cell_nodes(edges_gev)
