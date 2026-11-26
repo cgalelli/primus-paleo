@@ -9,7 +9,8 @@ from ._core import (
 
 __all__ = [
     'interaction_profiles', 'plot_secondary_production', 'etch_pit_axes', 'rebin_counts', 'ETCH_DEFAULTS',
-    'slice_spectrum_etch',
+    'slice_spectrum_etch', 'resolution_limit_nm', 'PIXEL_SIZE_UM_AT_10X', 'MIN_RESOLVED_PIXELS',
+    'DEFAULT_MAGNIFICATION',
 ]
 
 def interaction_profiles(mineral, energies_gev, z_edges_mwe, species=('neutron', 'proton', 'mu-'), capture=True):
@@ -225,21 +226,59 @@ ETCH_DEFAULTS = {
     'plasma': {'removed_nm': 100., 'v_ratio': 10.0, 'lateral_ratio': 0.1},  # dry, directional (halite)
 }
 
+# Microscope: camera pixel size on the sample at 10x; at magnification M it is PIXEL_SIZE_UM_AT_10X * 10 / M (same
+# camera and tube lens). A pit must be at least MIN_RESOLVED_PIXELS pixels wide to be seen (resolution_limit_nm).
+PIXEL_SIZE_UM_AT_10X = 0.345
+MIN_RESOLVED_PIXELS = 3
+DEFAULT_MAGNIFICATION = 10
+DEFAULT_WAVELENGTH_NM = 550.
+
+
+def resolution_limit_nm(magnification=DEFAULT_MAGNIFICATION, n_pixels=MIN_RESOLVED_PIXELS, numerical_aperture=None,
+                        wavelength_nm=DEFAULT_WAVELENGTH_NM):
+    """Smallest pit width the microscope resolves [nm]: the default minimum width of slice_spectrum_etch.
+
+    The camera criterion is n_pixels pixels, a pixel being PIXEL_SIZE_UM_AT_10X * 10 / magnification on the sample
+    (0.69 um at 5x, 0.345 um at 10x, 0.086 um at 40x). At high magnification the optics, not the camera, limit the
+    resolution: if numerical_aperture is given, the limit is the larger of the camera criterion and the Rayleigh
+    distance 0.61 * wavelength / NA (e.g. 40x with NA 0.65: 0.52 um, against 0.26 um for 3 pixels).
+
+    Args:
+        magnification (float, optional): Objective magnification. Defaults to DEFAULT_MAGNIFICATION (10).
+        n_pixels (float, optional): Minimum width in pixels. Defaults to MIN_RESOLVED_PIXELS (3).
+        numerical_aperture (float, optional): NA of the objective. Defaults to None (camera criterion only).
+        wavelength_nm (float, optional): Wavelength of the illumination [nm]. Defaults to 550.
+
+    Returns:
+        float: Minimum resolved width [nm].
+    """
+    limit = n_pixels * PIXEL_SIZE_UM_AT_10X * 1e3 * 10. / magnification
+    if numerical_aperture is not None:
+        limit = max(limit, 0.61 * wavelength_nm / numerical_aperture)
+    return limit
+
 
 def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, removed_nm=None, v_ratio=None,
-                        lateral_ratio=None, angular_pdf=None, min_width_nm=0.345 * 3 * 1e3, measure='major',
-                        rng=None, x_bins=None, out_bins=None, etch_type="HF"):
-    """Monte Carlo of the etched-pit size distribution on the final surface, from a latent track-length spectrum.
+                        lateral_ratio=None, angular_pdf=None, min_width_nm=None, measure='major', rng=None,
+                        x_bins=None, out_bins=None, etch_type="HF", magnification=DEFAULT_MAGNIFICATION,
+                        numerical_aperture=None, n_samples=100_000, realisation=False):
+    """Expected etched-pit size distribution on the analysed surface, from a latent track-length spectrum.
 
-    The latent tracks of counts_mg (tracks per mg) are placed at random in a sample volume of 1 mg (a cube of side
-    (1e-3 / density)^(1/3)), and scaled to sample_area_cm2 of surface: n = area / side^2 x total tracks. Each has a
-    random dip (isotropic, or angular_pdf) and depth; the measured size is the opening of its etch pit
-    (etch_pit_axes).
+    The latent tracks of counts_mg (tracks per mg) fill the sample uniformly, with an isotropic direction (or the
+    dip distribution angular_pdf); a surface area A of a sample of density rho cuts through A / side^2 cubes of 1 mg
+    (side = (1e-3 / rho)^(1/3)), i.e. A / side^2 * sum(counts_mg) tracks per side of depth. A track of length L and
+    dip d is etched if its top lies between -L sin(d) (it crosses the original surface) and the removed thickness h,
+    a fraction (h + L sin d) / side of the tracks; its measured size is the opening of its pit (etch_pit_axes), and
+    pits narrower than the resolution (minor axis below min_width_nm) are not seen.
+
+    Computed by Monte Carlo with importance sampling: n_samples tracks are drawn (lengths from counts_mg, uniform
+    inside each bin; dips; tops uniform in the etched interval only), each weighted by the fraction above, so every
+    sample contributes and the result is the expected number of pits per bin, with a relative Monte Carlo error of
+    about 1 / sqrt(samples in the bin). With realisation=True one measurement is returned instead: a Poisson draw
+    of every bin around that expectation.
 
     The latent spectrum and the measured sizes can use different binnings: `x_bins` describes `counts_mg` (e.g. the
     wide bins of the theoretical spectrum) and `out_bins` the returned histogram (e.g. the bins of the descriptor).
-    Latent lengths are drawn uniformly inside their bin, so wide input bins do not produce a comb of discrete
-    lengths, and the measured sizes are histogrammed directly on `out_bins` (no approximation from rebinning).
 
     Args:
         counts_mg (np.ndarray): Latent track spectrum, tracks per mg in each bin of x_bins.
@@ -249,17 +288,24 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         lateral_ratio (float, optional): See etch_pit_axes (1 isotropic, 0 directional). Default from `etch_type`.
         angular_pdf (np.ndarray, optional): Relative probability of the dip angle on a uniform grid from 0 to pi/2
             (len(angular_pdf) points). Defaults to None (isotropic: sin(dip) uniform).
-        min_width_nm (float, optional): Pits with minor axis below this width are not resolved and are dropped
-            (optical resolution). Defaults to 1125 nm.
+        min_width_nm (float, optional): Pits with a minor axis below this width are not seen. Defaults to None:
+            resolution_limit_nm(magnification, numerical_aperture=numerical_aperture) (1035 nm at 10x).
         measure (str, optional): 'major' (what OptimusPrimus reports as length) or 'minor'.
         rng (np.random.Generator, optional): Random generator.
         x_bins (np.ndarray, optional): Bin edges of `counts_mg` [nm]. Defaults to DEFAULT_INTEGRATION_X_BINS_NM.
         out_bins (np.ndarray, optional): Bin edges of the returned histogram [nm]. Defaults to x_bins.
         etch_type (str, optional): 'HF' or 'plasma': sets the defaults of removed_nm, v_ratio and lateral_ratio
             (ETCH_DEFAULTS); explicitly given values always win, including 0. Defaults to "HF".
+        magnification (float, optional): Objective magnification, for the default min_width_nm. Defaults to 10.
+        numerical_aperture (float, optional): NA of the objective, for the default min_width_nm (see
+            resolution_limit_nm). Defaults to None (pixel criterion only).
+        n_samples (int, optional): Monte Carlo tracks. Defaults to 100000 (about 2% error in a bin with 1/40 of
+            the pits).
+        realisation (bool, optional): Return one Poisson realisation (integer counts) instead of the expectation.
+            Defaults to False.
 
     Returns:
-        np.ndarray: Expected number of pits per bin of out_bins on the analysed area.
+        np.ndarray: Expected number of pits per bin of out_bins on the analysed area (or one realisation).
 
     Raises:
         ValueError: If etch_type or measure is unknown, or counts_mg does not match x_bins.
@@ -272,6 +318,8 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
     removed_nm = d['removed_nm'] if removed_nm is None else removed_nm
     v_ratio = d['v_ratio'] if v_ratio is None else v_ratio
     lateral_ratio = d['lateral_ratio'] if lateral_ratio is None else lateral_ratio
+    if min_width_nm is None:
+        min_width_nm = resolution_limit_nm(magnification, numerical_aperture=numerical_aperture)
 
     rng = rng or np.random.default_rng()
     x_bins = _resolve_x_bins(x_bins)
@@ -285,8 +333,9 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
 
     side_cm = (1.e-3 / sample_density_g_cm3) ** (1. / 3.)
     side_nm = side_cm * 1.e7
-    n = int(round(sample_area_cm2 / side_cm ** 2 * total))
+    tracks_per_side = sample_area_cm2 / side_cm ** 2 * total
 
+    n = int(n_samples)
     k = rng.choice(len(counts_mg), size=n, p=counts_mg / total)
     L = rng.uniform(x_bins[k], x_bins[k + 1])
     if angular_pdf is not None:
@@ -294,11 +343,13 @@ def slice_spectrum_etch(counts_mg, sample_area_cm2, sample_density_g_cm3, remove
         dip = rng.choice(grid, size=n, p=np.asarray(angular_pdf, float) / np.sum(angular_pdf))
     else:
         dip = np.arcsin(rng.uniform(0., 1., size=n))
-    z_top = rng.uniform(-side_nm / 2., side_nm / 2., size=n)
+    z_lo = np.maximum(-L * np.sin(dip), -side_nm / 2.)
+    z_hi = np.minimum(removed_nm, side_nm / 2.)
+    weight = tracks_per_side / n * np.clip(z_hi - z_lo, 0., None) / side_nm
+    z_top = rng.uniform(z_lo, np.maximum(z_hi, z_lo))
 
-    keep = (z_top < removed_nm) & (z_top + L * np.sin(dip) > 0.)
-    major, minor = etch_pit_axes(L[keep], dip[keep], z_top[keep], removed_nm, v_ratio, lateral_ratio)
-
+    major, minor = etch_pit_axes(L, dip, z_top, removed_nm, v_ratio, lateral_ratio)
     resolved = np.isfinite(minor) & (minor >= min_width_nm)
     size = (major if measure == 'major' else minor)[resolved]
-    return np.histogram(size, bins=out_bins)[0]
+    expected = np.histogram(size, bins=out_bins, weights=weight[resolved])[0]
+    return rng.poisson(expected) if realisation else expected
