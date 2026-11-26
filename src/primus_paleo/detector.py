@@ -296,6 +296,26 @@ def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
     return nodes, weights
 
 
+def _product_axis(product_bins_gev):
+    """Layout of the products of a cascade on one flat axis: product p occupies its energy cells at offsets[p].
+
+    Shared by the two cascades that follow neutrons, protons (and, for neutrinos, muons) through all their
+    generations: Paleodetector._secondary_yield (atmospheric secondaries) and the neutrino path
+    (Paleodetector._neutrino_run_pass, _neutrino_product_operator, integrate_atmospheric_neutrinos).
+
+    Args:
+        product_bins_gev (dict): {product: energy cell edges [GeV]}, in axis order.
+
+    Returns:
+        tuple[dict, int]: offsets {product: slice} and the total number of cells K.
+    """
+    offsets, k = {}, 0
+    for p, edges in product_bins_gev.items():
+        offsets[p] = slice(k, k + len(edges) - 1)
+        k += len(edges) - 1
+    return offsets, k
+
+
 def _accumulate_into(store, key, value):
     """store[key] += value, creating the entry at the first value (the readers list fragments as they meet them)."""
     store[key] = store[key] + value if key in store else value
@@ -1419,31 +1439,38 @@ class Paleodetector:
         }
 
 
-    def _stdrock_offset_matrix(self, source, product, source_bins_gev, product_bins_gev, delta_mwe, n_offsets,
-                               total_simulated_particles=1e4):
-        """Particles of type `product` produced by a `source` primary, by distance travelled and energy.
+    def _stdrock_production_matrix(self, source, product, source_bins_gev, product_bins_gev,
+                                   total_simulated_particles=1e4, delta_mwe=None, n_offsets=None):
+        """Particles of type `product` made by a `source` primary in the StdRock runs, per primary, by energy cell
+        and, optionally, by distance travelled: one block of a cascade's generation matrix.
 
-        One block of the generation matrix of the atmospheric secondary cascade (see _secondary_yield): from the
-        StdRock/<source> runs, C[l, d, m] is the number of products with energy in cell m (of product_bins_gev)
-        produced between d * delta and (d + 1) * delta after the entry point, per primary in energy cell l (of
-        source_bins_gev). source == product gives the same-type generations, source != product the
-        cross-generations (neutrons from protons and protons from neutrons).
+        source == product gives the same-type generations, source != product the cross-generations (e.g. neutrons
+        from protons). Called by:
+          * _secondary_yield, with a depth binning: C[l, d, m] is the number of products in energy cell m made
+            between d * delta_mwe and (d + 1) * delta_mwe after the entry point, per primary in cell l (products
+            beyond n_offsets bins are left out);
+          * _neutrino_product_operator (medium 'StdRock'), without: G[l, m] counts the products made anywhere in
+            the StdRock target.
 
         Args:
-            source (str): Primary of the StdRock runs, 'neutron' or 'proton'.
-            product (str): Produced particle, 'neutron' or 'proton'.
+            source (str): Primary of the StdRock runs ('mu-', 'mu+', 'neutron', 'proton'; see _load_stdrock_rows).
+            product (str): Produced particle.
             source_bins_gev (np.ndarray): Energy cell edges of the source [GeV].
             product_bins_gev (np.ndarray): Energy cell edges of the product [GeV].
-            delta_mwe (float): Offset bin width [m.w.e.].
-            n_offsets (int): Number of offset bins.
             total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
+            delta_mwe (float, optional): Width of the distance bins [m.w.e.]. Defaults to None (no distance axis).
+            n_offsets (int, optional): Number of distance bins (with delta_mwe).
 
         Returns:
-            np.ndarray: C, shape (len(source_bins_gev) - 1, n_offsets, len(product_bins_gev) - 1).
+            np.ndarray: Shape (n_source_cells, n_offsets, n_product_cells), or (n_source_cells, n_product_cells)
+            without delta_mwe.
         """
         rows = self._load_stdrock_rows(source, product, product_bins_gev, total_simulated_particles,
                                        primary_bins_gev=source_bins_gev)
         n_s, n_q = len(source_bins_gev) - 1, len(product_bins_gev) - 1
+        if delta_mwe is None:
+            flat = rows['primary_cell'] * n_q + rows['cell']
+            return np.bincount(flat, minlength=n_s * n_q).astype(float).reshape(n_s, n_q) * rows['weight']
         d = np.floor(rows['depth_mwe'] / delta_mwe).astype(int)
         ok = d < n_offsets
         flat = (rows['primary_cell'][ok] * n_offsets + d[ok]) * n_q + rows['cell'][ok]
@@ -1503,7 +1530,7 @@ class Paleodetector:
             A_b,k = sum_s sum_i Phi_s,i(t) * (StdRock/<s> products of cell k in bin b per primary of cell i)
 
         Generations inside the window: the StdRock/<p> runs of every product p give the products of every type
-        q it makes (_stdrock_offset_matrix blocks C[p -> q]), so neutrons from neutrons, protons from protons and
+        q it makes (_stdrock_production_matrix blocks C[p -> q]), so neutrons from neutrons, protons from protons and
         the cross-generations (neutrons from protons, protons from neutrons) are all followed, to any order.
         Products are born uniformly within their bin, so a production at offset bin d is shared between bins
         b' + d and b' + d + 1:
@@ -1531,10 +1558,7 @@ class Paleodetector:
         """
         products = list(product_bins_gev)
         product_bins_gev = {q: np.asarray(e, dtype=float) for q, e in product_bins_gev.items()}
-        offsets, n_k = {}, 0
-        for q in products:
-            offsets[q] = slice(n_k, n_k + len(product_bins_gev[q]) - 1)
-            n_k += len(product_bins_gev[q]) - 1
+        offsets, n_k = _product_axis(product_bins_gev)
 
         n_t, n_c = len(t_kyr_array), len(c_vals)
         n_b = SECONDARY_WINDOW_BINS
@@ -1606,9 +1630,8 @@ class Paleodetector:
                     print(f"Warning: no StdRock/{p} runs: the secondaries made by {p}s are not followed.")
                 continue
             for q in products:
-                C[offsets[p], :, offsets[q]] = self._stdrock_offset_matrix(
-                    p, q, product_bins_gev[p], product_bins_gev[q], delta, n_b + 1, total_simulated_particles
-                )
+                C[offsets[p], :, offsets[q]] = self._stdrock_production_matrix(
+                    p, q, product_bins_gev[p], product_bins_gev[q], total_simulated_particles, delta, n_b + 1)
         half_same_bin = 0.5 * C[:, 0, :]
         if np.max(np.abs(np.linalg.eigvals(half_same_bin))) < 1.0:
             same_bin_inv = np.linalg.inv(np.eye(n_k) - half_same_bin)
@@ -2412,10 +2435,7 @@ class Paleodetector:
             recoil bins)}}, G (K, K) with K the total number of cells, and outside {product: [below, above]} (next
             generation particles outside the cells, per primary, summed over the runs).
         """
-        offsets, k = {}, 0
-        for p, edges in product_edges.items():
-            offsets[p] = slice(k, k + len(edges) - 1)
-            k += len(edges) - 1
+        offsets, k = _product_axis(product_edges)
         G = np.zeros((k, k))
         R = {p: {} for p in product_edges}
         outside = {p: [0.0, 0.0] for p in product_edges}
@@ -2439,10 +2459,8 @@ class Paleodetector:
                         print(f"Warning: no StdRock/{p} runs: the products of neutrino-made {p}s are not followed.")
                     continue
                 for q, q_edges in product_edges.items():
-                    rows = self._load_stdrock_rows(p, q, q_edges, total_simulated_particles, primary_bins_gev=edges)
-                    n_p, n_q = len(edges) - 1, len(q_edges) - 1
-                    G[offsets[p], offsets[q]] = np.bincount(rows['primary_cell'] * n_q + rows['cell'],
-                                                            minlength=n_p * n_q).reshape(n_p, n_q) * rows['weight']
+                    G[offsets[p], offsets[q]] = self._stdrock_production_matrix(p, q, edges, q_edges,
+                                                                                total_simulated_particles)
         return offsets, R, G, outside
 
 
@@ -2471,7 +2489,7 @@ class Paleodetector:
             (n_runs, minimum and maximum bias, maximum biased interactions per primary).
         """
         n_t, n_r = t_kyr.size, len(RECOIL_ENERGY_BINS_MEV) - 1
-        n_k = sum(len(e) - 1 for e in product_edges.values())
+        offsets, n_k = _product_axis(product_edges)
         length_cm = self._geant4_geometry(run_dir)["target_length_m"] * 100.0
         phi_cell = self._flux_cell_integral(species, t_kyr, edges)          # (T, n_cells)
         if self.verbose > 0 and not np.any(phi_cell > 0):
@@ -2487,13 +2505,10 @@ class Paleodetector:
                 for frag, counts in run['recoils'].items():
                     out['recoils'].setdefault(frag, np.zeros((n_t, n_r)))
                     out['recoils'][frag] += np.outer(w, counts)
-            col = 0
-            for p, p_edges in product_edges.items():
-                n_p = len(p_edges) - 1
-                out['S0'][:, col:col + n_p] += np.outer(w, run['products'][p])
+            for p in product_edges:
+                out['S0'][:, offsets[p]] += np.outer(w, run['products'][p])
                 out['lost'][p][0] += float(np.mean(w)) * run['below'][p]
                 out['lost'][p][1] += float(np.mean(w)) * run['above'][p]
-                col += n_p
             biases.append(bias)
             fractions.append(run['n_vertices'] / total_simulated_particles)
         out['report'] = (len(edges) - 1, min(biases), max(biases), max(fractions))
@@ -2606,7 +2621,7 @@ class Paleodetector:
             print(f"Warning: no mineral runs for {sorted(set(NEUTRINO_PRODUCTS) - set(products))}: "
                   "the neutrino products of that type are not followed.")
         product_edges = {p: self.energy_bins[p] for p in products}
-        n_cells_total = sum(len(e) - 1 for e in product_edges.values())
+        n_cells_total = _product_axis(product_edges)[1]
 
         # --- neutrino runs in the mineral: recoils of the neutrinos (and first products, medium 'mineral') ---
         stdrock_nu = {sp: os.path.join(self.data_path, "Geant4_data", "StdRock", sp) for sp in species_list}
