@@ -265,6 +265,37 @@ def _recoil_spectra(fragments, t_kyr=None):
     return {'t_kyr': t_kyr, 'fragments': {k: v for k, v in fragments.items() if k != 'neutron'}}
 
 
+# Quadrature of the flux integrals: each Geant4 run at the lower edge of an energy cell stands for every particle in
+# the cell, so the flux (or emission spectrum) is integrated over the cell with the trapezoidal rule on
+# ENERGY_CELL_NODES linear points (_energy_cell_nodes); the slab interactions are integrated over cos(zenith) on
+# COS_ZENITH_NODES.
+ENERGY_CELL_NODES = 50
+COS_ZENITH_NODES = np.linspace(0.01, 1.0, 50)
+
+
+def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
+    """Nodes and trapezoidal weights for integrals over each energy cell.
+
+    Used by every integral over the energy cells of the Geant4 runs: Paleodetector._flux_cell_integral (bare flux:
+    secondary cascade, neutrinos), Paleodetector._primary_recoils (flux times slab probability) and
+    Paleodetector._radiogenic_neutron_recoils (emission spectrum). The integral of f over cell i is
+    sum_j f(e[i, j]) * w[i, j].
+
+    Args:
+        edges_gev (array_like): Cell edges [GeV], shape (M,).
+        n_nodes (int, optional): Linear points per cell, edges included. Defaults to ENERGY_CELL_NODES.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Nodes e [GeV] and weights w [GeV], both of shape (M - 1, n_nodes).
+    """
+    edges_gev = np.asarray(edges_gev, dtype=float)
+    e_lo, e_hi = edges_gev[:-1], edges_gev[1:]
+    nodes = e_lo[:, None] + (e_hi - e_lo)[:, None] * np.linspace(0.0, 1.0, n_nodes)[None, :]
+    weights = np.repeat(((e_hi - e_lo) / (n_nodes - 1))[:, None], n_nodes, axis=1)
+    weights[:, [0, -1]] *= 0.5
+    return nodes, weights
+
+
 def _accumulate_into(store, key, value):
     """store[key] += value, creating the entry at the first value (the readers list fragments as they meet them)."""
     store[key] = store[key] + value if key in store else value
@@ -796,8 +827,8 @@ class Paleodetector:
 
         The neutrons are emitted inside the mineral, so every recoil they cause is counted (infinite homogeneous
         medium): the recoils per neutron of the mineral's neutron run at the lower edge of each energy cell are
-        weighted by the neutrons emitted in the cell (emission spectrum integrated with the trapezoidal rule on 50
-        points). Called by integrate_radiogenic.
+        weighted by the neutrons emitted in the cell (emission spectrum integrated with _energy_cell_nodes). Called
+        by integrate_radiogenic.
 
         Args:
             source (str): 'fission_n' (U-238 spontaneous-fission neutrons, _radiogenic_spectrum) or 'alpha_n'
@@ -817,13 +848,13 @@ class Paleodetector:
             raise ValueError(f"Unknown radiogenic neutron source '{source}' (expected 'fission_n' or 'alpha_n').")
         edges = self._energy_edges('neutron', edges=energy_bins_gev)
         run_dir = os.path.join(self.data_path, "Geant4_data", self.name, "neutron")
+        nodes, weights = _energy_cell_nodes(edges)
+        emitted = np.sum(emission(nodes) * weights, axis=-1)                 # neutrons per g per s in each cell
         fragments = {}
-        for e_lo, e_hi in zip(edges[:-1], edges[1:]):
+        for e_lo, weight in zip(edges[:-1], emitted):
             hist = _mineral_run_histograms(os.path.join(run_dir, f"outNuclei_{e_lo:.6f}.txt"))
             if hist is None:
                 continue
-            e_vals = np.linspace(e_lo, e_hi, 50)
-            weight = np.trapezoid(emission(e_vals), e_vals)
             for frag, counts in sorted(hist['all'].items()):
                 _accumulate_into(fragments, frag, counts * weight)
         norm = total_simulated_particles * KYR_PER_SECOND
@@ -1456,7 +1487,7 @@ class Paleodetector:
 
 
     def _secondary_yield(self, t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
-                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES, n_energy_sub=50):
+                         total_simulated_particles=1e4, species_list=SECONDARY_SOURCES):
         """Secondary neutrons and protons born in a window above the sample, per direction, as one cascade.
 
         For each time t and direction c, the path to the sample has slant depth S = X(t) / c. The window
@@ -1491,7 +1522,6 @@ class Paleodetector:
             total_simulated_particles (float, optional): Primaries per Geant4 run. Defaults to 1e4.
             species_list (tuple[str], optional): Primary species producing the secondaries.
                 Defaults to SECONDARY_SOURCES.
-            n_energy_sub (int, optional): Points per energy cell for the flux integration. Defaults to 50.
 
         Returns:
             tuple[np.ndarray, float, dict]:
@@ -1511,8 +1541,6 @@ class Paleodetector:
         window = max(self._secondary_window_mwe(q) for q in products)
         delta = window / n_b
 
-        t_kyr_flux_array = self._flux_time_kyr(np.asarray(t_kyr_array, dtype=float))
-        sub = np.linspace(0.0, 1.0, n_energy_sub)
         slant = depth_mwe_array[:, None] / c_vals[None, :]               # (T, N_C) path to the sample
         window_top = slant - window
 
@@ -1536,15 +1564,7 @@ class Paleodetector:
                         print(f"Warning: vertical overburden beyond the StdRock/{species} target "
                               f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondaries "
                               "from that species are missing there; use a longer StdRock target.")
-                    # primary intensity integrated over each primary energy cell [cm^-2 s^-1 sr^-1]
-                    pb = rows['primary_bins']
-                    e_lo, e_hi = pb[:-1], pb[1:]
-                    e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * sub[None, :]
-                    step = (e_hi - e_lo) / (n_energy_sub - 1)
-                    phi = self.flux_history.get_map(species, t_kyr_flux_array, e_sub)[2].reshape(
-                        n_t, *e_sub.shape
-                    )
-                    phi_cell = (phi.sum(axis=-1) - 0.5 * (phi[..., 0] + phi[..., -1])) * step[None, :]
+                    phi_cell = self._flux_cell_integral(species, t_kyr_array, rows['primary_bins'])
 
                 n_q = len(product_bins_gev[q]) - 1
                 depth = rows['depth_mwe']
@@ -1625,7 +1645,9 @@ class Paleodetector:
         For mu-, captures use a single energy-independent capture spectrum (averaged
         over runs with E0 <= CAPTURE_SPECTRUM_MAX_E0_GEV) times the total stopping
         probability in the slab. All timesteps are processed at once; each file is
-        read once. Called by integrate_particle_signal_spectrum (also through integrate_all_particles).
+        read once. The flux does not depend on the zenith, so it is evaluated once on the energy nodes of every cell
+        (_energy_cell_nodes) and broadcast over cos(zenith) (COS_ZENITH_NODES). Called by
+        integrate_particle_signal_spectrum (also through integrate_all_particles).
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
@@ -1663,6 +1685,14 @@ class Paleodetector:
         fragment_spectra = {}
         target_thickness_mwe = target_thickness_cm * 0.01 * self.config['density_g_cm3']
 
+        c_vals = COS_ZENITH_NODES
+        e_nodes, e_weights = _energy_cell_nodes(energy_bins_gev)
+        flux_nodes = self.flux_history.get_map(species, t_kyr_flux_array, e_nodes)[2].reshape(n_t, *e_nodes.shape)
+
+        def over_energy_and_zenith(integrand, i):
+            """Integral over cell i (last axis, _energy_cell_nodes) and over cos(zenith) (trapezoid on c_vals)."""
+            return np.trapezoid(np.sum(integrand * e_weights[i], axis=-1), c_vals, axis=-1)
+
         if species == 'mu-':
             capture_counts, per_file_peak = {}, {}
             n_capture_files = 0
@@ -1670,44 +1700,27 @@ class Paleodetector:
 
         for i in range(len(energy_bins_gev) - 1):
             e_min = energy_bins_gev[i]
-            e_max = energy_bins_gev[i + 1]
 
-            N_E, N_C = 50, 50
-            e_vals = np.linspace(e_min, e_max, N_E)
-            c_vals = np.linspace(0.01, 1.0, N_C)
+            e_vals = e_nodes[i]
             E_grid, C_grid = np.meshgrid(e_vals, c_vals)
 
             z_min_grid = depth_mwe_array[:, None, None] / C_grid[None, :, :]
             z_max_grid = z_min_grid + target_thickness_mwe / C_grid[None, :, :]
-
-            # the flux does not depend on the zenith: evaluated once per energy, then broadcast over c
-            flux_e = self.flux_history.get_map(species, t_kyr_flux_array, e_vals)[2]          # (T, N_E)
-            flux_grid_gev_cm2_s_sr = np.broadcast_to(flux_e[:, None, :], (t_kyr_flux_array.size, *E_grid.shape))
+            flux_grid_gev_cm2_s_sr = np.broadcast_to(flux_nodes[:, None, i, :], (n_t, *E_grid.shape))
 
             if species in ('mu-', 'mu+'):
                 prob_tail_grid, prob_peak_grid = self._muon_depth_probabilities(
                     e_vals, z_min_grid, z_max_grid
                 )
-                integrand_tail = flux_grid_gev_cm2_s_sr * prob_tail_grid
-
-                weight_elastic_t = np.trapezoid(
-                    np.trapezoid(integrand_tail, e_vals, axis=-1), c_vals, axis=-1
-                )
-
+                weight_elastic_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_tail_grid, i)
                 if species == 'mu-':
-                    integrand_peak = flux_grid_gev_cm2_s_sr * prob_peak_grid
-                    weight_peak_t = np.trapezoid(
-                        np.trapezoid(integrand_peak, e_vals, axis=-1), c_vals, axis=-1
-                    )
+                    weight_peak_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_peak_grid, i)
                     weight_peak_total_t += weight_peak_t
             else:
                 prob_attenuation_grid = self._hadron_depth_probability(
                     e_vals, z_min_grid, z_max_grid, self._depth_interpolators[species]['table']
                 )
-                integrand = flux_grid_gev_cm2_s_sr * prob_attenuation_grid
-                weight_elastic_t = np.trapezoid(
-                    np.trapezoid(integrand, e_vals, axis=-1), c_vals, axis=-1
-                )
+                weight_elastic_t = over_energy_and_zenith(flux_grid_gev_cm2_s_sr * prob_attenuation_grid, i)
 
             filepath = os.path.join(geant4_input_dir, f"outNuclei_{e_min:.6f}.txt")
             hist = _mineral_run_histograms(filepath)
@@ -1841,7 +1854,7 @@ class Paleodetector:
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
         depth_mwe_array = np.atleast_1d(self._overburden_interpolator(t_kyr_array))
 
-        c_vals = np.linspace(0.01, 1.0, 50)
+        c_vals = COS_ZENITH_NODES
         Y, delta, offsets = self._secondary_yield(
             t_kyr_array, depth_mwe_array, c_vals, product_bins_gev,
             total_simulated_particles, secondary_sources,
@@ -2290,29 +2303,25 @@ class Paleodetector:
         return value
 
 
-    def _flux_cell_integral(self, species, t_kyr_array, edges_gev, n_energy_sub=50):
-        """Flux of a species integrated over each energy cell, at local times.
+    def _flux_cell_integral(self, species, t_kyr_array, edges_gev):
+        """Flux of a species integrated over each energy cell, at local times (_energy_cell_nodes quadrature).
 
-        Purpose: the Geant4 run at the lower edge of a cell stands for every primary in the cell, so each run is
-        weighted by the flux integrated over its cell (trapezoid on n_energy_sub linear points per cell).
+        Called by _secondary_yield (primaries of the StdRock runs) and _neutrino_run_pass (neutrino runs): the run at
+        the lower edge of a cell is weighted by the flux integrated over its cell.
 
         Args:
             species (str): Flux species (MCEQ_SPECIES key).
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             edges_gev (np.ndarray): Cell edges [GeV], shape (M,).
-            n_energy_sub (int, optional): Points per cell. Defaults to 50.
 
         Returns:
-            np.ndarray: Integrated flux [cm^-2 s^-1] (crossing a horizontal plane, see NEUTRINO_SOLID_ANGLE_FACTOR),
-            shape (T, M - 1).
+            np.ndarray: Template flux integrated over energy [cm^-2 s^-1 sr^-1] (for neutrinos see
+            NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1).
         """
         t_flux = self._flux_time_kyr(np.atleast_1d(np.asarray(t_kyr_array, dtype=float)))
-        edges_gev = np.asarray(edges_gev, dtype=float)
-        e_lo, e_hi = edges_gev[:-1], edges_gev[1:]
-        e_sub = e_lo[:, None] + (e_hi - e_lo)[:, None] * np.linspace(0.0, 1.0, n_energy_sub)[None, :]
-        phi = self.flux_history.get_map(species, t_flux, e_sub)[2].reshape(t_flux.size, *e_sub.shape)
-        step = (e_hi - e_lo) / (n_energy_sub - 1)
-        return (phi.sum(axis=-1) - 0.5 * (phi[..., 0] + phi[..., -1])) * step[None, :]
+        nodes, weights = _energy_cell_nodes(edges_gev)
+        phi = self.flux_history.get_map(species, t_flux, nodes)[2].reshape(t_flux.size, *nodes.shape)
+        return np.sum(phi * weights, axis=-1)
 
 
     def _read_recoils_and_products(self, filepath, product_edges):
