@@ -16,7 +16,7 @@ from . import config
 from .flux import FluxHistory, MCEQ_SPECIES
 from ._core import (
     B0_U238, CAPTURE_SPECTRUM_MAX_E0_GEV, COMPUTABLE_SPECIES, DEFAULT_TRACK_SUM, DEPTH_FLOOR_MWE,
-    DERIVED_SPECIES, FISSIONS_U238_G_KYR, KYR_PER_SECOND, MIN_DEPTH_SAMPLES, MUON_SPECIES,
+    DERIVED_SPECIES, FISSIONS_U238_G_KYR, SECONDS_PER_KYR, MIN_DEPTH_SAMPLES, MUON_SPECIES,
     NEUTRINO_MAX_GENERATIONS, NEUTRINO_MAX_INTERACTION_FRACTION, NEUTRINO_PRODUCTS, NEUTRINO_SECONDARY_PREFIX,
     NEUTRINO_SOLID_ANGLE_FACTOR, NEUTRINO_SPECIES, NEUTRON_MASS_MEV, NEUTRON_P_NODES, NU_BAR_U238_SF,
     PROTON_MASS_MEV, RECOIL_ENERGY_BINS_MEV, SECONDARY_SOURCES, SECONDARY_WINDOW_BINS,
@@ -828,7 +828,7 @@ class Paleodetector:
         Returns:
             scipy.interpolate.interp1d: Energy [GeV] -> neutrons per g per s per GeV.
         """
-        sf_yield_per_g_s = self._fission_rate_per_g_kyr() * NU_BAR_U238_SF * KYR_PER_SECOND
+        sf_yield_per_g_s = self._fission_rate_per_g_kyr() * NU_BAR_U238_SF / SECONDS_PER_KYR
         energies_gev = np.logspace(-6, -1, 10000)
         energies_mev = energies_gev * 1e3
         watt_shape = np.exp(-energies_mev / WATT_A_MEV) * np.sinh(np.sqrt(WATT_B_PER_MEV * energies_mev))
@@ -901,8 +901,8 @@ class Paleodetector:
                 continue
             for frag, counts in sorted(hist['all'].items()):
                 _accumulate_into(fragments, frag, counts * weight)
-        norm = total_simulated_particles * KYR_PER_SECOND
-        return _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragments.items()})
+        per_kyr = SECONDS_PER_KYR / total_simulated_particles
+        return _recoil_spectra({frag: spectrum * per_kyr for frag, spectrum in fragments.items()})
 
 
     def _fission_fragments(self):
@@ -1747,8 +1747,9 @@ class Paleodetector:
                 for frag, spectrum in peak_per_run.items():
                     _accumulate_into(fragment_spectra, frag, spectrum)
 
-        norm = thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
-        return _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragment_spectra.items()}, t_kyr_array)
+        per_g_kyr = SECONDS_PER_KYR / (thickness_cm * rho * total_simulated_particles)
+        return _recoil_spectra({frag: spectrum * per_g_kyr for frag, spectrum in fragment_spectra.items()},
+                               t_kyr_array)
 
 
     def _secondary_products(self):
@@ -1883,7 +1884,7 @@ class Paleodetector:
                 V[:n_b - d] += M[d][None, :, :] * P[c, d:, None, :]
             W[:, c, :] = A[:, c].reshape(n_t, n_b * n_k) @ V.reshape(n_b * n_k, n_k)
 
-        norm = target_thickness_cm * rho * total_simulated_particles * KYR_PER_SECOND
+        per_g_kyr = SECONDS_PER_KYR / (target_thickness_cm * rho * total_simulated_particles)
         out = {}
         for product, energy_bins_gev in product_bins_gev.items():
             n_e = len(energy_bins_gev) - 1
@@ -1903,7 +1904,7 @@ class Paleodetector:
                     continue
                 for frag in sorted(hist['all']):
                     _accumulate_into(fragment_spectra, frag, np.outer(weight_t[:, m], hist['all'][frag]))
-            out[product] = _recoil_spectra({frag: spectrum / norm for frag, spectrum in fragment_spectra.items()},
+            out[product] = _recoil_spectra({frag: spectrum * per_g_kyr for frag, spectrum in fragment_spectra.items()},
                                            t_kyr_array)
         return out
 
@@ -2689,7 +2690,7 @@ class Paleodetector:
 
         results = {}
         for key, spec in recoils.items():
-            spectra = _recoil_spectra({frag: arr / KYR_PER_SECOND for frag, arr in spec.items()}, t_kyr)
+            spectra = _recoil_spectra({frag: arr * SECONDS_PER_KYR for frag, arr in spec.items()}, t_kyr)
             results[key] = self._recoils_to_counts(spectra, observable, x_bins, x_grid, nucleus, key)
 
         results['total'] = _combine_track_results(results.values())

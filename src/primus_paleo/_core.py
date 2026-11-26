@@ -16,7 +16,8 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 __all__ = [
-    'PROTON_MASS_MEV', 'NEUTRON_MASS_MEV', 'B0_U238', 'FISSIONS_U238_G_KYR', 'U238_ABUNDANCE', 'KYR_PER_SECOND',
+    'PROTON_MASS_MEV', 'NEUTRON_MASS_MEV', 'B0_U238', 'FISSIONS_U238_G_KYR', 'U238_ABUNDANCE', 'SECONDS_PER_YEAR',
+    'SECONDS_PER_KYR',
     'NU_BAR_U238_SF', 'WATT_A_MEV', 'WATT_B_PER_MEV', 'TOTAL_ALL_FRAGMENTS', 'TOTAL_NO_LIGHT_IONS',
     'TRACK_SUMS', 'DEFAULT_TRACK_SUM', 'LIGHT_ION_MAX_Z', 'is_light_ion', 'normalize_fragment_name',
     'normalize_fragment_names', 'RECOIL_N_BINS', 'RECOIL_ER_MIN_LOG_MEV', 'RECOIL_ER_MAX_LOG_MEV',
@@ -40,7 +41,11 @@ NEUTRON_MASS_MEV = 939.6
 B0_U238 = 7.570126
 FISSIONS_U238_G_KYR = 2.14e8
 U238_ABUNDANCE = 0.9927
-KYR_PER_SECOND = 1/ (60 * 60 * 24 * 365 * 1e3)
+# The year (annus) of the IUPAC-IUGS recommendation (Holden et al., Pure Appl. Chem. 83, 1159 (2011)): the mean
+# tropical year for the epoch 2000.0, the unit of geological ages. The Julian year (365.25 d) differs by 2e-5.
+# Every conversion between per second (fluxes, emission rates) and per kyr (ages, rates in the sample) uses it.
+SECONDS_PER_YEAR = 31556925.445
+SECONDS_PER_KYR = 1e3 * SECONDS_PER_YEAR
 
 # --- U-238 spontaneous fission: shared by the fragment tracks and the SF neutrons ---
 NU_BAR_U238_SF = 2.0
