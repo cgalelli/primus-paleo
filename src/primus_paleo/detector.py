@@ -27,8 +27,8 @@ from ._core import (
     U238_ABUNDANCE, WATT_A_MEV, ELEMENT_SYMBOLS, atomic_number, predict_track_groups, track_group,
     WATT_B_PER_MEV, _ENERGY_EDGE_RTOL, _LIGHT_ION_SYMBOLS,
     _geant4_energy_edges, _list_geant4_energy_files, _loglog_interp_rows,
-    _piecewise_cdf_and_integral, _rebin_density, _resolve_x_bins, _restrict_edges,
-    _slab_probability, is_light_ion, normalize_fragment_names,
+    _rebin_density, _resolve_x_bins, _restrict_edges,
+    is_light_ion, normalize_fragment_names,
 )
 
 __all__ = [
@@ -296,6 +296,57 @@ def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
     weights = np.repeat(((e_hi - e_lo) / (n_nodes - 1))[:, None], n_nodes, axis=1)
     weights[:, [0, -1]] *= 0.5
     return nodes, weights
+
+
+def _depth_cdf_rows(z, q_rows, p, tail_lambdas=None):
+    """F(z) = P(R <= z) and G(z) = integral_0^z (1 - F) of a depth distribution, for many energies at once.
+
+    The vectorised form of _core._piecewise_cdf_and_integral (see there for the meaning of F and G, the linear
+    interpolation between the quantile nodes and the exponential tail), with the same formulas: row j of q_rows (one
+    energy) applies to z[..., j]. Only the node search runs row by row (each row has its own nodes); everything
+    else is computed for all rows at once. Called by Paleodetector._slab_interaction_probabilities (primaries) and
+    Paleodetector._secondary_recoils (products of the secondary cascade).
+
+    Args:
+        z (array_like): Depths [m.w.e.], shape (..., n_E); the last axis runs over the rows of q_rows. May be inf.
+        q_rows (np.ndarray): Quantile nodes per energy [m.w.e.], non-decreasing along each row, shape (n_E, n).
+        p (np.ndarray): Probabilities of the nodes, shape (n,), p[0] = 0.
+        tail_lambdas (np.ndarray, optional): Exponential-tail length per energy [m.w.e.], shape (n_E,); required
+            when p[-1] < 1. Defaults to None (no tail: F = 1 beyond the last node).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: F and G, same shape as z (G(inf) is the mean depth E[R]).
+    """
+    z = np.asarray(z, dtype=float)
+    q_rows = np.asarray(q_rows, dtype=float)
+    n_e, n = q_rows.shape
+    q0, q_last = q_rows[:, 0], q_rows[:, -1]
+    dq = np.diff(q_rows, axis=1)
+    slope_all = np.divide(np.diff(p)[None, :], dq, out=np.zeros_like(dq), where=dq > 0)
+    g_nodes = np.empty_like(q_rows)
+    g_nodes[:, 0] = q0
+    g_nodes[:, 1:] = q0[:, None] + np.cumsum(dq * (1.0 - 0.5 * (p[:-1] + p[1:]))[None, :], axis=1)
+
+    zc = np.clip(z, q0, q_last)
+    row = np.broadcast_to(np.arange(n_e), z.shape)
+    k = np.empty(z.shape, dtype=np.intp)
+    for j in range(n_e):
+        k[..., j] = np.searchsorted(q_rows[j], z[..., j], side='right') - 1
+    k = np.clip(k, 0, n - 2)
+    t = zc - q_rows[row, k]
+    slope, p_k = slope_all[row, k], p[k]
+
+    if tail_lambdas is None:
+        F_beyond, G_beyond = 1.0, g_nodes[:, -1]
+    else:
+        survive = 1.0 - p[-1]
+        decay = np.exp(-np.maximum(z - q_last, 0.0) / tail_lambdas)
+        F_beyond = 1.0 - survive * decay
+        G_beyond = g_nodes[:, -1] + survive * tail_lambdas * (1.0 - decay)
+    F = np.where(z < q0, 0.0, np.where(z >= q_last, F_beyond, p_k + slope * t))
+    G_inside = g_nodes[row, k] + t * (1.0 - p_k) - 0.5 * slope * t**2
+    G = np.where(z < q0, z, np.where(z >= q_last, G_beyond, G_inside))
+    return F, G
 
 
 def _product_axis(product_bins_gev):
@@ -1262,9 +1313,11 @@ class Paleodetector:
 
         * mu-: 'elastic' (the interactions along the path, with density proportional to P(R > z):
           (G(z_max) - G(z_min)) / E[R]) and 'peak' (the stop, followed by capture: F(z_max) - F(z_min)), R being the
-          stopping depth (_piecewise_cdf_and_integral gives F and G).
+          stopping depth.
         * mu+: 'all', the interactions along the path (as 'elastic' above; the stop gives no capture).
-        * neutron, proton: 'all', the interaction depth inside the slab, F(z_max) - F(z_min) (_slab_probability).
+        * neutron, proton: 'all', the interaction depth inside the slab, F(z_max) - F(z_min).
+
+        F and G come from _depth_cdf_rows, for all the energies at once.
 
         Called by _primary_recoils.
 
@@ -1279,16 +1332,13 @@ class Paleodetector:
         """
         q_rows, tails = self._depth_rows(species, e_vals)
         p = self._depth_table(species)['p']
+        F_lo, G_lo = _depth_cdf_rows(z_min_grid, q_rows, p, tails)
+        F_hi, G_hi = _depth_cdf_rows(z_max_grid, q_rows, p, tails)
         if species not in MUON_SPECIES:
-            return {'all': _slab_probability(q_rows, p, z_min_grid, z_max_grid, tails)}
-        path = np.empty_like(z_min_grid, dtype=float)
-        stop = np.empty_like(z_min_grid, dtype=float)
-        for j in range(len(e_vals)):
-            F_lo, G_lo = _piecewise_cdf_and_integral(z_min_grid[..., j], q_rows[j], p)
-            F_hi, G_hi = _piecewise_cdf_and_integral(z_max_grid[..., j], q_rows[j], p)
-            _, mean_range = _piecewise_cdf_and_integral(np.inf, q_rows[j], p)
-            path[..., j] = (G_hi - G_lo) / mean_range
-            stop[..., j] = F_hi - F_lo
+            return {'all': F_hi - F_lo}
+        mean_range = _depth_cdf_rows(np.full(len(e_vals), np.inf), q_rows, p)[1]
+        path = (G_hi - G_lo) / mean_range
+        stop = F_hi - F_lo
         if species == 'mu-':
             return {'elastic': path, 'peak': stop}
         return {'all': path}
@@ -1680,8 +1730,10 @@ class Paleodetector:
         energy, and the low-energy runs have the most stops), times the total stopping probability in the slab
         summed over all cells. Without such runs each run's own peak recoils are used (warning).
 
-        All times are processed at once and each file is read once. Called by integrate_particle_signal_spectrum
-        (also through integrate_all_particles).
+        All times are processed at once and each file is read once. The slab probabilities depend on time only
+        through the overburden, so they are computed once per distinct overburden of the time grid (one for a
+        constant overburden) and shared by the times that have it. Called by integrate_particle_signal_spectrum (also
+        through integrate_all_particles).
 
         Args:
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
@@ -1707,7 +1759,8 @@ class Paleodetector:
         thickness_mwe = thickness_cm * 0.01 * rho
         t_kyr_array = np.atleast_1d(np.asarray(t_kyr_array, dtype=float))
         n_t = t_kyr_array.size
-        depth_mwe = self._overburden_interpolator(t_kyr_array)
+        depth_mwe, depth_of_time = np.unique(np.asarray(self._overburden_interpolator(t_kyr_array), dtype=float),
+                                             return_inverse=True)
 
         c_vals = COS_ZENITH_NODES
         e_nodes, e_weights = _energy_cell_nodes(energy_bins_gev)
@@ -1724,7 +1777,8 @@ class Paleodetector:
             z_max_grid = z_min_grid + thickness_mwe / C_grid[None, :, :]
             flux_grid = np.broadcast_to(flux_nodes[:, None, i, :], (n_t, *E_grid.shape))
             probabilities = self._slab_interaction_probabilities(species, e_nodes[i], z_min_grid, z_max_grid)
-            weights = {category: np.trapezoid(np.sum(flux_grid * prob * e_weights[i], axis=-1), c_vals, axis=-1)
+            weights = {category: np.trapezoid(np.sum(flux_grid * prob[depth_of_time] * e_weights[i], axis=-1),
+                                              c_vals, axis=-1)
                        for category, prob in probabilities.items()}
             if 'peak' in weights:
                 stop_weight_total += weights['peak']
@@ -1871,16 +1925,15 @@ class Paleodetector:
             e_cells = energy_bins_gev[:-1]
             geant4_input_dir = os.path.join(self.data_path, "Geant4_data", self.name, product)
 
-            table = self._depth_table(product)
             q_rows, tails = self._depth_rows(product, e_cells)
-            prob = np.empty((len(c_vals), n_b, n_e))
-            for m in range(n_e):
-                def H(z):
-                    """Integral of the product's depth CDF from 0 to z [m.w.e.]."""
-                    _, G = _piecewise_cdf_and_integral(z, q_rows[m], table['p'], tails[m])
-                    return z - G
-                prob[:, :, m] = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau)
-                                 - H(z_d0 + delta) + H(z_d0)) / delta
+            p = self._depth_table(product)['p']
+
+            def H(z):
+                """z - G(z), the integral of the product's depth CDF from 0 to z, for every energy cell (last axis)."""
+                z = np.broadcast_to(z[..., None], (*z.shape, n_e))
+                return z - _depth_cdf_rows(z, q_rows, p, tails)[1]
+
+            prob = (H(z_d0 + delta + z_tau) - H(z_d0 + z_tau) - H(z_d0 + delta) + H(z_d0)) / delta
 
             weight_t = np.trapezoid(np.einsum('tcbm,cbm->tcm', Y[..., offsets[product]], prob), c_vals, axis=1)
             if product in energy_windows:
