@@ -173,7 +173,8 @@ if _numba is not None:
     def _window_source_numba(A, depth, primary_cell, cell, lo_idx, hi_idx, beyond, window_top, phi_cell, weight,
                              delta, n_b, n_q, k0, active):
         """Compiled form of the (t, c) loop of _secondary_cascade: same operations on each row, same order of
-        summation within each bin (np.bincount adds the weights in row order from 0, then the sum is added to A).
+        summation within each bin (np.bincount adds the weights in row order from 0, then the sum is added to A);
+        phi_cell is per time, direction and primary cell.
         The times are independent (each writes only A[t]) and run in parallel threads; only those with active[t]."""
         n_t, n_c = lo_idx.shape
         for t in _numba.prange(n_t):
@@ -190,7 +191,7 @@ if _numba is not None:
                     b = int((depth[r] - top) / delta)
                     if b > n_b - 1:
                         b = n_b - 1
-                    buf[b, cell[r]] += phi_cell[t, primary_cell[r]] * weight
+                    buf[b, cell[r]] += phi_cell[t, c, primary_cell[r]] * weight
                 for b in range(n_b):
                     for k in range(n_q):
                         A[t, c, b, k0 + k] += buf[b, k]
@@ -271,6 +272,38 @@ def _energy_cell_nodes(edges_gev, n_nodes=ENERGY_CELL_NODES):
     weights = np.repeat(((e_hi - e_lo) / (n_nodes - 1))[:, None], n_nodes, axis=1)
     weights[:, [0, -1]] *= 0.5
     return nodes, weights
+
+
+def _zenith_density(cos_zenith, weights, intensity, c_vals):
+    """Distribution in cos(zenith) of the flux crossing a horizontal plane, on the detector's grid c_vals.
+
+    A particle of intensity I(c) crosses a horizontal plane at a rate 2 pi c I(c) per unit c, so its density is
+    p(c) = 2 pi c I(c) / sum_i w_i I_i, with I known at the quadrature nodes of the flux templates
+    (FluxHistory.get_zenith_map). log I is interpolated linearly in log c between the nodes and held beyond them; p
+    is then normalised so that its trapezoid over c_vals is 1, so the flux crossing the plane is kept whole. Called by
+    _primary_recoils and _flux_cell_integral (for the secondary cascade): the flux times p(c) is what each direction
+    of the c_vals integrals gets.
+
+    Args:
+        cos_zenith (np.ndarray): Quadrature nodes mu_i, shape (n_angles,).
+        weights (np.ndarray): Quadrature weights, shape (n_angles,).
+        intensity (np.ndarray): Intensities at the nodes, shape (..., n_angles).
+        c_vals (np.ndarray): cos(zenith) grid, shape (N_C,).
+
+    Returns:
+        np.ndarray: p on c_vals, shape (..., N_C); uniform where the intensity is zero at every node.
+    """
+    order = np.argsort(cos_zenith)
+    log_mu = np.log(cos_zenith[order])
+    intensity = np.clip(intensity[..., order], 0.0, None)
+    total = intensity @ weights[order]
+    shape = np.where(total[..., None] > 0, intensity / np.where(total > 0, total, 1.0)[..., None], 1.0)
+    log_shape = np.log(np.clip(shape, 1e-300, None))
+    x = np.log(np.clip(c_vals, cos_zenith.min(), cos_zenith.max()))
+    j = np.clip(np.searchsorted(log_mu, x) - 1, 0, log_mu.size - 2)
+    f = (x - log_mu[j]) / (log_mu[j + 1] - log_mu[j])
+    density = 2.0 * np.pi * c_vals * np.exp(log_shape[..., j] * (1.0 - f) + log_shape[..., j + 1] * f)
+    return density / np.trapezoid(density, c_vals, axis=-1)[..., None]
 
 
 def _product_axis(product_bins_gev):
@@ -1479,7 +1512,7 @@ class Paleodetector:
 
         Same window, binning and rows as the per-time loop (see there), but the rows are counted once per direction,
         by primary energy cell i, window bin b and product cell k (N[i, b, k]); each time t then gets
-        weight * sum_i phi_cell[t, i] N[i, b, k], a matrix product. Equal to the per-time sums up to the order of
+        weight * sum_i phi_cell[t, c, i] N[i, b, k], a matrix product. Equal to the per-time sums up to the order of
         the floating-point additions.
 
         Args:
@@ -1487,7 +1520,8 @@ class Paleodetector:
             times (np.ndarray): Indices of the times sharing this overburden.
             rows (dict): Output of _load_stdrock_rows.
             lo_idx, hi_idx, beyond, window_top (np.ndarray): Their rows for these times, shape (N_C,).
-            phi_cell (np.ndarray): Primary intensity per energy cell, (T, n_primary_cells).
+            phi_cell (np.ndarray): Primary flux per direction and energy cell (_flux_cell_integral with c_vals),
+                (T, N_C, n_primary_cells).
             delta (float): Window bin width [m.w.e.].
             n_b, n_q (int): Window bins and product cells.
             product_slice (slice): Columns of this product on the last axis of A.
@@ -1503,7 +1537,7 @@ class Paleodetector:
             counts = np.bincount(prim[sl] * (n_b * n_q) + b * n_q + cell[sl],
                                  minlength=n_prim * n_b * n_q).reshape(n_prim, n_b * n_q)
             used = np.nonzero(counts.any(axis=1))[0]
-            A[times, c, :, product_slice] += (rows['weight'] * (phi[:, used] @ counts[used])).reshape(
+            A[times, c, :, product_slice] += (rows['weight'] * (phi[:, c, used] @ counts[used])).reshape(
                 len(times), n_b, n_q)
 
 
@@ -1519,10 +1553,11 @@ class Paleodetector:
         State: the products of every type on one flat axis, product q occupying offsets[q] (its energy cells).
 
         Source: products made in the window by the primaries, from the StdRock runs at their actual slant depth
-        (so the transport of the primary down to the window is included), weighted by the primary intensity
-        integrated over each energy cell of the primary's StdRock grid:
+        (so the transport of the primary down to the window is included), weighted by the primary flux of the
+        direction, integrated over each energy cell of the primary's StdRock grid (_flux_cell_integral with c_vals:
+        the flux times its zenith density p(c), see _zenith_density):
 
-            A_b,k = sum_s sum_i Phi_s,i(t) * (StdRock/<s> products of cell k in bin b per primary of cell i)
+            A_b,k = sum_s sum_i Phi_s,i(t, c) * (StdRock/<s> products of cell k in bin b per primary of cell i)
 
         Generations inside the window: the StdRock/<p> runs of every product p give the products of every type
         q it makes (_stdrock_production_matrix blocks C[p -> q]), so neutrons from neutrons, protons from protons and
@@ -1599,7 +1634,7 @@ class Paleodetector:
                         self._log(f"Warning: vertical overburden beyond the StdRock/{species} target "
                                   f"({rows['target_mwe']:.0f} m.w.e.) at some times: secondaries "
                                   "from that species are missing there; use a longer StdRock target.")
-                    phi_cell = self._flux_cell_integral(species, t_kyr_array, rows['primary_bins'])
+                    phi_cell = self._flux_cell_integral(species, t_kyr_array, rows['primary_bins'], c_vals)
 
                 n_q = len(product_bins_gev[q]) - 1
                 depth = rows['depth_mwe']
@@ -1626,7 +1661,7 @@ class Paleodetector:
                             continue
                         sl = slice(lo_idx[t, c], hi_idx[t, c])
                         b = np.minimum(((depth[sl] - window_top[t, c]) / delta).astype(int), n_b - 1)
-                        w = phi_cell[t, rows['primary_cell'][sl]] * rows['weight']
+                        w = phi_cell[t, c, rows['primary_cell'][sl]] * rows['weight']
                         A[t, c, :, offsets[q]] += np.bincount(
                             b * n_q + rows['cell'][sl], weights=w, minlength=n_b * n_q
                         ).reshape(n_b, n_q)
@@ -1659,10 +1694,11 @@ class Paleodetector:
 
         The sample is a slab [X, X + thickness] at overburden X(t), seen along each slanted path (both divided by
         cos(zenith)); its thickness is that of a 1 mg cube. For each energy cell of the mineral runs, the flux is
-        integrated over the cell (_energy_cell_nodes) and over cos(zenith) (COS_ZENITH_NODES) times the probability
-        of an interaction in the slab, one per category of recoils (_slab_interaction_probabilities), and multiplied
-        by the recoils per primary of the run at the lower edge of the cell in that category
-        (_mineral_run_histograms): 'all' for mu+ and hadrons, 'elastic' and 'peak' for mu-.
+        integrated over the cell (_energy_cell_nodes) and over cos(zenith) (COS_ZENITH_NODES), each direction with
+        its share of the flux (the zenith density of the flux templates at that energy and time, _zenith_density),
+        times the probability of an interaction in the slab, one per category of recoils
+        (_slab_interaction_probabilities), and multiplied by the recoils per primary of the run at the lower edge of
+        the cell in that category (_mineral_run_histograms): 'all' for mu+ and hadrons, 'elastic' and 'peak' for mu-.
 
         mu- captures ('peak', the muon stops in the slab) use one capture spectrum for every energy: the mean of the
         peak recoils of the runs with E0 <= CAPTURE_SPECTRUM_MAX_E0_GEV (a stopped muon does not remember its initial
@@ -1703,18 +1739,20 @@ class Paleodetector:
 
         c_vals = COS_ZENITH_NODES
         e_nodes, e_weights = _energy_cell_nodes(energy_bins_gev)
-        flux_nodes = self.flux_history.get_map(species, self._flux_time_kyr(t_kyr_array), e_nodes)[2].reshape(
-            n_t, *e_nodes.shape)
+        flux_times = self._flux_time_kyr(t_kyr_array)
+        flux_nodes = self.flux_history.get_map(species, flux_times, e_nodes)[2].reshape(n_t, *e_nodes.shape)
+        cos_zenith, zenith_weights, intensity = self.flux_history.get_zenith_map(species, flux_times, e_nodes)
         run_dir = os.path.join(self.data_path, "Geant4_data", self.name, species)
 
         fragment_spectra = {}
         peak_per_run, capture_counts = {}, {}
         stop_weight_total, n_capture_runs = np.zeros(n_t), 0
         for i, e_lo in enumerate(energy_bins_gev[:-1]):
-            E_grid, C_grid = np.meshgrid(e_nodes[i], c_vals)
+            _, C_grid = np.meshgrid(e_nodes[i], c_vals)
             z_min_grid = depth_mwe[:, None, None] / C_grid[None, :, :]
             z_max_grid = z_min_grid + thickness_mwe / C_grid[None, :, :]
-            flux_grid = np.broadcast_to(flux_nodes[:, None, i, :], (n_t, *E_grid.shape))
+            density = _zenith_density(cos_zenith, zenith_weights, intensity[:, i], c_vals)
+            flux_grid = flux_nodes[:, None, i, :] * np.moveaxis(density, -1, 1)
             probabilities = self._slab_interaction_probabilities(species, e_nodes[i], z_min_grid, z_max_grid)
             weights = {category: np.trapezoid(np.sum(flux_grid * prob[depth_of_time] * e_weights[i], axis=-1),
                                               c_vals, axis=-1)
@@ -2310,25 +2348,36 @@ class Paleodetector:
         return value
 
 
-    def _flux_cell_integral(self, species, t_kyr_array, edges_gev):
-        """Flux of a species integrated over each energy cell, at local times (_energy_cell_nodes quadrature).
+    def _flux_cell_integral(self, species, t_kyr_array, edges_gev, c_vals=None):
+        """Flux of a species integrated over each energy cell, at local times (_energy_cell_nodes quadrature), and
+        per direction if c_vals is given.
 
-        Called by _secondary_cascade (primaries of the StdRock runs) and _neutrino_run_pass (neutrino runs): the run at
-        the lower edge of a cell is weighted by the flux integrated over its cell.
+        Called by _secondary_cascade (primaries of the StdRock runs, per direction) and _neutrino_run_pass (neutrino
+        runs): the run at the lower edge of a cell is weighted by the flux integrated over its cell.
 
         Args:
             species (str): Flux species (MCEQ_SPECIES key).
             t_kyr_array (np.ndarray): Local times [kyr], shape (T,).
             edges_gev (np.ndarray): Cell edges [GeV], shape (M,).
+            c_vals (np.ndarray, optional): cos(zenith) grid: the flux of each direction is the flux times its zenith
+                density (_zenith_density), per unit cos(zenith). Defaults to None (all directions together).
 
         Returns:
             np.ndarray: Template flux integrated over energy [cm^-2 s^-1]: the flux crossing a horizontal plane
-            (see the flux module docstring; for neutrinos see NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1).
+            (see the flux module docstring; for neutrinos see NEUTRINO_SOLID_ANGLE_FACTOR), shape (T, M - 1), or
+            (T, N_C, M - 1) per unit cos(zenith) with c_vals.
         """
         t_flux = self._flux_time_kyr(np.atleast_1d(np.asarray(t_kyr_array, dtype=float)))
         nodes, weights = _energy_cell_nodes(edges_gev)
         phi = self.flux_history.get_map(species, t_flux, nodes)[2].reshape(t_flux.size, *nodes.shape)
-        return np.sum(phi * weights, axis=-1)
+        if c_vals is None:
+            return np.sum(phi * weights, axis=-1)
+        cos_zenith, zenith_weights, intensity = self.flux_history.get_zenith_map(species, t_flux, nodes)
+        out = np.empty((t_flux.size, len(c_vals), nodes.shape[0]))
+        for i in range(nodes.shape[0]):
+            density = _zenith_density(cos_zenith, zenith_weights, intensity[:, i], c_vals)
+            out[:, :, i] = np.einsum('tn,tnc->tc', phi[:, i] * weights[i], density)
+        return out
 
 
     def _read_recoils_and_products(self, filepath, product_edges):

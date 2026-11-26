@@ -371,8 +371,8 @@ def plot_secondary_production(detector, sources=None, products=('neutron', 'prot
         (c) Who makes them at each depth: production rate per gram of rock vs depth, each run weighted by the flux
             integrated over its energy cell (flux history at t_kyr; _flux_cell_integral, per cm^2 per s), divided by
             the rock column of each depth bin (1 m.w.e. = 100 g/cm^2) to give a rate per gram. Every primary is
-            taken as vertical, so the panel shows shapes and crossover depths; the integrations also spread the
-            primaries over zenith angle.
+            taken as vertical, so the panel shows shapes and crossover depths; the integrations spread the
+            primaries over zenith angle with the zenith distribution of the flux templates.
     Yields only count products made inside the StdRock target (a lower limit for muons leaving it).
 
     Args:

@@ -289,7 +289,8 @@ FISSION_KEYS = ('heavier', 'lighter', 'pair')
 # Quadrature of the flux integrals: each Geant4 run at the lower edge of an energy cell stands for every particle in
 # the cell, so the flux (or emission spectrum) is integrated over the cell with the trapezoidal rule on
 # ENERGY_CELL_NODES linear points (detector._energy_cell_nodes); the slab interactions are integrated over
-# cos(zenith) on COS_ZENITH_NODES.
+# cos(zenith) on COS_ZENITH_NODES, each direction weighted by the zenith density of the flux templates
+# (detector._zenith_density).
 ENERGY_CELL_NODES = 50
 COS_ZENITH_NODES = np.linspace(0.01, 1.0, 50)
 

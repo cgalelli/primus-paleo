@@ -26,6 +26,13 @@ Units. A template stores, per species of MCEQ_SPECIES, the zenith-integrated flu
 [cm^-2 s^-1 GeV^-1] (the zenith quadrature _hemisphere_quadrature has weights summing to pi), and, as 'primary',
 the all-nucleus primary flux at the top of the atmosphere after the cutoff [cm^-2 s^-1 sr^-1 GeV^-1].
 
+Zenith distribution. MCEq solves each zenith angle of the quadrature; besides their weighted sum, a template keeps,
+per species, the angular shape g_i(E) = I_i(E) / sum_j w_j I_j(E) at the quadrature nodes mu_i = cos(theta_i)
+(sum_i w_i g_i = 1), so that the intensity is I_i = flux * g_i and the flux crossing a horizontal plane per unit
+cos(zenith) is 2 pi mu g(mu) * flux (FluxTemplate.zenith_shape, FluxHistory.get_zenith_map; used by Paleodetector
+for the slanted paths through the overburden). Below the low-energy matching energies, where MCEq is not used, the
+shape is held at its value there (_zenith_shapes).
+
 Caching (_cached). Templates and response matrices are kept in memory for the session; the matrices are saved to
 <template_dir>/Response_*.npz, and templates of the 'direct' solver (or all of them, with SAVE_RESPONSE_TEMPLATES) to
 <template_dir>/<name>.npz (default config.flux_template_dir()).
@@ -56,7 +63,7 @@ def _hemisphere_quadrature(n_angles):
     Gauss-Jacobi quadrature with weight function mu on [0, 1], so the factor mu is part of the rule (exact for
     polynomials in mu up to degree 2 n_angles - 1; a constant I = 1 gives pi). Summing MCEq's solutions
     [cm^-2 s^-1 sr^-1 GeV^-1] with these weights gives the flux crossing a horizontal plane [cm^-2 s^-1 GeV^-1].
-    Used for DEFAULT_ANGLES_DEG / DEFAULT_ANGLE_WEIGHTS (_zenith_averaged_secondaries).
+    Used for DEFAULT_ANGLES_DEG / DEFAULT_ANGLE_WEIGHTS (_zenith_sum).
 
     Args:
         n_angles (int): Number of zenith angles.
@@ -113,7 +120,7 @@ def _cached(memory, key, path, load, build, use_disk=True, force_rebuild=False):
         memory (dict): Session cache.
         key: Key of the object in memory.
         path (str): File of the object on disk.
-        load (callable): path -> object.
+        load (callable): path -> object, or None if the file is outdated (then built again).
         build (callable): () -> object (then saved to path if use_disk).
         use_disk (bool, optional): Read and write path. Defaults to True.
         force_rebuild (bool, optional): Build even if cached. Defaults to False.
@@ -125,8 +132,10 @@ def _cached(memory, key, path, load, build, use_disk=True, force_rebuild=False):
         if key in memory:
             return memory[key]
         if use_disk and os.path.exists(path):
-            memory[key] = load(path)
-            return memory[key]
+            obj = load(path)
+            if obj is not None:
+                memory[key] = obj
+                return obj
     obj = build()
     if use_disk:
         obj.save(path)
@@ -142,22 +151,26 @@ def _h_obs_cm(h_obs_km):
 # --- MCEq runs --------------------------------------------------------------------------------------------------------
 
 
-def _zenith_averaged_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG,
-                                  weights=DEFAULT_ANGLE_WEIGHTS):
-    """
-    Zenith-averaged flux of every MCEQ_SPECIES entry, in MCEq's raw units, at `mceq_run`'s *current*
-    configuration (interaction model, primary model/params, density model), using one `solve_fullsky` batch
-    call and the solid-angle quadrature `weights` (see `_hemisphere_quadrature`).
+def _zenith_resolved_secondaries(mceq_run, angles=DEFAULT_ANGLES_DEG):
+    """MCEq intensity of every MCEQ_SPECIES entry at each zenith angle, at mceq_run's current configuration
+    (interaction model, primary model, atmosphere), from one solve_fullsky call. Called by ResponseMatrix.build and
+    _validate and by the direct solver of _build_template.
 
     Returns:
-        dict: species -> flux on mceq_run.e_grid (un-rescaled, un-clipped).
+        dict: species -> intensity [raw MCEq units, per sr], shape (n_angles, n_e) on mceq_run.e_grid.
     """
     result = mceq_run.solve_fullsky(zenith_grid=angles)
-    out = {key: np.zeros_like(mceq_run.e_grid) for key in MCEQ_SPECIES}
-    for theta, w in zip(angles, weights):
-        for key, names in MCEQ_SPECIES.items():
-            for name in names:
-                out[key] += w * result.get_solution(name, zenith=float(theta), mag=0)
+    return {key: np.array([sum(result.get_solution(name, zenith=float(theta), mag=0) for name in names)
+                           for theta in angles])
+            for key, names in MCEQ_SPECIES.items()}
+
+
+def _zenith_sum(intensity, weights=DEFAULT_ANGLE_WEIGHTS):
+    """Flux crossing a horizontal plane from intensities at the quadrature angles: sum_i w_i I_i over the first
+    axis (_hemisphere_quadrature), added in angle order. Called wherever the per-angle MCEq results are integrated."""
+    out = np.zeros(np.shape(intensity)[1:])
+    for w, row in zip(weights, intensity):
+        out += w * row
     return out
 
 
@@ -233,10 +246,10 @@ class _NucleonInjection(PrimaryFlux):
 
 class ResponseMatrix:
     """
-    Zenith-averaged secondary fluxes per unit primary nucleon flux, for one atmosphere (interaction model,
+    Secondary intensities at each zenith angle per unit primary nucleon flux, for one atmosphere (interaction model,
     observation altitude, zenith quadrature, MCEq database):
 
-        Phi_out[species](E_out) = sum_j  R[species][E_out, 0, j] * phi_p(E_j)  +  R[species][E_out, 1, j] * phi_n(E_j),
+        I[species](theta_a, E) = sum_j  R[species][a, E, 0, j] * phi_p(E_j)  +  R[species][a, E, 1, j] * phi_n(E_j),
 
     with phi_p, phi_n the primary model's p_and_n_flux on MCEq's nucleon grid E_j (crflux units, as MCEq takes
     them). MCEq's cascade equations are linear in the initial condition, so this reproduces a full solve to
@@ -244,39 +257,56 @@ class ResponseMatrix:
     p_and_n_flux (superposition, as in MCEq itself) after crflux has applied the per-nucleus cutoff Z * Rc, so
     composition, spectral shape and geomagnetic cutoff all live in the primary vector and need no new matrix.
 
+    The angles are kept (not only their weighted sum) for the zenith distribution of the templates; the flux
+    crossing a horizontal plane is _zenith_sum of the intensities.
+
     Cost: one MCEq solve (all zenith angles) per nucleon type and energy cell, ~2 x 100, once per atmosphere;
-    cached in the template directory and in memory.
+    cached in the template directory and in memory. Files of the earlier, zenith-summed form have another name
+    (no "_zen") and are not read.
+
+    Attributes:
+        e_grid (np.ndarray): MCEq energy grid of the secondaries [GeV].
+        e_in (np.ndarray): MCEq nucleon grid of the primaries [GeV].
+        response (dict): species -> R, shape (n_angles, n_e, 2, n_in).
+        angles_deg, weights (np.ndarray): Zenith angles [deg] and their quadrature weights.
+        meta (dict): Atmosphere and validation.
     """
 
-    def __init__(self, e_grid, e_in, response, meta=None):
+    def __init__(self, e_grid, e_in, response, meta=None, angles_deg=DEFAULT_ANGLES_DEG,
+                 weights=DEFAULT_ANGLE_WEIGHTS):
         self.e_grid = np.asarray(e_grid, dtype=float)
         self.e_in = np.asarray(e_in, dtype=float)
         self.response = {key: np.asarray(val, dtype=float) for key, val in response.items()}
+        self.angles_deg = np.asarray(angles_deg, dtype=float)
+        self.weights = np.asarray(weights, dtype=float)
         self.meta = dict(meta or {})
 
     def apply(self, model_instance):
-        """Zenith-averaged MCEq fluxes (raw units, on e_grid) for a crflux primary model, as a matrix product."""
+        """MCEq intensities per zenith angle (raw units, on e_grid) for a crflux primary model, as a matrix
+        product (see apply_nucleons)."""
         _, p, n = model_instance.p_and_n_flux(self.e_in)
         return self.apply_nucleons(p, n)
 
     def apply_nucleons(self, p, n):
-        """Zenith-averaged MCEq fluxes (raw units, on e_grid) for proton and neutron fluxes on e_in (crflux units)."""
+        """MCEq intensities for proton and neutron fluxes on e_in (crflux units): species -> (n_angles, n_e), raw
+        units, on e_grid."""
         p = np.broadcast_to(np.asarray(p, dtype=float), self.e_in.shape)
         n = np.broadcast_to(np.asarray(n, dtype=float), self.e_in.shape)
-        return {key: R[:, 0, :] @ p + R[:, 1, :] @ n for key, R in self.response.items()}
+        return {key: R[..., 0, :] @ p + R[..., 1, :] @ n for key, R in self.response.items()}
 
     @staticmethod
     def filename(interaction_model=DEFAULT_INTERACTION_MODEL, h_obs_km=None, n_angles=len(DEFAULT_ANGLES_DEG)):
         """Cache file name of the matrix of one atmosphere: interaction model, altitude, zenith angles, database."""
         db = "default" if MCEQ_DB_FNAME is None else os.path.splitext(MCEQ_DB_FNAME)[0]
-        return f"Response_{interaction_model}_{h_obs_km or 0.0}km_{n_angles}ang_{db}.npz"
+        return f"Response_{interaction_model}_{h_obs_km or 0.0}km_{n_angles}ang_zen_{db}.npz"
 
     def save(self, filepath):
         """Writes the matrix to an .npz file (arrays, R__<species> blocks, meta__<key> entries)."""
         directory = os.path.dirname(filepath)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        payload = {"e_grid": self.e_grid, "e_in": self.e_in}
+        payload = {"e_grid": self.e_grid, "e_in": self.e_in, "angles_deg": self.angles_deg,
+                   "angle_weights": self.weights}
         payload.update({f"R__{key}": val for key, val in self.response.items()})
         payload.update({f"meta__{key}": np.asarray(val) for key, val in self.meta.items()})
         np.savez_compressed(filepath, **payload)
@@ -287,13 +317,12 @@ class ResponseMatrix:
         with np.load(filepath, allow_pickle=False) as data:
             response = {k.split("__", 1)[1]: data[k] for k in data.files if k.startswith("R__")}
             meta = {k.split("__", 1)[1]: data[k].item() for k in data.files if k.startswith("meta__")}
-            return cls(data["e_grid"], data["e_in"], response, meta)
+            return cls(data["e_grid"], data["e_in"], response, meta, data["angles_deg"], data["angle_weights"])
 
     @classmethod
     def build(cls, interaction_model=DEFAULT_INTERACTION_MODEL, h_obs_km=None, angles=DEFAULT_ANGLES_DEG,
               weights=DEFAULT_ANGLE_WEIGHTS, validate=True, verbose=True):
-        """
-        Runs MCEq once per primary nucleon type and energy cell.
+        """Runs MCEq once per primary nucleon type and energy cell (all zenith angles each).
 
         Raises:
             RuntimeError: If MCEq does not set its initial condition through p_and_n_flux, or if the matrix does
@@ -309,7 +338,7 @@ class ResponseMatrix:
                                "be built with this MCEq version; use solver='direct'.")
         e_in = recorder.energies
         n_in = e_in.size
-        response = {key: np.zeros((run.e_grid.size, 2, n_in)) for key in MCEQ_SPECIES}
+        response = {key: np.zeros((len(angles), run.e_grid.size, 2, n_in)) for key in MCEQ_SPECIES}
         if verbose:
             print(f"Building MCEq response matrix ({interaction_model}, h_obs={h_obs_km or 0.0} km): "
                   f"2 x {n_in} primary cells, {len(angles)} zenith angles each.")
@@ -317,15 +346,15 @@ class ResponseMatrix:
             for nucleon in (0, 1):
                 run.set_primary_model(_NucleonInjection(e_in, j, nucleon))
                 _set_h_obs(run, h_obs_cm)
-                raw = _zenith_averaged_secondaries(run, angles, weights)
+                intensity = _zenith_resolved_secondaries(run, angles)
                 for key in MCEQ_SPECIES:
-                    response[key][:, nucleon, j] = raw[key]
+                    response[key][:, :, nucleon, j] = intensity[key]
             if verbose and (j + 1) % 20 == 0:
                 print(f"  {j + 1}/{n_in} cells")
 
         matrix = cls(run.e_grid, e_in, response, meta={
             "interaction_model": interaction_model, "h_obs_km": float(h_obs_km or 0.0), "n_angles": len(angles),
-            "mceq_db": str(MCEQ_DB_FNAME)})
+            "mceq_db": str(MCEQ_DB_FNAME)}, angles_deg=angles, weights=weights)
         if validate:
             matrix._validate(run, h_obs_cm, angles, weights)
             if verbose:
@@ -334,13 +363,14 @@ class ResponseMatrix:
         return matrix
 
     def _validate(self, run, h_obs_cm, angles, weights):
-        """Compares apply() with a direct solve of the H3a baseline at 5 GV; stores the largest difference."""
+        """Compares apply() with a direct solve of the H3a baseline at 5 GV, angle by angle; stores the largest
+        difference."""
         import crflux.models as pm
 
         model = pm.HillasGaisser2012("H3a", geomagnetic_cutoff=5.0)
         run.set_primary_model(model)
         _set_h_obs(run, h_obs_cm)
-        direct = _zenith_averaged_secondaries(run, angles, weights)
+        direct = _zenith_resolved_secondaries(run, angles)
         via = self.apply(model)
         worst, worst_key = 0.0, None
         for key in MCEQ_SPECIES:
@@ -545,7 +575,7 @@ def cutoff_scaling_factor(geomagnetic_cutoff, h_obs_km=None, reference_cutoff=No
 
 def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=None, h_obs_km=None):
     """
-    Zenith-averaged MCEq fluxes -> template fluxes: the MCEq grid extended down to LOW_E_GRID['e_min_gev'], with the
+    Zenith-integrated MCEq fluxes -> template fluxes: the MCEq grid extended down to LOW_E_GRID['e_min_gev'], with the
     low-energy correction of every LOW_E_SPLICE species. Shared by both solvers (direct MCEq solve and response
     matrix), applied to every template (steady and, per time step, transient).
 
@@ -563,8 +593,8 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
 
     Args:
         e_grid (np.ndarray): MCEq energy grid [GeV].
-        raw_fluxes (dict): species -> zenith-averaged MCEq flux on e_grid (`_zenith_averaged_secondaries` or
-            `ResponseMatrix.apply`).
+        raw_fluxes (dict): species -> MCEq flux crossing a horizontal plane on e_grid (_zenith_sum of the
+            intensities of _zenith_resolved_secondaries or ResponseMatrix.apply_nucleons).
         total_flux (callable): E per nucleus [GeV] -> all-nucleus primary flux after the cutoff (the 'primary'
             species).
         geomagnetic_cutoff (float, optional): Cutoff [GV] the primary model was built with. Defaults to None:
@@ -615,25 +645,60 @@ def _postprocess_secondaries(e_grid, raw_fluxes, total_flux, geomagnetic_cutoff=
     return e_ext, fluxes, primary
 
 
+def _zenith_shapes(e_grid, intensities, weights, e_ext):
+    """Angular shape of each species on the template energy grid: g_i(E) = I_i(E) / sum_j w_j I_j(E) at the
+    quadrature angles (see the module docstring). Called by _build_template, next to _postprocess_secondaries.
+
+    Below the matching energy of the low-energy extension (LOW_E_SPLICE e_match_gev for nucleons,
+    NEUTRINO_LOW_E['e_match_gev'] for neutrinos, the bottom of the MCEq grid for the others) the shape is held at its
+    value there; energies where MCEq gives no flux take the shape of the nearest energy that has one (an isotropic
+    intensity if none has).
+
+    Args:
+        e_grid (np.ndarray): MCEq energy grid [GeV].
+        intensities (dict): species -> intensities (n_angles, len(e_grid)) (_zenith_resolved_secondaries or
+            ResponseMatrix.apply_nucleons).
+        weights (np.ndarray): Quadrature weights of the angles.
+        e_ext (np.ndarray): Template grid (_postprocess_secondaries): e_grid extended downwards.
+
+    Returns:
+        dict: species -> g, shape (n_angles, len(e_ext)).
+    """
+    e_grid = np.asarray(e_grid, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    on_grid = np.clip(np.searchsorted(e_grid, e_ext), 0, e_grid.size - 1)
+    shapes = {}
+    for key, intensity in intensities.items():
+        intensity = np.clip(np.asarray(intensity, dtype=float), 0.0, None)
+        total = _zenith_sum(intensity, weights)
+        valid = np.nonzero(total > 0)[0]
+        if valid.size == 0:
+            shapes[key] = np.full((weights.size, e_ext.size), 1.0 / np.sum(weights))
+            continue
+        nearest = valid[np.clip(np.searchsorted(valid, np.arange(e_grid.size)), 0, valid.size - 1)]
+        lower = valid[np.clip(np.searchsorted(valid, np.arange(e_grid.size)) - 1, 0, valid.size - 1)]
+        nearest = np.where(np.abs(lower - np.arange(e_grid.size)) < np.abs(nearest - np.arange(e_grid.size)),
+                           lower, nearest)
+        g = intensity[:, nearest] / total[nearest]
+        if key in LOW_E_SPLICE:
+            e_hold = LOW_E_SPLICE[key]['e_match_gev']
+        elif key in NEUTRINO_LOW_E['species']:
+            e_hold = NEUTRINO_LOW_E['e_match_gev']
+        else:
+            e_hold = e_grid[0]
+        j_hold = min(int(np.searchsorted(e_grid, e_hold)), e_grid.size - 1)
+        shapes[key] = g[:, np.maximum(on_grid, j_hold)]
+    return shapes
+
+
 # --- Building a template ----------------------------------------------------------------------------------------------
-
-def _corrected_secondaries(mceq_run, model_instance, angles=DEFAULT_ANGLES_DEG, weights=DEFAULT_ANGLE_WEIGHTS,
-                           geomagnetic_cutoff=None, h_obs_km=None):
-    """
-    Direct solver: `_zenith_averaged_secondaries` at mceq_run's current primary model, then
-    `_postprocess_secondaries` (see there for the arguments and the return value).
-    """
-    raw = _zenith_averaged_secondaries(mceq_run, angles, weights)
-    return _postprocess_secondaries(mceq_run.e_grid, raw, model_instance.total_flux,
-                                    geomagnetic_cutoff=geomagnetic_cutoff,
-                                    h_obs_km=h_obs_km)
-
 
 def _build_template(name, model_factory, t_since_yr=None, interaction_model=DEFAULT_INTERACTION_MODEL,
                     h_obs_km=None, geomagnetic_cutoff=5.0, solver=None, template_dir=None):
     """
     Builds a FluxTemplate: the primary model model_factory(t) at each time of t_since_yr (model_factory(None) once
-    for a steady flux) -> MCEq secondaries, zenith-averaged -> _postprocess_secondaries.
+    for a steady flux) -> MCEq intensities per zenith angle -> their sum (_zenith_sum) through
+    _postprocess_secondaries, and their shape (_zenith_shapes).
 
     Args:
         name (str): Template name.
@@ -651,33 +716,43 @@ def _build_template(name, model_factory, t_since_yr=None, interaction_model=DEFA
     if solver == "response":
         matrix = ResponseMatrix.get_or_build(interaction_model, h_obs_km, template_dir)
 
-        def solve(source):
-            """Secondaries of one PrimarySource from the response matrix."""
+        e_grid, angles, weights = matrix.e_grid, matrix.angles_deg, matrix.weights
+
+        def intensities(source):
+            """Intensities per angle of one PrimarySource, from the response matrix, and its primary flux."""
             p, n = nucleon_spectra(source, matrix.e_in, geomagnetic_cutoff)
-            return _postprocess_secondaries(matrix.e_grid, matrix.apply_nucleons(p, n),
-                                            lambda E: total_nucleus_flux(source, E, geomagnetic_cutoff),
-                                            geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
+            return matrix.apply_nucleons(p, n), lambda E: total_nucleus_flux(source, E, geomagnetic_cutoff)
     else:
         mceq_run = _new_mceq_run(interaction_model)
         reference_h_obs_cm = _h_obs_cm(h_obs_km)
+        e_grid, angles, weights = mceq_run.e_grid, DEFAULT_ANGLES_DEG, DEFAULT_ANGLE_WEIGHTS
 
-        def solve(source):
-            """Secondaries of one PrimarySource from a full MCEq solve."""
+        def intensities(source):
+            """Intensities per angle of one PrimarySource, from a full MCEq solve, and its primary flux."""
             model_instance = _SourceAsCrflux(source, geomagnetic_cutoff)
             mceq_run.set_primary_model(model_instance)
             _set_h_obs(mceq_run, reference_h_obs_cm)
-            return _corrected_secondaries(mceq_run, model_instance, DEFAULT_ANGLES_DEG,
-                                          geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
+            return _zenith_resolved_secondaries(mceq_run, angles), model_instance.total_flux
+
+    def solve(source):
+        """Template fluxes, primary flux and zenith shapes of one PrimarySource."""
+        per_angle, total_flux = intensities(source)
+        e_ext, fluxes, primary = _postprocess_secondaries(
+            e_grid, {key: _zenith_sum(v, weights) for key, v in per_angle.items()}, total_flux,
+            geomagnetic_cutoff=geomagnetic_cutoff, h_obs_km=h_obs_km)
+        return e_ext, fluxes, primary, _zenith_shapes(e_grid, per_angle, weights, e_ext)
 
     if t_since_yr is None:
-        e_ext, fluxes, primary = solve(model_factory(None))
+        e_ext, fluxes, primary, shapes = solve(model_factory(None))
     else:
-        steps, primary = [], []
+        steps, primary, step_shapes = [], [], []
         for t_yr in t_since_yr:
-            e_ext, fluxes_t, primary_t = solve(model_factory(t_yr))
+            e_ext, fluxes_t, primary_t, shapes_t = solve(model_factory(t_yr))
             steps.append(fluxes_t)
             primary.append(primary_t)
+            step_shapes.append(shapes_t)
         fluxes = {key: np.array([f[key] for f in steps]) for key in MCEQ_SPECIES}
+        shapes = {key: np.array([g[key] for g in step_shapes]) for key in MCEQ_SPECIES}
 
     return FluxTemplate(
         name, e_ext,
@@ -687,6 +762,7 @@ def _build_template(name, model_factory, t_since_yr=None, interaction_model=DEFA
         },
         t_since_yr=t_since_yr,
         meta={"h_obs_km": h_obs_km, "geomagnetic_cutoff": geomagnetic_cutoff, "interaction_model": interaction_model},
+        zenith={"cos_zenith": np.cos(np.deg2rad(angles)), "weights": weights, "shapes": shapes},
     )
 
 
@@ -709,9 +785,23 @@ class FluxTemplate:
         meta (dict): The site it was built for: 'h_obs_km', 'geomagnetic_cutoff', 'interaction_model' (checked by
             FluxHistory against its own site).
         species (list[str]): Species stored.
+        cos_zenith, zenith_weights (np.ndarray or None): Quadrature nodes mu_i = cos(theta_i) and weights of the
+            zenith shapes (None without zenith data).
     """
 
-    def __init__(self, name, energy_gev, species_grids, t_since_yr=None, meta=None):
+    def __init__(self, name, energy_gev, species_grids, t_since_yr=None, meta=None, zenith=None):
+        """
+        Args:
+            name (str): Template name.
+            energy_gev (array_like): Energy grid [GeV], shape (n_e,).
+            species_grids (dict): species -> flux, shape (n_e,) (steady) or (n_t, n_e) (transient).
+            t_since_yr (array_like, optional): Time axis [yr since the event]. Defaults to None (steady).
+            meta (dict, optional): Site of the template. Defaults to None.
+            zenith (dict, optional): Zenith distribution: 'cos_zenith' (n_angles,), 'weights' (n_angles,) and
+                'shapes' {species: g, shape (n_angles, n_e) or (n_t, n_angles, n_e), sum_i w_i g_i = 1} (see the
+                module docstring). Made by _build_template; needed by Paleodetector for the cosmic-ray species.
+                Defaults to None.
+        """
         self.name = name
         self.meta = dict(meta or {})
         self.energy_gev = np.asarray(energy_gev, dtype=float)
@@ -724,6 +814,21 @@ class FluxTemplate:
             grid = np.asarray(grid, dtype=float)
             self._grids[species] = grid
             self._interp[species] = self._build_interpolator(grid)
+
+        self.cos_zenith = self.zenith_weights = None
+        self._zenith_shapes = {}
+        if zenith is not None:
+            self.cos_zenith = np.asarray(zenith['cos_zenith'], dtype=float)
+            self.zenith_weights = np.asarray(zenith['weights'], dtype=float)
+            n_angles = self.cos_zenith.size
+            expected = (n_angles, self.energy_gev.size) if self.is_steady else \
+                (self.t_since_yr.size, n_angles, self.energy_gev.size)
+            for species, g in zenith['shapes'].items():
+                g = np.asarray(g, dtype=float)
+                if g.shape != expected:
+                    raise ValueError(f"Template '{name}': zenith shape of {species} has shape {g.shape}, expected "
+                                     f"{expected}.")
+                self._zenith_shapes[species] = g
 
     def _build_interpolator(self, grid):
         """Interpolator of one species: log flux linear in log energy (steady: _core.log_interp1d) or in (time, log
@@ -741,6 +846,46 @@ class FluxTemplate:
     def species(self):
         """Species stored in the template."""
         return list(self._grids.keys())
+
+    @property
+    def has_zenith(self):
+        """Whether the template has zenith shapes (templates built before they were kept do not)."""
+        return self.cos_zenith is not None
+
+    def zenith_shape(self, species, energy_gev, t_since_yr=None):
+        """Zenith shape g_i of one species at the quadrature angles (see the module docstring): the intensity at
+        angle i is flux * g_i. Linear in log energy (and time) between the grid points, held at the edges.
+
+        Args:
+            species (str): A species with a zenith shape.
+            energy_gev (array_like): Energies [GeV].
+            t_since_yr (array_like, optional): Times since the event [yr], broadcastable against energy_gev;
+                required for a transient template.
+
+        Returns:
+            np.ndarray: g, shape (*broadcast shape of the inputs, n_angles).
+
+        Raises:
+            ValueError: If the template has no zenith shape for the species, or is transient and t_since_yr is
+                missing.
+        """
+        if species not in self._zenith_shapes:
+            raise ValueError(f"Template '{self.name}' has no zenith distribution for {species}: it was built before "
+                             "templates kept it, or by hand. Rebuild it (FluxTemplate.get_or_build(spec, "
+                             "force_rebuild=True), or delete its .npz file) or pass zenith= to FluxTemplate.")
+        g = self._zenith_shapes[species]
+        log_grid = np.log10(self.energy_gev)
+        log_e = np.clip(np.log10(np.asarray(energy_gev, dtype=float)), log_grid[0], log_grid[-1])
+        if self.is_steady:
+            j = np.clip(np.searchsorted(log_grid, log_e) - 1, 0, log_grid.size - 2)
+            f = ((log_e - log_grid[j]) / (log_grid[j + 1] - log_grid[j]))[..., None]
+            return np.moveaxis(g[:, j], 0, -1) * (1.0 - f) + np.moveaxis(g[:, j + 1], 0, -1) * f
+        if t_since_yr is None:
+            raise ValueError(f"Template '{self.name}' is transient: t_since_yr is required.")
+        t_b, e_b = np.broadcast_arrays(np.clip(np.asarray(t_since_yr, dtype=float), self.t_since_yr[0],
+                                               self.t_since_yr[-1]), log_e)
+        interp = RegularGridInterpolator((self.t_since_yr, log_grid), np.moveaxis(g, 1, -1), method='linear')
+        return interp(np.stack([t_b.ravel(), e_b.ravel()], axis=-1)).reshape(*t_b.shape, -1)
 
     def flux(self, species, energy_gev, t_since_yr=None):
         """Flux of one species at energies (and, for a transient template, times since the event).
@@ -778,7 +923,8 @@ class FluxTemplate:
         return np.where(t_orig_b < 0.0, 0.0, out)
 
     def save(self, filepath):
-        """Writes the template to an .npz file (energy_gev, t_since_yr, species__<name> grids, meta__<key>)."""
+        """Writes the template to an .npz file (energy_gev, t_since_yr, species__<name> grids, meta__<key>, and the
+        zenith data: zenith__cos, zenith__weights, zshape__<name>)."""
         directory = os.path.dirname(filepath)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -792,6 +938,11 @@ class FluxTemplate:
             payload[f'species__{species}'] = grid
         for key, value in self.meta.items():
             payload[f'meta__{key}'] = np.asarray('' if value is None else value)
+        if self.has_zenith:
+            payload['zenith__cos'] = self.cos_zenith
+            payload['zenith__weights'] = self.zenith_weights
+            for species, g in self._zenith_shapes.items():
+                payload[f'zshape__{species}'] = g
         np.savez_compressed(filepath, **payload)
 
     @classmethod
@@ -807,9 +958,14 @@ class FluxTemplate:
                 for key in data.files if key.startswith('species__')
             }
             meta = {key.split('__', 1)[1]: data[key].item() for key in data.files if key.startswith('meta__')}
+            zenith = None
+            if 'zenith__cos' in data.files:
+                zenith = {'cos_zenith': data['zenith__cos'], 'weights': data['zenith__weights'],
+                          'shapes': {key.split('__', 1)[1]: data[key] for key in data.files
+                                     if key.startswith('zshape__')}}
         meta = {k: (None if v == '' else v) for k, v in meta.items()}
         name = os.path.splitext(os.path.basename(filepath))[0]
-        return cls(name, energy_gev, species_grids, t_since_yr=t_since_yr, meta=meta)
+        return cls(name, energy_gev, species_grids, t_since_yr=t_since_yr, meta=meta, zenith=zenith)
 
     @classmethod
     def get_or_build(cls, params, template_dir=None, force_rebuild=False):
@@ -823,7 +979,8 @@ class FluxTemplate:
         Caching (_cached): templates are kept in memory for the session. Templates built with the response matrix
         are rebuilt from it on demand (a fraction of a second), so only the matrices (Response_*.npz) live on disk,
         unless SAVE_RESPONSE_TEMPLATES is True; 'direct' templates are saved to and loaded from
-        <template_dir>/<name>.npz. Called by FluxHistory for its baseline, events and excursion variants.
+        <template_dir>/<name>.npz (a saved template without zenith data is built again). Called by FluxHistory for
+        its baseline, events and excursion variants.
         """
         template_dir = config.flux_template_dir() if template_dir is None else template_dir
         params = dict(params)
@@ -836,9 +993,14 @@ class FluxTemplate:
         label, factory, times = _primary_source(params)
         name = f"{label}_{geomagnetic_cutoff}GV" + (f"_{h_obs_km}km" if h_obs_km else "")
 
+        def load(path):
+            """The saved template, or None (rebuild) if it has no zenith data."""
+            template = cls.load(path)
+            return template if template.has_zenith else None
+
         return _cached(
             _TEMPLATE_CACHE, (os.path.abspath(template_dir), name, interaction_model),
-            os.path.join(template_dir, name + ".npz"), cls.load,
+            os.path.join(template_dir, name + ".npz"), load,
             lambda: _build_template(name, factory, t_since_yr=times, interaction_model=interaction_model,
                                     h_obs_km=h_obs_km, geomagnetic_cutoff=geomagnetic_cutoff, solver=solver,
                                     template_dir=template_dir),
@@ -1045,27 +1207,49 @@ class FluxHistory:
         cache[geomagnetic_cutoff] = variant
         return variant
 
-    def _flux_stack(self, species, energy_gev, t_kyr, geomagnetic_cutoff=None):
+    def _flux_stack(self, species, energy_gev, t_kyr, geomagnetic_cutoff=None, zenith=False):
         """Baseline plus every event (each at its time since the start, in years) at absolute times t_kyr, with the
-        site's templates (geomagnetic_cutoff None) or their variants at an excursion cutoff. Called by flux.
+        site's templates (geomagnetic_cutoff None) or their variants at an excursion cutoff. With zenith, the
+        intensities at the quadrature angles (flux * zenith_shape of each template, last axis) instead of the flux.
+        Called by flux and angular_flux.
         """
         if geomagnetic_cutoff is None:
             baseline = self.baseline
         else:
             baseline = self._cutoff_variant(self._baseline_spec, self._baseline_cutoff_variants, geomagnetic_cutoff)
 
-        total = baseline.flux(species, energy_gev)
-        total = np.broadcast_to(total, np.broadcast_shapes(np.shape(t_kyr), np.shape(energy_gev))).copy()
+        def term(template, t_since_yr=None):
+            """Flux (or intensities, with zenith) of one template."""
+            flux = template.flux(species, energy_gev, t_since_yr=t_since_yr)
+            if not zenith:
+                return flux
+            self._check_zenith(template)
+            return flux[..., None] * template.zenith_shape(species, energy_gev, t_since_yr=t_since_yr)
+
+        shape = np.broadcast_shapes(np.shape(t_kyr), np.shape(energy_gev))
+        total = term(baseline)
+        total = np.broadcast_to(total, shape + total.shape[len(np.shape(energy_gev)):]).copy()
         for event in self.events:
             if geomagnetic_cutoff is None:
                 template = event["template"]
             else:
                 template = self._cutoff_variant(event["spec"], event["_cutoff_variants"], geomagnetic_cutoff)
             t_since_yr = (np.asarray(t_kyr, dtype=float) - event["start_time_kyr"]) * 1.e3
-            total = total + event["weight"] * template.flux(species, energy_gev, t_since_yr=t_since_yr)
+            total = total + event["weight"] * term(template, t_since_yr)
         return total
 
-    def flux(self, species, energy_gev, t_kyr):
+    def _check_zenith(self, template):
+        """Raises unless the template has zenith shapes on the baseline's angles. Called by _flux_stack."""
+        if not template.has_zenith:
+            raise ValueError(f"Template '{template.name}' has no zenith distribution: it was built before templates "
+                             "kept it, or by hand. Rebuild it (FluxTemplate.get_or_build(spec, force_rebuild=True), "
+                             "or delete its .npz file) or pass zenith= to FluxTemplate.")
+        if not (template.cos_zenith.shape == self.baseline.cos_zenith.shape
+                and np.allclose(template.cos_zenith, self.baseline.cos_zenith)):
+            raise ValueError(f"Template '{template.name}' has its zenith shapes on other angles than the baseline "
+                             f"'{self.baseline.name}'; build them with the same zenith quadrature.")
+
+    def flux(self, species, energy_gev, t_kyr, zenith=False):
         """Total flux of one species (baseline and active events, excursions swapped in over their windows).
 
         Args:
@@ -1073,25 +1257,31 @@ class FluxHistory:
             energy_gev (array_like): Energies [GeV].
             t_kyr (array_like): Absolute times [kyr, 0 = present], broadcastable against energy_gev.
 
+            zenith (bool, optional): Return the intensities at the zenith quadrature angles instead (last axis; see
+                get_zenith_map). Defaults to False.
+
         Returns:
-            np.ndarray: Flux (units: see the module docstring), shape of the broadcast inputs.
+            np.ndarray: Flux (units: see the module docstring), shape of the broadcast inputs (with zenith, plus
+            the angle axis).
         """
-        total = self._flux_stack(species, energy_gev, t_kyr)
+        total = self._flux_stack(species, energy_gev, t_kyr, zenith=zenith)
 
         if not self.excursions:
             return total
 
         t_arr = np.asarray(t_kyr, dtype=float)
         shape = np.broadcast_shapes(t_arr.shape, np.shape(energy_gev))
-        total = np.broadcast_to(total, shape).copy()
         t_b = np.broadcast_to(t_arr, shape)
+        if zenith:
+            shape, t_b = shape + total.shape[-1:], t_b[..., None]
+        total = np.broadcast_to(total, shape).copy()
 
         for excursion in self.excursions:
             mask = (t_b >= excursion["start_time_kyr"]) & (t_b < excursion["end_time_kyr"])
             if not np.any(mask):
                 continue
             excursion_total = self._flux_stack(
-                species, energy_gev, t_kyr, geomagnetic_cutoff=excursion["geomagnetic_cutoff"]
+                species, energy_gev, t_kyr, geomagnetic_cutoff=excursion["geomagnetic_cutoff"], zenith=zenith
             )
             excursion_total = np.broadcast_to(excursion_total, shape)
             total = np.where(mask, excursion_total, total)
@@ -1115,3 +1305,26 @@ class FluxHistory:
         e_grid_gev = np.asarray(e_grid_gev, dtype=float)
         tt, ee = np.meshgrid(t_grid_kyr, e_grid_gev, indexing='ij')
         return t_grid_kyr, e_grid_gev, self.flux(species, ee, tt)
+
+    def get_zenith_map(self, species, t_grid_kyr, e_grid_gev):
+        """Intensities of one species at the zenith quadrature angles on a (time, energy) grid: what Paleodetector
+        reads for the slanted paths through the overburden (with excursions, as flux). sum_i w_i I_i is get_map's
+        flux; the flux crossing a horizontal plane per unit cos(zenith) is 2 pi mu I(mu).
+
+        Args:
+            species (str): Template species with zenith shapes (MCEQ_SPECIES key).
+            t_grid_kyr (array_like): Absolute times [kyr].
+            e_grid_gev (array_like): Energies [GeV], any shape.
+
+        Returns:
+            tuple: (cos_zenith, weights, intensity): the quadrature nodes mu_i and weights (n_angles,), and the
+            intensities [cm^-2 s^-1 sr^-1 GeV^-1], shape (len(t_grid_kyr), *e_grid_gev.shape, n_angles).
+
+        Raises:
+            ValueError: If a template of the history has no zenith data (rebuild it) or other angles.
+        """
+        t_grid_kyr = np.asarray(t_grid_kyr, dtype=float)
+        e_grid_gev = np.asarray(e_grid_gev, dtype=float)
+        tt = t_grid_kyr.reshape(-1, *([1] * e_grid_gev.ndim))
+        intensity = self.flux(species, e_grid_gev[None], tt, zenith=True)
+        return self.baseline.cos_zenith, self.baseline.zenith_weights, intensity
