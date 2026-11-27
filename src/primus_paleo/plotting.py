@@ -17,7 +17,15 @@ darkest for the first (for the track groups: the heaviest). Three layouts, chose
             panel. The clearest when the components differ by orders of magnitude or more than three curves are
             compared.
 
-'auto' picks 'stack' for one curve, 'lines' for two or three, 'panels' beyond.
+'auto' picks 'stack' for one curve, 'lines' for two or three, 'panels' beyond. With a single curve, 'lines' gives
+each component its own colour (one legend), as for a breakdown by species or source.
+
+Comparing scenarios (ratio_to='<label of a curve>'): every other curve is drawn divided by that one, component by
+component, on a linear axis around 1 ('lines' or 'panels'); a few-percent effect, invisible on a log axis of counts,
+is read directly. Bins where the reference is below RATIO_MIN_FRACTION of its maximum are left out.
+
+The x axis is logarithmic by default when the spectrum spans more than LOGX_SPAN (track lengths from the first bin
+to the end of the tails), so that the short tracks, where most counts are, and the long tails both show.
 
 Input: the dicts of the integrate_* functions, e.g. with nucleus='groups'
 
@@ -38,7 +46,7 @@ import numpy as np
 from ._core import (MUON_SPECIES, SECONDARY_SOURCES, TOTAL_ALL_FRAGMENTS, TOTAL_NO_LIGHT_IONS, TRACK_GROUPS,
                     _depth_cdf_rows)
 
-__all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS',
+__all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS', 'LOGX_SPAN',
            'interaction_profiles', 'plot_secondary_production']
 
 # Labels, shades (position in the colour map, 1 = darkest end of a sequential map) and line styles of the track
@@ -57,6 +65,13 @@ GROUP_LINESTYLES = {'heavy': '-', 'medium_heavy': '-', 'medium_light': '--', 'li
 OTHER_LINESTYLES = ('-', '--', ':', '-.')
 # sequential matplotlib colour maps, one family per curve
 DEFAULT_COLORMAPS = ('Blues', 'Oranges', 'Greens', 'Purples', 'Reds', 'Greys', 'YlOrBr', 'PuRd')
+# Default log x axis when the shown range spans more than this factor (from the first positive bin edge); bins of a
+# ratio whose reference is below RATIO_MIN_FRACTION of the reference's maximum are not drawn (noise of empty bins).
+LOGX_SPAN = 100.
+RATIO_MIN_FRACTION = 1e-6
+# Colours of the components of a single curve in the 'lines' layout (categorical), and of its total.
+SINGLE_CURVE_COLORMAP = 'tab10'
+SINGLE_CURVE_TOTAL_COLOR = 'black'
 # default axes of each observable of the integrate_* functions
 _AXES = {
     'tracks': {'xlabel': 'Track length [nm]', 'counts': 'Tracks', 'unit': 'nm', 'logx': False},
@@ -102,17 +117,19 @@ def _as_curves(curves):
 
 
 def _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormaps, show_light, xlim, xlabel, ylabel,
-                observable):
+                observable, ratio_to=None):
     """What every layout of plot_track_groups needs, worked out once: the curves, the keys drawn, the scaling, the
     colours, the axes ranges and labels (see plot_track_groups for the arguments).
 
     Returns:
         dict: 'curves', 'x_bins', 'style', 'keys' (components), 'total', 'drawn' (components and total), 'scale'
-        (counts -> plotted values), 'families' ({curve: colours}), 'labels' ({key: label}), 'xlim', 'logx', 'logy',
-        'xlabel', 'ylabel'.
+        (counts -> plotted values), 'ratio_to', 'shown' (labels of the curves drawn: all but the reference),
+        'single' (one curve in 'lines': categorical colours), 'families' ({curve: colours}), 'labels' ({key: label}),
+        'xlim', 'logx', 'logy', 'xlabel', 'ylabel'.
 
     Raises:
-        ValueError: If style or observable is unknown, or a curve lacks a key.
+        ValueError: If style or observable is unknown, a curve lacks a key, or ratio_to is not a curve (or is used
+            with 'stack').
     """
     curves = _as_curves(curves)
     x_bins = np.asarray(x_bins, dtype=float)
@@ -127,42 +144,78 @@ def _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormap
         style = 'stack' if len(curves) == 1 else 'lines' if len(curves) <= 3 else 'panels'
     if style not in _LAYOUTS:
         raise ValueError(f"style must be 'auto' or one of {tuple(_LAYOUTS)}, got {style!r}.")
+    if ratio_to is not None:
+        if ratio_to not in curves:
+            raise ValueError(f"ratio_to={ratio_to!r} is not one of the curves {list(curves)}.")
+        if style == 'stack':
+            raise ValueError("ratio_to works with style 'lines' or 'panels', not 'stack'.")
+    shown = [label for label in curves if label != ratio_to]
+    single = style == 'lines' and len(shown) == 1
     if observable not in _AXES:
         raise ValueError(f"observable must be one of {tuple(_AXES)}, got {observable!r}.")
     axis = _AXES[observable]
-    logx = axis['logx'] if logx is None else logx
     widths = np.diff(x_bins)
     scale = (lambda v: np.asarray(v, dtype=float) / widths) if per_nm else (lambda v: np.asarray(v, dtype=float))
 
-    x_lo = x_bins[0] if not logx else x_bins[x_bins > 0][0]
-    x_hi = x_bins[-1]
+    positive = x_bins[x_bins > 0][0]
     if isinstance(xlim, str) and xlim == 'auto':
         values = [scale(c[k]) for c in curves.values() for k in drawn]
         peak = max(float(np.max(v)) for v in values)
         last = max((int(np.nonzero(v > 1e-6 * peak)[0][-1]) for v in values if np.any(v > 1e-6 * peak)),
                    default=len(widths) - 1)
-        margin = x_bins[last + 1] * 1.5 if logx else x_bins[last + 1] + 0.1 * (x_bins[last + 1] - x_lo)
-        x_hi = min(x_bins[-1], margin)
-    elif xlim is not None:
-        x_lo, x_hi = xlim
+        x_end = x_bins[last + 1]
+        logx = (axis['logx'] or x_end / positive > LOGX_SPAN) if logx is None else logx
+        x_lo = positive if logx else x_bins[0]
+        x_hi = min(x_bins[-1], x_end * 1.5 if logx else x_end + 0.1 * (x_end - x_lo))
+    else:
+        x_lo, x_hi = (x_bins[0], x_bins[-1]) if xlim is None else xlim
+        logx = (axis['logx'] or x_hi / max(x_lo, positive) > LOGX_SPAN) if logx is None else logx
+        x_lo = max(x_lo, positive) if logx else x_lo
 
+    if single:
+        import matplotlib
+        cmap = matplotlib.colormaps[SINGLE_CURVE_COLORMAP]
+        families = {shown[0]: {**{k: cmap(i % cmap.N) for i, k in enumerate(keys)},
+                               'total': SINGLE_CURVE_TOTAL_COLOR}}
+    else:
+        families = {label: group_colors(colormaps[i % len(colormaps)], keys) for i, label in enumerate(shown)}
+    if ylabel is None:
+        ylabel = (f"Ratio to {ratio_to}" if ratio_to is not None else
+                  f"{axis['counts']} / mg / {axis['unit'] if per_nm else 'bin'}")
     return {
         'curves': curves, 'x_bins': x_bins, 'style': style, 'keys': keys, 'total': total, 'drawn': drawn,
-        'scale': scale, 'families': {label: group_colors(colormaps[i % len(colormaps)], keys)
-                                     for i, label in enumerate(curves)},
+        'scale': scale, 'ratio_to': ratio_to, 'shown': shown, 'single': single, 'families': families,
         'labels': {k: GROUP_LABELS.get(k, k) for k in drawn},
-        'xlim': (x_lo, x_hi), 'logx': logx, 'logy': (style != 'stack') if logy is None else logy,
-        'xlabel': axis['xlabel'] if xlabel is None else xlabel,
-        'ylabel': (f"{axis['counts']} / mg / {axis['unit'] if per_nm else 'bin'}" if ylabel is None else ylabel),
+        'xlim': (x_lo, x_hi), 'logx': logx,
+        'logy': (style != 'stack' and ratio_to is None) if logy is None else logy,
+        'xlabel': axis['xlabel'] if xlabel is None else xlabel, 'ylabel': ylabel,
     }
+
+
+def _values(p, label, key):
+    """What is drawn for one component of one curve: its counts (scaled, see per_nm), or with ratio_to its ratio to
+    the reference curve (NaN where the reference is below RATIO_MIN_FRACTION of its maximum). Called by the layouts."""
+    values = p['scale'](p['curves'][label][key])
+    if p['ratio_to'] is None:
+        return values
+    ref = p['scale'](p['curves'][p['ratio_to']][key])
+    keep = ref > RATIO_MIN_FRACTION * np.max(ref) if np.max(ref) > 0 else np.zeros(ref.shape, dtype=bool)
+    return np.where(keep, values / np.where(keep, ref, 1.0), np.nan)
+
+
+def _baseline(p):
+    """Baseline of the step lines: 0 (vertical edges down at the ends of a spectrum) for counts, none for ratios."""
+    return None if p['ratio_to'] is not None else 0
 
 
 def _finish_axes(a, p, top, y_decades):
     """Scales and limits of one axes; with a log y axis and y_decades, y from top / 10**y_decades to 2 * top, top
-    being the largest value drawn on it."""
+    being the largest value drawn on it. With ratio_to, a dashed line at 1 for the reference."""
     a.set_xscale('log' if p['logx'] else 'linear')
     a.set_yscale('log' if p['logy'] else 'linear')
     a.set_xlim(*p['xlim'])
+    if p['ratio_to'] is not None:
+        a.axhline(1.0, color='grey', linestyle='--', linewidth=1.0, label=p['ratio_to'])
     if p['logy'] and y_decades and top > 0:
         a.set_ylim(top * 10 ** (-y_decades), top * 2)
 
@@ -173,7 +226,8 @@ def _plot_stack(p, ax, y_decades, legend):
     import matplotlib.pyplot as plt
     fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
     x, top = p['x_bins'], 0.0
-    for label, c in p['curves'].items():
+    for label in p['shown']:
+        c = p['curves'][label]
         colors = p['families'][label]
         bottom = np.zeros(len(x) - 1)
         for k in p['keys']:
@@ -196,37 +250,50 @@ def _plot_stack(p, ax, y_decades, legend):
 
 
 def _plot_lines(p, ax, y_decades, legend):
-    """'lines' layout: every component of every curve as a line (shade and line style = component, colour family =
-    curve), the total as a thick line; two legends, one for the curves and one for the components."""
+    """'lines' layout: every component of every curve as a line, the total as a thick line. Several curves: shade
+    and line style = component, colour family = curve, two legends (curves, components). One curve: a colour per
+    component and one legend."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4.5))
     x, keys, top = p['x_bins'], p['keys'], 0.0
-    for label, c in p['curves'].items():
+    for label in p['shown']:
         colors = p['families'][label]
         for k in keys:
-            values = p['scale'](c[k])
-            ax.stairs(values, x, color=colors[k], linestyle=_linestyle(k, keys), linewidth=1.2)
-            top = max(top, float(np.max(values)))
+            values = _values(p, label, k)
+            ax.stairs(values, x, color=colors[k], linestyle='-' if p['single'] else _linestyle(k, keys),
+                      linewidth=1.2, label=p['labels'][k] if p['single'] else None, baseline=_baseline(p))
+            top = max(top, float(np.nanmax(values, initial=0.0)))
         if p['total']:
-            values = p['scale'](c[p['total']])
-            ax.stairs(values, x, color=colors['total'], linewidth=2.4)
-            top = max(top, float(np.max(values)))
+            values = _values(p, label, p['total'])
+            ax.stairs(values, x, color=colors['total'], linewidth=2.4,
+                      label=p['labels'][p['total']] if p['single'] else None, baseline=_baseline(p))
+            top = max(top, float(np.nanmax(values, initial=0.0)))
     _finish_axes(ax, p, top, y_decades)
     ax.set_xlabel(p['xlabel'])
     ax.set_ylabel(p['ylabel'])
-    if legend:
-        curve_handles = [Patch(color=p['families'][label][keys[0]], label=label or 'spectrum') for label in p['curves']]
-        grey = group_colors('Greys', keys)
-        key_handles = [Line2D([], [], color=grey[k], linestyle=_linestyle(k, keys), linewidth=1.2,
-                              label=p['labels'][k]) for k in keys]
-        if p['total']:
-            key_handles.insert(0, Line2D([], [], color=grey['total'], linewidth=2.4, label=p['labels'][p['total']]))
-        first = ax.legend(handles=curve_handles, frameon=False, fontsize=8, loc='upper left',
-                          bbox_to_anchor=(1.01, 1.0))
-        ax.add_artist(first)
-        ax.legend(handles=key_handles, frameon=False, fontsize=8, loc='lower left', bbox_to_anchor=(1.01, 0.0))
+    if p['single'] and p['shown'][0]:
+        ax.set_title(p['shown'][0])
+    if not legend:
+        return fig, ax
+    if p['single']:
+        handles, labels = ax.get_legend_handles_labels()
+        order = sorted(range(len(labels)), key=lambda i: labels[i] != p['labels'].get(p['total']))
+        ax.legend([handles[i] for i in order], [labels[i] for i in order], frameon=False, fontsize=8,
+                  loc='upper left', bbox_to_anchor=(1.01, 1.0))
+        return fig, ax
+    curve_handles = [Patch(color=p['families'][label][keys[0]], label=label or 'spectrum') for label in p['shown']]
+    if p['ratio_to'] is not None:
+        curve_handles.append(Line2D([], [], color='grey', linestyle='--', label=p['ratio_to']))
+    grey = group_colors('Greys', keys)
+    key_handles = [Line2D([], [], color=grey[k], linestyle=_linestyle(k, keys), linewidth=1.2,
+                          label=p['labels'][k]) for k in keys]
+    if p['total']:
+        key_handles.insert(0, Line2D([], [], color=grey['total'], linewidth=2.4, label=p['labels'][p['total']]))
+    first = ax.legend(handles=curve_handles, frameon=False, fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1.0))
+    ax.add_artist(first)
+    ax.legend(handles=key_handles, frameon=False, fontsize=8, loc='lower left', bbox_to_anchor=(1.01, 0.0))
     return fig, ax
 
 
@@ -241,12 +308,12 @@ def _plot_panels(p, ax, y_decades, legend):
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.2 * nrows), sharex=True, squeeze=False)
     for i, (a, k) in enumerate(zip(axes.flat, shown)):
         top = 0.0
-        for label, c in p['curves'].items():
+        for label in p['shown']:
             family = p['families'][label]
-            values = p['scale'](c[k])
+            values = _values(p, label, k)
             a.stairs(values, p['x_bins'], color=family['total'] if k == p['total'] else family[p['keys'][0]],
-                     linewidth=1.4, label=label or None)
-            top = max(top, float(np.max(values)))
+                     linewidth=1.4, label=label or None, baseline=_baseline(p))
+            top = max(top, float(np.nanmax(values, initial=0.0)))
         a.set_title(p['labels'][k], fontsize=10)
         _finish_axes(a, p, top, y_decades)
         if i % ncols == 0:
@@ -258,7 +325,7 @@ def _plot_panels(p, ax, y_decades, legend):
         if visible:
             visible[-1].set_xlabel(p['xlabel'])
             visible[-1].xaxis.set_tick_params(labelbottom=True)
-    if legend and any(p['curves']):
+    if legend and (any(p['shown']) or p['ratio_to'] is not None):
         axes.flat[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     return fig, axes
@@ -269,7 +336,8 @@ _LAYOUTS = {'stack': _plot_stack, 'lines': _plot_lines, 'panels': _plot_panels}
 
 def plot_track_groups(curves, x_bins, style='auto', keys=TRACK_GROUPS, total=TOTAL_NO_LIGHT_IONS, ax=None,
                       per_nm=False, logx=None, logy=None, colormaps=DEFAULT_COLORMAPS, show_light=True,
-                      xlim='auto', y_decades=None, xlabel=None, ylabel=None, legend=True, observable='tracks'):
+                      xlim='auto', y_decades=None, xlabel=None, ylabel=None, legend=True, observable='tracks',
+                      ratio_to=None):
     """Plots track-length (or recoil-energy) spectra split into components: the track groups, or any keys.
 
     Works out the common settings once (_plot_setup), then draws with the layout of `style` (_plot_stack,
@@ -286,8 +354,10 @@ def plot_track_groups(curves, x_bins, style='auto', keys=TRACK_GROUPS, total=TOT
         ax (matplotlib Axes, optional): Axes for 'stack' and 'lines' (a new figure if None). Ignored by 'panels'.
         per_nm (bool, optional): Plot counts per unit of the x axis (counts / bin width: per nm, or per MeV for
             recoil energies) instead of counts per bin. Defaults to False.
-        logx (bool, optional): Logarithmic x axis. Defaults to None: False for tracks, True for recoil energies.
-        logy (bool, optional): Logarithmic y axis. Defaults to None: False for 'stack', True otherwise.
+        logx (bool, optional): Logarithmic x axis. Defaults to None: True for recoil energies, and for tracks when
+            the range shown spans more than LOGX_SPAN (from the first positive bin edge).
+        logy (bool, optional): Logarithmic y axis. Defaults to None: False for 'stack' and for ratios, True
+            otherwise.
         colormaps (tuple, optional): Colour families of the curves, in order. Defaults to DEFAULT_COLORMAPS.
         show_light (bool, optional): Include the 'light' key if present in keys. Defaults to True.
         xlim (tuple or str or None, optional): x range; 'auto' ends it a little after the last bin above 1e-6 of
@@ -300,15 +370,18 @@ def plot_track_groups(curves, x_bins, style='auto', keys=TRACK_GROUPS, total=TOT
         legend (bool, optional): Draw the legend(s). Defaults to True.
         observable (str, optional): 'tracks' or 'recoil_energy', as given to the integrate_* function; sets the
             default labels and x scale. Defaults to 'tracks'.
+        ratio_to (str, optional): Label of one of the curves: the others are drawn divided by it, component by
+            component (a dashed line at 1 stands for it); 'lines' or 'panels' only. Defaults to None (counts).
 
     Returns:
         tuple: (fig, axes), axes being one Axes or, for 'panels', an array of them.
 
     Raises:
-        ValueError: If style or observable is unknown, or a curve lacks a key.
+        ValueError: If style or observable is unknown, a curve lacks a key, or ratio_to is not a curve (or is used
+            with 'stack').
     """
     p = _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormaps, show_light, xlim, xlabel,
-                    ylabel, observable)
+                    ylabel, observable, ratio_to)
     return _LAYOUTS[p['style']](p, ax, y_decades, legend)
 
 
