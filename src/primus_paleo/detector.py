@@ -1133,7 +1133,7 @@ class Paleodetector:
             raise ValueError(f"fission_group must be one of {TRACK_GROUPS}, got {fission_group!r}.")
 
         results = {}
-        for source in sources:
+        for source in tqdm(sources):
             if source == 'fission_fragments':
                 density = (self._fission_track_density(grid, fission_key) if observable == OBSERVABLE_TRACKS else
                            self._recoil_density(self._fission_fragment_recoils(), observable, grid, source))
