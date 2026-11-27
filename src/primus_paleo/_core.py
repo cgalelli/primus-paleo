@@ -33,6 +33,7 @@ __all__ = [
     'fragment_za', 'predict_track_groups', 'track_group',
     'OBSERVABLE_TRACKS', 'OBSERVABLE_RECOIL_ENERGY', 'OBSERVABLES', 'RADIOGENIC_SOURCES', 'FISSION_KEYS',
     'ENERGY_CELL_NODES', 'COS_ZENITH_NODES', 'GEANT4_HARDCODED_DENSITIES_G_CM3', 'GEANT4_DEFAULT_TARGET_LENGTH_M',
+    'track_total', 'breakdown', 'top_keys',
     'GEANT4_TARGET_LENGTH_M', 'GEANT4_TARGET_RADIUS_M',
 ]
 
@@ -245,6 +246,78 @@ def normalize_fragment_names(names):
     uniq, inverse = np.unique(names, return_inverse=True)
     mapped = np.array([normalize_fragment_name(u) for u in uniq], dtype=str)
     return mapped[inverse.reshape(names.shape)]
+
+# --- Reading the results of the integrate_* functions ---
+def _spectrum(value, total):
+    """One entry of an integrate_* result as a spectrum: value[total] if it is split (nucleus='groups' or 'all'),
+    else value itself. Called by track_total and breakdown."""
+    return np.asarray(value[total] if isinstance(value, dict) else value, dtype=float)
+
+
+def track_total(result, total=TOTAL_NO_LIGHT_IONS):
+    """The total spectrum of an integrate_* result, whatever its nucleus option.
+
+    Args:
+        result (dict): Second output of an integrate_* function (with a 'total' entry).
+        total (str, optional): Sum used when the result is split by track group or nuclide. Defaults to
+            'total_no_light_ions'.
+
+    Returns:
+        np.ndarray: Tracks (or recoils) per mg per bin.
+    """
+    return _spectrum(result['total'], total)
+
+
+def breakdown(cosmic=None, neutrinos=None, radiogenic=None, total=TOTAL_NO_LIGHT_IONS, by_species=True):
+    """The spectrum of a sample split by source, ready for plot_track_groups (keys=[k for k in out if k != 'total'],
+    total='total') or for summing.
+
+    Args:
+        cosmic (dict, optional): integrate_all_particles result: one entry per species (by_species) or 'cosmic rays'.
+        neutrinos (dict, optional): integrate_atmospheric_neutrinos result: 'neutrinos'.
+        radiogenic (dict, optional): integrate_radiogenic result: 'fission' (fission fragments) and 'radiogenic n'
+            (fission and alpha-n neutrons), for the sources it has.
+        total (str, optional): Sum used for split results. Defaults to 'total_no_light_ions'.
+        by_species (bool, optional): One entry per cosmic-ray species. Defaults to True.
+
+    Returns:
+        dict: {component: spectrum, ..., 'total': their sum}.
+    """
+    out = {}
+    if cosmic is not None:
+        if by_species:
+            out.update({species: _spectrum(v, total) for species, v in cosmic.items() if species != 'total'})
+        else:
+            out['cosmic rays'] = track_total(cosmic, total)
+    if neutrinos is not None:
+        out['neutrinos'] = track_total(neutrinos, total)
+    if radiogenic is not None:
+        if 'fission_fragments' in radiogenic:
+            out['fission'] = _spectrum(radiogenic['fission_fragments'], total)
+        neutrons = [_spectrum(radiogenic[k], total) for k in ('fission_n', 'alpha_n') if k in radiogenic]
+        if neutrons:
+            out['radiogenic n'] = sum(neutrons)
+    out['total'] = sum(out.values()) if out else 0.0
+    return out
+
+
+def top_keys(curve, n=6, exclude=None):
+    """The n keys of a {key: spectrum} dict with the most counts, largest first (e.g. the main recoiling nuclides of
+    a nucleus='all' result), sums excluded: the keys= of plot_track_groups.
+
+    Args:
+        curve (dict): {key: spectrum}.
+        n (int, optional): Number of keys. Defaults to 6.
+        exclude (tuple, optional): Keys never returned. Defaults to None: the track sums, 'total' and the track
+            groups (a nucleus='all' result carries the group sums next to the nuclides).
+
+    Returns:
+        list[str]: The keys.
+    """
+    exclude = (*TRACK_SUMS, 'total', *TRACK_GROUPS) if exclude is None else exclude
+    sums = {k: float(np.sum(v)) for k, v in curve.items() if k not in exclude}
+    return [str(k) for k in sorted(sums, key=lambda k: -sums[k])[:n]]
+
 
 # --- Binning setup ---
 RECOIL_N_BINS= 301

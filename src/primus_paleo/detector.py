@@ -37,6 +37,10 @@ __all__ = [
 ]
 
 
+# Warnings already printed in this session (Paleodetector._log prints each once).
+_SHOWN_WARNINGS = set()
+
+
 # --- Speed helpers: caches and a compiled loop. None of them changes a number of the results. ------------------------
 # numba is optional: without it _secondary_cascade uses its numpy loop instead of _window_source_numba.
 
@@ -460,12 +464,20 @@ class Paleodetector:
         summaries that need extra work to build (_print_available_species, the neutrino run report and missing
         products) stay behind their own `if self.verbose` check.
 
+        A warning (a message starting with "Warning") is printed once per session: detectors made one after the other
+        (e.g. one per sample) share the same Geant4 runs and would repeat it; verbose >= 2 prints every repetition.
+
         Args:
             message (str): Text to print.
             level (int, optional): Smallest verbose that prints it. Defaults to 1.
         """
-        if self.verbose >= level:
-            print(message)
+        if self.verbose < level:
+            return
+        if message.startswith('Warning') and self.verbose < 2:
+            if message in _SHOWN_WARNINGS:
+                return
+            _SHOWN_WARNINGS.add(message)
+        print(message)
 
 
     def set_track_groups(self, heavy_min_z=None, medium_min_z=None):
@@ -1133,7 +1145,7 @@ class Paleodetector:
             raise ValueError(f"fission_group must be one of {TRACK_GROUPS}, got {fission_group!r}.")
 
         results = {}
-        for source in tqdm(sources):
+        for source in sources:
             if source == 'fission_fragments':
                 density = (self._fission_track_density(grid, fission_key) if observable == OBSERVABLE_TRACKS else
                            self._recoil_density(self._fission_fragment_recoils(), observable, grid, source))
@@ -1335,6 +1347,19 @@ class Paleodetector:
         if species == 'mu-':
             return {'elastic': path, 'peak': stop}
         return {'all': path}
+
+
+    def overburden_mwe(self, t_kyr):
+        """Overburden above the sample at local times [m.w.e.] (0 = start of exposure, total_age_kyr = present), from
+        the overburden history given at creation.
+
+        Args:
+            t_kyr (float or array_like): Local times [kyr].
+
+        Returns:
+            float or np.ndarray: Overburden [m.w.e.].
+        """
+        return self._overburden_interpolator(t_kyr)
 
 
     def _flux_time_kyr(self, t_kyr):

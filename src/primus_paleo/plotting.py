@@ -1,8 +1,12 @@
-"""Plots: track-length (or recoil-energy) spectra split into components, and diagnostics of a Paleodetector.
+"""Plots: track-length (or recoil-energy) spectra split into components, the history of a sample, and diagnostics of
+a Paleodetector.
 
 Spectra split into components (track groups by default; nuclides, species or sources with keys=...):
-plot_track_groups. Diagnostics of the inputs of a detector: interaction_profiles (interaction depth profiles of its
-StdRock depth tables) and plot_secondary_production (where and by whom the atmospheric secondaries are made).
+plot_track_groups. History: plot_flux_history (a FluxHistory against time: events, excursions) and
+plot_exposure_timeline (a detector's overburden and flux over its exposure, with the exposure windows), to check
+the timing of a scenario before integrating. Diagnostics of the inputs of a detector: interaction_profiles
+(interaction depth profiles of its StdRock depth tables) and plot_secondary_production (where and by whom the
+atmospheric secondaries are made).
 
 plot_track_groups
 -----------------
@@ -47,7 +51,7 @@ from ._core import (MUON_SPECIES, SECONDARY_SOURCES, TOTAL_ALL_FRAGMENTS, TOTAL_
                     _depth_cdf_rows)
 
 __all__ = ['plot_track_groups', 'group_colors', 'GROUP_LABELS', 'GROUP_SHADES', 'DEFAULT_COLORMAPS', 'LOGX_SPAN',
-           'interaction_profiles', 'plot_secondary_production']
+           'plot_flux_history', 'plot_exposure_timeline', 'interaction_profiles', 'plot_secondary_production']
 
 # Labels, shades (position in the colour map, 1 = darkest end of a sequential map) and line styles of the track
 # groups and totals. Other keys get their own name as label, evenly spaced shades and cycling line styles.
@@ -383,6 +387,135 @@ def plot_track_groups(curves, x_bins, style='auto', keys=TRACK_GROUPS, total=TOT
     p = _plot_setup(curves, x_bins, style, keys, total, per_nm, logx, logy, colormaps, show_light, xlim, xlabel,
                     ylabel, observable, ratio_to)
     return _LAYOUTS[p['style']](p, ax, y_decades, legend)
+
+
+# --- History of a sample: flux and overburden against time ------------------------------------------------------------
+
+def _flux_times(flux_history, t_lo, t_hi, n_times):
+    """Times [kyr, flux timeline] to draw a flux history on [t_lo, t_hi]: uniform, log-spaced from t_lo (so that a
+    log time axis from the start is drawn right too), and log-spaced after each event start (transients rise and
+    decay much faster than the range). Called by _draw_flux."""
+    span = t_hi - t_lo
+    t = [np.linspace(t_lo, t_hi, n_times), t_lo + np.geomspace(span * 1e-6, span, n_times)]
+    for event in flux_history.events:
+        start = event['start_time_kyr']
+        if start < t_hi:
+            span = t_hi - max(start, t_lo)
+            t.append(np.clip(start + np.geomspace(1e-3, max(span, 2e-3), 200), t_lo, t_hi))
+    return np.unique(np.concatenate(t))
+
+
+def _draw_flux(ax, flux_history, species, energies_gev, t_lo, t_hi, offset, relative, n_times):
+    """Flux of one species at a few energies against time on ax, x = flux time + offset (0 for the flux timeline,
+    total_age_kyr for a detector's local time); excursions shaded, event starts dotted. Called by plot_flux_history
+    and plot_exposure_timeline. Linear y for the flux / baseline, log for the flux."""
+    t = _flux_times(flux_history, t_lo, t_hi, n_times)
+    energies = np.atleast_1d(np.asarray(energies_gev, dtype=float))
+    flux = flux_history.get_map(species, t, energies)[2]
+    if relative:
+        flux = flux / flux_history.baseline.flux(species, energies)[None, :]
+    for i, e in enumerate(energies):
+        ax.plot(t + offset, flux[:, i], color=f'C{i}', linewidth=1.4, label=f'{species}, {e:g} GeV')
+    for k, exc in enumerate(flux_history.excursions):
+        ax.axvspan(exc['start_time_kyr'] + offset, exc['end_time_kyr'] + offset, color='grey', alpha=0.25,
+                   linewidth=0, label='excursion' if k == 0 else None)
+    for event in flux_history.events:
+        if t_lo <= event['start_time_kyr'] <= t_hi:
+            ax.axvline(event['start_time_kyr'] + offset, color='k', linestyle=':', linewidth=1)
+            ax.annotate(event.get('label') or event['template'].name, (event['start_time_kyr'] + offset, 1),
+                        xycoords=('data', 'axes fraction'), xytext=(3, -12), textcoords='offset points',
+                        fontsize='x-small')
+    ax.set_yscale('linear' if relative else 'log')
+    ax.set_ylabel(f'{species} flux / baseline' if relative else f'{species} flux [cm$^{{-2}}$ s$^{{-1}}$ GeV$^{{-1}}$]')
+
+
+def plot_flux_history(flux_history, species='mu-', energies_gev=(1., 10., 100.), t_range_kyr=None, relative=True,
+                      ax=None, n_times=2000):
+    """A FluxHistory against time: the flux of one species at a few energies, its events and excursions.
+
+    A check of a scenario before integrating: the amplitude, start and decay of each event, the excursion windows.
+
+    Args:
+        flux_history (FluxHistory): The history.
+        species (str, optional): Template species. Defaults to 'mu-'.
+        energies_gev (tuple, optional): Energies drawn [GeV]. Defaults to (1, 10, 100).
+        t_range_kyr (tuple, optional): (start, end) on the flux timeline [kyr, 0 = present]. Defaults to None: from
+            a little before the earliest event or excursion (or -100 kyr) to the present.
+        relative (bool, optional): Divide by the baseline flux. Defaults to True.
+        ax (matplotlib Axes, optional): Axes to draw on. Defaults to None (a new figure).
+        n_times (int, optional): Uniform time points (more are added after each event start). Defaults to 2000.
+
+    Returns:
+        tuple: (fig, ax).
+    """
+    import matplotlib.pyplot as plt
+    if t_range_kyr is None:
+        starts = [e['start_time_kyr'] for e in flux_history.events] + \
+                 [e['start_time_kyr'] for e in flux_history.excursions]
+        t_lo = min(starts + [-100.]) * 1.1
+        t_range_kyr = (t_lo, 0.)
+    fig, ax = (ax.figure, ax) if ax is not None else plt.subplots(figsize=(7, 4))
+    _draw_flux(ax, flux_history, species, energies_gev, *t_range_kyr, 0., relative, n_times)
+    ax.set_xlabel('Time [kyr, 0 = present]')
+    ax.set_xlim(*t_range_kyr)
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_exposure_timeline(detector, flux_history=None, windows=None, species='mu-', energies_gev=(10.,),
+                           relative=True, n_times=2000):
+    """A sample over its exposure: the overburden (top) and the flux at the site (bottom) against the detector's
+    local time (0 = start of exposure, total_age_kyr = present), with the exposure windows of the integrals.
+
+    Shows on one axis what the integrals combine: when the sample is shielded, when events and excursions act on
+    it, and which part of the history a window (exposure_window_kyr) covers. Events that start before the exposure
+    are listed in the title (only their tail reaches the sample).
+
+    Args:
+        detector (Paleodetector): The sample.
+        flux_history (FluxHistory, optional): Defaults to None (the detector's).
+        windows (dict or list, optional): Exposure windows [kyr, local time]: {label: (start, end)} or a list of
+            (start, end). Defaults to None.
+        species (str, optional): Template species of the flux panel. Defaults to 'mu-'.
+        energies_gev (tuple, optional): Energies of the flux panel [GeV]. Defaults to (10,).
+        relative (bool, optional): Flux divided by the baseline. Defaults to True.
+        n_times (int, optional): Uniform time points. Defaults to 2000.
+
+    Returns:
+        tuple: (fig, (ax_overburden, ax_flux)).
+    """
+    import matplotlib.pyplot as plt
+    flux_history = detector.flux_history if flux_history is None else flux_history
+    age = detector.total_age_kyr
+    fig, (ax_ob, ax_fl) = plt.subplots(2, 1, figsize=(7.5, 5.5), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
+
+    t = np.unique(np.concatenate([np.linspace(0., age, n_times), np.geomspace(age * 1e-6, age, n_times)]))
+    overburden = np.asarray(detector.overburden_mwe(t), dtype=float)
+    ax_ob.plot(t, overburden, color='k', linewidth=1.4)
+    if np.all(overburden > 0):
+        ax_ob.set_yscale('log')
+    ax_ob.set_ylabel('Overburden [m.w.e.]')
+
+    _draw_flux(ax_fl, flux_history, species, energies_gev, -age, 0., age, relative, n_times)
+    ax_fl.set_xlabel(f'Local time [kyr] (0 = start of exposure, {age:g} = present)')
+    ax_fl.set_xlim(0., age)
+
+    if windows is not None:
+        items = windows.items() if isinstance(windows, dict) else ((None, w) for w in windows)
+        for k, (label, (lo, hi)) in enumerate(items):
+            for a in (ax_ob, ax_fl):
+                a.axvspan(lo, hi, color=f'C{k + 3}', alpha=0.12, linewidth=0,
+                          label=(label or f'window {lo:g}-{hi:g} kyr') if a is ax_ob else None)
+        ax_ob.legend(frameon=False, fontsize=8)
+    ax_fl.legend(frameon=False, fontsize=8)
+    early = [e for e in flux_history.events if e['start_time_kyr'] < -age]
+    if early:
+        ax_ob.set_title('; '.join(f"{e.get('label') or e['template'].name}: starts "
+                                  f"{-age - e['start_time_kyr']:g} kyr before the exposure" for e in early),
+                        fontsize=9)
+    fig.tight_layout()
+    return fig, (ax_ob, ax_fl)
 
 
 # --- Diagnostics of a Paleodetector ----------------------------------------------------------------------------------
